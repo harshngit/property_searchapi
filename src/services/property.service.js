@@ -51,6 +51,14 @@ async function listProperties(user, filters, page, limit) {
     params.push(filters.maxPrice);
     where.push(`price <= $${params.length}`);
   }
+  // Used by the Broker CRM dashboard (GET /api/broker/inventory) to scope
+  // to "properties created by or assigned (as broker) to this user" - kept
+  // here rather than duplicated in broker.service.js since this service
+  // owns all properties-table querying.
+  if (filters.brokerId) {
+    params.push(filters.brokerId);
+    where.push(`(created_by = $${params.length} OR broker_id = $${params.length})`);
+  }
 
   const whereClause = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const offset = (page - 1) * limit;

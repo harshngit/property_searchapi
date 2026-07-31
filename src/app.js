@@ -11,6 +11,15 @@ const adminRoutes = require('./routes/admin.routes');
 const propertyRoutes = require('./routes/property.routes');
 const searchRoutes = require('./routes/search.routes');
 const { projectRouter, unitRouter } = require('./routes/project.routes');
+const leadRoutes = require('./routes/lead.routes');
+const customerRoutes = require('./routes/customer.routes');
+const { taskRouter, followupRouter } = require('./routes/task.routes');
+const notificationRoutes = require('./routes/notification.routes');
+const brokerRoutes = require('./routes/broker.routes');
+const dealRoutes = require('./routes/deal.routes');
+const documentRoutes = require('./routes/document.routes');
+const paymentRoutes = require('./routes/payment.routes');
+const reportRoutes = require('./routes/report.routes');
 const { notFoundHandler, errorHandler } = require('./middlewares/errorHandler');
 
 const app = express();
@@ -51,6 +60,16 @@ app.use('/api/properties', propertyRoutes);
 app.use('/api/search', searchRoutes);
 app.use('/api/projects', projectRouter);
 app.use('/api/units', unitRouter);
+app.use('/api/leads', leadRoutes);
+app.use('/api/customers', customerRoutes);
+app.use('/api/tasks', taskRouter);
+app.use('/api/followups', followupRouter);
+app.use('/api/notifications', notificationRoutes);
+app.use('/api/broker', brokerRoutes);
+app.use('/api/deals', dealRoutes);
+app.use('/api/documents', documentRoutes);
+app.use('/api/payments', paymentRoutes);
+app.use('/api/reports', reportRoutes);
 
 // 404 + error handler (must be last)
 app.use(notFoundHandler);
