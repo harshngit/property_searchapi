@@ -1,10 +1,10 @@
 const express = require('express');
-const { body } = require('express-validator');
+const { body, param } = require('express-validator');
 const router = express.Router();
 
 const authController = require('../controllers/auth.controller');
 const validate = require('../middlewares/validate');
-const { authenticate, optionalAuthenticate } = require('../middlewares/auth');
+const { authenticate, authorize, optionalAuthenticate } = require('../middlewares/auth');
 
 const ALL_ROLES = ['customer', 'broker', 'agency_admin', 'builder', 'internal_sales', 'admin', 'super_admin'];
 
@@ -425,6 +425,43 @@ router.put(
   ],
   validate,
   authController.changePassword
+);
+
+/**
+ * @swagger
+ * /auth/users/{id}/activate:
+ *   put:
+ *     summary: Activate a pending_approval user (currently only reachable by self-registered brokers)
+ *     description: >
+ *       Allowed roles agency_admin, admin, super_admin. An agency_admin may
+ *       only activate users within their own tenant; admin/super_admin can
+ *       activate anyone. Only works while the target user's status is
+ *       `pending_approval` — returns `400` otherwise.
+ *     tags: [Authentication]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string, format: uuid }
+ *     responses:
+ *       200:
+ *         description: User activated successfully
+ *       400:
+ *         description: User is not currently pending_approval
+ *       403:
+ *         description: Role not permitted, or agency_admin targeting a user outside their tenant
+ *       404:
+ *         description: User not found
+ */
+router.put(
+  '/users/:id/activate',
+  authenticate,
+  authorize('agency_admin', 'admin', 'super_admin'),
+  [param('id').isUUID().withMessage('Invalid user id')],
+  validate,
+  authController.activateUser
 );
 
 module.exports = router;

@@ -70,6 +70,45 @@ async function findUserById(id) {
   return result.rows[0];
 }
 
+// Activates a pending_approval account (currently only reachable by
+// self-registered brokers - every other role goes active immediately at
+// creation). agency_admin can only activate users in their own tenant;
+// admin/super_admin can activate anyone.
+async function activateUser(targetUserId, actingUser) {
+  const result = await pool.query(
+    `SELECT u.id, u.tenant_id, u.full_name, u.email, u.mobile, u.status, r.name AS role_name
+     FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = $1`,
+    [targetUserId]
+  );
+  const target = result.rows[0];
+
+  if (!target) {
+    const err = new Error('User not found');
+    err.statusCode = 404;
+    throw err;
+  }
+
+  if (actingUser.role === 'agency_admin' && target.tenant_id !== actingUser.tenant_id) {
+    const err = new Error('You can only activate users within your own tenant');
+    err.statusCode = 403;
+    throw err;
+  }
+
+  if (target.status !== 'pending_approval') {
+    const err = new Error(`User is not pending approval (current status: ${target.status})`);
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const updated = await pool.query(
+    `UPDATE users SET status = 'active' WHERE id = $1
+     RETURNING id, tenant_id, full_name, email, mobile, status, updated_at`,
+    [targetUserId]
+  );
+
+  return { ...updated.rows[0], role: target.role_name };
+}
+
 // Single entry point for creating any user of any role.
 //   - customer / broker: always public, no token needed.
 //   - super_admin: public and token-less ONLY as a one-time bootstrap, while
@@ -276,6 +315,7 @@ module.exports = {
   getRoleByName,
   findUserByEmailOrMobile,
   findUserById,
+  activateUser,
   registerUser,
   validatePassword,
   updateLastLogin,

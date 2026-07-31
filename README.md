@@ -32,6 +32,7 @@ Raw OpenAPI JSON: `http://localhost:5000/api-docs.json`
 | POST   | /api/auth/reset-password         | No  | Consumes reset token, sets new password |
 | GET    | /api/auth/me                     | Yes | Returns logged-in user profile |
 | PUT    | /api/auth/change-password         | Yes | Requires current password |
+| PUT    | /api/auth/users/:id/activate       | Yes | Roles: agency_admin, admin, super_admin. agency_admin limited to their own tenant. Only works on `pending_approval` users |
 | GET    | /api/properties                    | Yes | Tenant-scoped list, filters: city, propertyType, transactionType, status, minPrice, maxPrice |
 | GET    | /api/properties/:id                | Yes | 404 if outside caller's tenant/ownership (non-admin) |
 | POST   | /api/properties                    | Yes | Roles: broker, agency_admin, builder, admin, super_admin. Starts as `pending_approval` |
@@ -143,9 +144,9 @@ itself determines what you're allowed to create, per a fixed role tree
 (`ROLE_CREATION_PERMISSIONS` in `src/services/auth.service.js`):
 
 - **customer** → always public, no token. Status `active` immediately.
-- **broker** → always public, no token. Status `pending_approval` — there's no dedicated
-  "activate broker" endpoint yet (see TODOs below), so this currently needs a manual DB
-  update until one exists.
+- **broker** → always public, no token. Status `pending_approval` until activated via
+  `PUT /api/auth/users/:id/activate` (roles: agency_admin, admin, super_admin — an
+  agency_admin can only activate users in their own tenant).
 - **super_admin** → public and token-less **only as a one-time bootstrap**, while zero
   `super_admin` accounts exist in the database. Call it once with no `Authorization` header
   to create your first super admin. From then on, creating another `super_admin` requires a
@@ -385,6 +386,5 @@ database instead of the public API.
   /api/auth/register` replaced the invite-link flow entirely. The `invites` table itself
   was left in place rather than dropped (no migration touches existing tables), but nothing
   reads or writes it anymore
-- No "activate broker" endpoint exists yet — a self-registered broker sits at
-  `pending_approval` with no API path to flip them to `active` (would need a small addition,
-  e.g. `PUT /api/admin/users/:id/activate` gated the same way as the role tree)
+- ~~No "activate broker" endpoint~~ — added: `PUT /api/auth/users/:id/activate`
+  (agency_admin/admin/super_admin, agency_admin tenant-scoped, `pending_approval` only)

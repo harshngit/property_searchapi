@@ -226,6 +226,16 @@ async function changePassword(req, res, next) {
   }
 }
 
+// PUT /api/auth/users/:id/activate
+async function activateUser(req, res, next) {
+  try {
+    const user = await authService.activateUser(req.params.id, req.user);
+    return success(res, 200, 'User activated successfully', user);
+  } catch (err) {
+    next(err);
+  }
+}
+
 module.exports = {
   register,
   login,
@@ -237,4 +247,5 @@ module.exports = {
   resetPassword,
   getMe,
   changePassword,
+  activateUser,
 };
