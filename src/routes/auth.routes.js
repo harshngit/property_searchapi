@@ -4,7 +4,7 @@ const router = express.Router();
 
 const authController = require('../controllers/auth.controller');
 const validate = require('../middlewares/validate');
-const { authenticate } = require('../middlewares/auth');
+const { authenticate, optionalAuthenticate } = require('../middlewares/auth');
 
 const ALL_ROLES = ['customer', 'broker', 'agency_admin', 'builder', 'internal_sales', 'admin', 'super_admin'];
 
@@ -19,22 +19,31 @@ const ALL_ROLES = ['customer', 'broker', 'agency_admin', 'builder', 'internal_sa
  * @swagger
  * /auth/register:
  *   post:
- *     summary: Register a new user
+ *     summary: Register a new user of any role
  *     description: >
- *       Public self-registration endpoint.
+ *       Single endpoint for creating a user of any role. An optional bearer
+ *       token determines what you're allowed to create:
  *
- *       - `customer` → account is created with status `active` immediately.
- *       - `broker` → account is created with status `pending_approval` and
- *         must be activated by an Agency Admin/Admin.
- *       - `agency_admin`, `builder`, `internal_sales`, `admin`, `super_admin`
- *         → **blocked in production** (returns `403`) — these roles are
- *         normally created only by an Admin/Super Admin via the invite flow.
- *         **Outside production** (`NODE_ENV !== 'production'`, or forced via
- *         the `ALLOW_ALL_ROLE_REGISTRATION` env var), this restriction is
- *         lifted as a dev/test convenience and these roles self-register
- *         with status `active` immediately. Never enable this in a real
- *         deployment — it lets any caller grant themselves admin rights.
+ *       - `customer` → always public, no token. Status `active` immediately.
+ *       - `broker` → always public, no token. Status `pending_approval`,
+ *         needs an Agency Admin/Admin to activate.
+ *       - `super_admin` → public and token-less **only while no super_admin
+ *         account exists yet** (one-time bootstrap). Once the first one
+ *         exists, creating another `super_admin` requires a bearer token
+ *         from an existing `super_admin`.
+ *       - `admin`, `agency_admin`, `builder`, `internal_sales` → always
+ *         require a bearer token from an actor permitted to create that
+ *         role: a `super_admin` can create `admin`/`agency_admin`/`builder`/
+ *         `internal_sales`/`super_admin`; an `admin` can create
+ *         `agency_admin`/`builder`/`internal_sales`. No token → `401`;
+ *         wrong role → `403`.
+ *
+ *       All roles other than `customer`/`broker` require `password` in the
+ *       body (they log in immediately, there's no separate activation step).
  *     tags: [Authentication]
+ *     security:
+ *       - bearerAuth: []
+ *       - {}
  *     requestBody:
  *       required: true
  *       content:
@@ -60,13 +69,21 @@ const ALL_ROLES = ['customer', 'broker', 'agency_admin', 'builder', 'internal_sa
  *                 password: Passw0rd!123
  *                 role: broker
  *                 tenantId: null
- *             agencyAdminBlocked:
- *               summary: agency_admin (blocked with 403 in production; allowed outside production)
+ *             agencyAdminByAdmin:
+ *               summary: agency_admin (requires a super_admin/admin bearer token)
  *               value:
  *                 fullName: Suresh Rao
  *                 email: suresh@agency.com
  *                 password: Passw0rd!123
  *                 role: agency_admin
+ *                 tenantId: null
+ *             superAdminBootstrap:
+ *               summary: super_admin (no token needed only while none exist yet)
+ *               value:
+ *                 fullName: Founding Super Admin
+ *                 email: root@propertyserch.co.in
+ *                 password: Passw0rd!123
+ *                 role: super_admin
  *                 tenantId: null
  *     responses:
  *       201:
@@ -80,8 +97,14 @@ const ALL_ROLES = ['customer', 'broker', 'agency_admin', 'builder', 'internal_sa
  *                 message: { type: string, example: Registration successful }
  *                 data:
  *                   $ref: '#/components/schemas/RegisteredUser'
+ *       401:
+ *         description: A bearer token is required to register this role, and none (or an invalid one) was provided
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  *       403:
- *         description: Role not allowed to self-register in production (e.g. agency_admin, builder, admin, super_admin)
+ *         description: The caller's role is not permitted to register this target role
  *         content:
  *           application/json:
  *             schema:
@@ -101,6 +124,7 @@ const ALL_ROLES = ['customer', 'broker', 'agency_admin', 'builder', 'internal_sa
  */
 router.post(
   '/register',
+  optionalAuthenticate,
   [
     body('fullName').notEmpty().withMessage('Full name is required'),
     body('email').optional().isEmail().withMessage('Valid email required'),

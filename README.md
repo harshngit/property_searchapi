@@ -22,7 +22,7 @@ Raw OpenAPI JSON: `http://localhost:5000/api-docs.json`
 
 | Method | Route                       | Auth required | Notes |
 |--------|------------------------------|----------------|-------|
-| POST   | /api/auth/register           | No  | Only `customer` and `broker` can self-register |
+| POST   | /api/auth/register           | Optional | Any role. `customer`/`broker` and first-ever `super_admin` need no token; every other role needs a bearer token from an actor allowed to create it (see Role registration rule) |
 | POST   | /api/auth/login               | No  | Email/mobile + password |
 | POST   | /api/auth/otp/send            | No  | purpose: register/login/reset_password/mobile_verification |
 | POST   | /api/auth/otp/verify           | No  | Verifies OTP, issues tokens if purpose = login |
@@ -137,23 +137,35 @@ Raw OpenAPI JSON: `http://localhost:5000/api-docs.json`
 
 ## Role registration rule
 
-In **production** (`NODE_ENV=production`), only **customer** and **broker** roles are
-allowed through `/api/auth/register`. `agency_admin`, `builder`, `internal_sales`, `admin`,
-`super_admin` must be created by an Admin/Super Admin via the invite flow
-(`/api/admin/users/invite` → `/api/admin/users/accept-invite`).
+`POST /api/auth/register` is the single endpoint for creating a user of **any** role. There
+is no separate invite-link flow anymore — an optional bearer token on the register call
+itself determines what you're allowed to create, per a fixed role tree
+(`ROLE_CREATION_PERMISSIONS` in `src/services/auth.service.js`):
 
-- customer -> status becomes `active` immediately
-- broker -> status becomes `pending_approval`, needs Agency Admin/Admin to activate
-- every other role -> blocked with `403` in production
+- **customer** → always public, no token. Status `active` immediately.
+- **broker** → always public, no token. Status `pending_approval` — there's no dedicated
+  "activate broker" endpoint yet (see TODOs below), so this currently needs a manual DB
+  update until one exists.
+- **super_admin** → public and token-less **only as a one-time bootstrap**, while zero
+  `super_admin` accounts exist in the database. Call it once with no `Authorization` header
+  to create your first super admin. From then on, creating another `super_admin` requires a
+  bearer token from an existing `super_admin`.
+- **admin, agency_admin, builder, internal_sales** → always require a bearer token:
+  - a `super_admin` token can create `admin`, `agency_admin`, `builder`, `internal_sales`,
+    or another `super_admin`.
+  - an `admin` token can create `agency_admin`, `builder`, or `internal_sales`.
+  - no token → `401`. Token present but the caller's role isn't permitted to create the
+    requested role → `403`.
 
-**Outside production** (`NODE_ENV !== 'production'`, the default in `.env.example`), this
-restriction is lifted: `/api/auth/register` accepts **all** roles, including `admin` and
-`super_admin`, and they go `active` immediately (no invite/approval loop to wait on). This
-is purely a local/dev/test convenience for spinning up accounts quickly — set
-`ALLOW_ALL_ROLE_REGISTRATION=false` to force it off even in dev, or `=true` to force it on
-even in production. **Never enable this in a real deployment** — it lets any
-unauthenticated caller grant themselves admin rights. See `OPEN_ROLE_REGISTRATION` in
-`src/services/auth.service.js`.
+Every role other than `customer`/`broker` requires `password` in the body and is created
+`active` + `email_verified: true` immediately — there's no separate accept/activation step,
+since the authenticated actor creating the account already vouches for it.
+
+**Security note**: the bootstrap-without-a-token path for `super_admin` is intentionally
+one-shot — it closes itself the moment any super_admin exists, so the live API never has a
+standing, unauthenticated way to mint admin accounts. If you ever need to force-recreate a
+super_admin outside that window, use `src/db/seedSuperAdmin.js` directly against the
+database instead of the public API.
 
 ## Property Listings, Search & Projects — design notes
 
@@ -194,7 +206,7 @@ unauthenticated caller grant themselves admin rights. See `OPEN_ROLE_REGISTRATIO
   an existing `customerId` (the customer record is expected to already exist in the CRM).
   The public endpoint has no auth context, so it finds-or-creates a bare `customers` row by
   email/mobile (no `tenant_id`/`created_by`) and defaults `source` to `website`. It's rate
-  limited (10 req/15 min/IP) separately from the global `/api/auth`, `/api/admin` limiter.
+  limited (10 req/15 min/IP) separately from the global `/api/auth` limiter.
 - **`PUT /:id/assign`** is restricted to `agency_admin`, `internal_sales`, `admin`,
   `super_admin` — brokers work leads assigned to them but don't reassign others' leads. The
   assignee must belong to the caller's tenant unless the caller is admin/super_admin.
@@ -368,3 +380,11 @@ unauthenticated caller grant themselves admin rights. See `OPEN_ROLE_REGISTRATIO
   deal closes `closed_won`), so `GET /api/reports/revenue`'s commission figures aren't always 0
 - Automatic overdue detection for `payment_milestones` (currently manual), mirroring the
   Tasks module's lazy `syncOverdueTasks()` pattern
+- `invites` (migration `002_create_invites_table.sql`) and `admin.controller.js`/
+  `admin.routes.js` are gone — direct role-tree-gated registration via `POST
+  /api/auth/register` replaced the invite-link flow entirely. The `invites` table itself
+  was left in place rather than dropped (no migration touches existing tables), but nothing
+  reads or writes it anymore
+- No "activate broker" endpoint exists yet — a self-registered broker sits at
+  `pending_approval` with no API path to flip them to `active` (would need a small addition,
+  e.g. `PUT /api/admin/users/:id/activate` gated the same way as the role tree)

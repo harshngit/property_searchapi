@@ -28,4 +28,28 @@ function authorize(...allowedRoles) {
   };
 }
 
-module.exports = { authenticate, authorize };
+// Like authenticate, but never rejects the request - used by endpoints that
+// are reachable both anonymously (e.g. customer/broker self-registration)
+// and by an authenticated actor (e.g. an admin registering another admin).
+// A missing or invalid token just leaves req.user null; it's up to the
+// route's own logic to decide what's allowed without one.
+function optionalAuthenticate(req, res, next) {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    req.user = null;
+    return next();
+  }
+
+  const token = authHeader.split(' ')[1];
+
+  try {
+    req.user = verifyAccessToken(token);
+  } catch (err) {
+    req.user = null;
+  }
+
+  next();
+}
+
+module.exports = { authenticate, authorize, optionalAuthenticate };

@@ -7,7 +7,6 @@ const swaggerUi = require('swagger-ui-express');
 
 const swaggerSpec = require('./config/swagger');
 const authRoutes = require('./routes/auth.routes');
-const adminRoutes = require('./routes/admin.routes');
 const propertyRoutes = require('./routes/property.routes');
 const searchRoutes = require('./routes/search.routes');
 const { projectRouter, unitRouter } = require('./routes/project.routes');
@@ -42,7 +41,6 @@ const authLimiter = rateLimit({
   message: { success: false, message: 'Too many requests, please try again later.' },
 });
 app.use('/api/auth', authLimiter);
-app.use('/api/admin', authLimiter);
 
 // Swagger docs
 app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
@@ -58,7 +56,6 @@ app.get('/health', (req, res) => {
 
 // Routes
 app.use('/api/auth', authRoutes);
-app.use('/api/admin', adminRoutes);
 app.use('/api/properties', propertyRoutes);
 app.use('/api/search', searchRoutes);
 app.use('/api/projects', projectRouter);

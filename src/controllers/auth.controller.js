@@ -7,14 +7,10 @@ async function register(req, res, next) {
   try {
     const { fullName, email, mobile, password, role, tenantId } = req.body;
 
-    const user = await authService.registerUser({
-      fullName,
-      email,
-      mobile,
-      password,
-      role,
-      tenantId,
-    });
+    const user = await authService.registerUser(
+      { fullName, email, mobile, password, role, tenantId },
+      req.user // set by optionalAuthenticate - null if no/invalid bearer token was sent
+    );
 
     return success(res, 201, 'Registration successful', user);
   } catch (err) {

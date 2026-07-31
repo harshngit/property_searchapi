@@ -3,20 +3,43 @@ const crypto = require('crypto');
 const pool = require('../config/db');
 const { generateOtp, getOtpExpiry } = require('../utils/otp');
 
-// Roles allowed to self-register through the public /auth/register endpoint
-// in production. All other roles (agency_admin, builder, internal_sales,
-// admin, super_admin) must be created via the admin invite flow there.
-const PUBLIC_REGISTER_ROLES = ['customer', 'broker'];
+// Roles that can always self-register through /auth/register with no token.
+const PUBLIC_SELF_REGISTER_ROLES = ['customer', 'broker'];
 
-// Outside production (local/dev/test), /auth/register accepts every role,
-// including admin/super_admin - purely a convenience for spinning up test
-// accounts without going through the invite flow. Never enable this in a
-// real deployment: it lets any unauthenticated caller grant themselves
-// admin rights. Can be forced on/off explicitly via ALLOW_ALL_ROLE_REGISTRATION.
-const OPEN_ROLE_REGISTRATION =
-  process.env.ALLOW_ALL_ROLE_REGISTRATION !== undefined
-    ? process.env.ALLOW_ALL_ROLE_REGISTRATION === 'true'
-    : process.env.NODE_ENV !== 'production';
+// Which roles a given actor's role is allowed to directly register another
+// user into, via /auth/register (replaces the old separate invite-link
+// flow - registration and role-tree authorization now happen in one call).
+// super_admin is listed under itself too, since an existing super_admin can
+// mint another one; the *first* super_admin is created via the one-time
+// bootstrap path in registerUser() below, which needs no actor at all.
+const ROLE_CREATION_PERMISSIONS = {
+  super_admin: ['admin', 'agency_admin', 'builder', 'internal_sales', 'super_admin'],
+  admin: ['agency_admin', 'builder', 'internal_sales'],
+};
+
+// Throws 401 if no caller is authenticated, or 403 if the caller's role
+// isn't permitted to create the target role, per ROLE_CREATION_PERMISSIONS.
+function assertCanCreateRole(actingUser, targetRole) {
+  if (!actingUser) {
+    const err = new Error(`Authentication is required to register a '${targetRole}' user`);
+    err.statusCode = 401;
+    throw err;
+  }
+
+  const allowedRoles = ROLE_CREATION_PERMISSIONS[actingUser.role] || [];
+  if (!allowedRoles.includes(targetRole)) {
+    const err = new Error(`Your role (${actingUser.role}) is not permitted to register a '${targetRole}' user`);
+    err.statusCode = 403;
+    throw err;
+  }
+}
+
+async function superAdminExists() {
+  const result = await pool.query(
+    `SELECT u.id FROM users u JOIN roles r ON r.id = u.role_id WHERE r.name = 'super_admin' LIMIT 1`
+  );
+  return result.rows.length > 0;
+}
 
 async function getRoleByName(roleName) {
   const result = await pool.query('SELECT id, name FROM roles WHERE name = $1', [roleName]);
@@ -47,12 +70,39 @@ async function findUserById(id) {
   return result.rows[0];
 }
 
-async function registerUser({ fullName, email, mobile, password, role, tenantId }) {
-  if (!PUBLIC_REGISTER_ROLES.includes(role) && !OPEN_ROLE_REGISTRATION) {
-    const err = new Error(
-      `Role '${role}' cannot self-register. This role must be created by an Admin/Super Admin via the invite flow.`
-    );
-    err.statusCode = 403;
+// Single entry point for creating any user of any role.
+//   - customer / broker: always public, no token needed.
+//   - super_admin: public and token-less ONLY as a one-time bootstrap, while
+//     zero super_admin accounts exist yet. Once the first one exists, every
+//     further super_admin must be created by an existing super_admin's token.
+//   - everything else (admin, agency_admin, builder, internal_sales): always
+//     requires an authenticated actor whose role is permitted to create that
+//     target role, per ROLE_CREATION_PERMISSIONS.
+// `actingUser` is req.user from optionalAuthenticate - null when the caller
+// sent no (or an invalid) bearer token.
+async function registerUser({ fullName, email, mobile, password, role, tenantId }, actingUser) {
+  let status;
+  let emailVerified = false;
+
+  if (role === 'customer') {
+    status = 'active';
+  } else if (role === 'broker') {
+    status = 'pending_approval';
+  } else if (role === 'super_admin') {
+    if (await superAdminExists()) {
+      assertCanCreateRole(actingUser, role);
+    }
+    status = 'active';
+    emailVerified = true;
+  } else {
+    assertCanCreateRole(actingUser, role);
+    status = 'active';
+    emailVerified = true;
+  }
+
+  if (!PUBLIC_SELF_REGISTER_ROLES.includes(role) && !password) {
+    const err = new Error('Password is required for this role');
+    err.statusCode = 400;
     throw err;
   }
 
@@ -72,21 +122,11 @@ async function registerUser({ fullName, email, mobile, password, role, tenantId 
 
   const passwordHash = password ? await bcrypt.hash(password, 10) : null;
 
-  // customer -> active immediately, broker -> pending_approval (needs
-  // Agency Admin/Admin activation). Roles only reachable via the
-  // OPEN_ROLE_REGISTRATION dev bypass go active immediately too - there's
-  // no admin/invite loop to approve them in a fresh dev setup, so leaving
-  // them pending_approval would just soft-lock the account.
-  const status =
-    role === 'customer' || (OPEN_ROLE_REGISTRATION && !PUBLIC_REGISTER_ROLES.includes(role))
-      ? 'active'
-      : 'pending_approval';
-
   const result = await pool.query(
-    `INSERT INTO users (tenant_id, role_id, full_name, email, mobile, password_hash, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
+    `INSERT INTO users (tenant_id, role_id, full_name, email, mobile, password_hash, status, email_verified)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
      RETURNING id, tenant_id, full_name, email, mobile, status, created_at`,
-    [tenantId || null, roleRecord.id, fullName, email || null, mobile || null, passwordHash, status]
+    [tenantId || null, roleRecord.id, fullName, email || null, mobile || null, passwordHash, status, emailVerified]
   );
 
   return { ...result.rows[0], role };
@@ -230,91 +270,9 @@ async function markVerified(userId, field) {
   // auto-activate here for customer role. Left explicit for admin approval flows.
 }
 
-// Which roles a given inviter role is allowed to create via the invite flow.
-const INVITE_PERMISSIONS = {
-  super_admin: ['admin', 'agency_admin', 'builder', 'internal_sales', 'super_admin'],
-  admin: ['agency_admin', 'builder', 'internal_sales'],
-};
-
-async function createInvite({ inviterRole, inviterId, fullName, email, role, tenantId }) {
-  const allowedRoles = INVITE_PERMISSIONS[inviterRole] || [];
-  if (!allowedRoles.includes(role)) {
-    const err = new Error(`Your role (${inviterRole}) is not permitted to invite a '${role}' user`);
-    err.statusCode = 403;
-    throw err;
-  }
-
-  const existingUser = await findUserByEmailOrMobile(email);
-  if (existingUser) {
-    const err = new Error('A user with this email already exists');
-    err.statusCode = 409;
-    throw err;
-  }
-
-  const roleRecord = await getRoleByName(role);
-  if (!roleRecord) {
-    const err = new Error('Invalid role specified');
-    err.statusCode = 400;
-    throw err;
-  }
-
-  const rawToken = crypto.randomBytes(32).toString('hex');
-  const expiresAt = new Date(
-    Date.now() + (Number(process.env.INVITE_EXPIRY_HOURS) || 72) * 60 * 60 * 1000
-  );
-
-  const result = await pool.query(
-    `INSERT INTO invites (tenant_id, role_id, full_name, email, invited_by, token_hash, expires_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
-     RETURNING id, full_name, email, status, expires_at, created_at`,
-    [tenantId || null, roleRecord.id, fullName, email, inviterId, hashToken(rawToken), expiresAt]
-  );
-
-  // NOTE: integrate with email provider here to actually send the invite link
-  // e.g. https://app.propertysearch.com/accept-invite?token=<rawToken>
-  return { invite: result.rows[0], rawToken };
-}
-
-async function getInviteByToken(rawToken) {
-  const result = await pool.query(
-    `SELECT i.*, r.name AS role_name
-     FROM invites i
-     JOIN roles r ON r.id = i.role_id
-     WHERE i.token_hash = $1 AND i.status = 'pending' AND i.expires_at > now()`,
-    [hashToken(rawToken)]
-  );
-  return result.rows[0];
-}
-
-async function acceptInvite(rawToken, password) {
-  const invite = await getInviteByToken(rawToken);
-  if (!invite) {
-    const err = new Error('Invite link is invalid, expired, or already used');
-    err.statusCode = 400;
-    throw err;
-  }
-
-  const passwordHash = await bcrypt.hash(password, 10);
-
-  const userResult = await pool.query(
-    `INSERT INTO users (tenant_id, role_id, full_name, email, password_hash, status, email_verified)
-     VALUES ($1, $2, $3, $4, $5, 'active', true)
-     RETURNING id, tenant_id, full_name, email, status, created_at`,
-    [invite.tenant_id, invite.role_id, invite.full_name, invite.email, passwordHash]
-  );
-
-  await pool.query(
-    `UPDATE invites SET status = 'accepted', accepted_at = now() WHERE id = $1`,
-    [invite.id]
-  );
-
-  return { ...userResult.rows[0], role: invite.role_name };
-}
-
 module.exports = {
-  PUBLIC_REGISTER_ROLES,
-  OPEN_ROLE_REGISTRATION,
-  INVITE_PERMISSIONS,
+  PUBLIC_SELF_REGISTER_ROLES,
+  ROLE_CREATION_PERMISSIONS,
   getRoleByName,
   findUserByEmailOrMobile,
   findUserById,
@@ -331,7 +289,4 @@ module.exports = {
   consumePasswordResetToken,
   updatePassword,
   markVerified,
-  createInvite,
-  getInviteByToken,
-  acceptInvite,
 };

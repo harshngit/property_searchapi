@@ -46,7 +46,7 @@ const options = {
             role: {
               type: 'string',
               description:
-                'In production, only `customer` and `broker` can self-register through this endpoint — every other role returns 403 and must be created by an Admin/Super Admin via the invite flow. Outside production (or with ALLOW_ALL_ROLE_REGISTRATION=true), all roles listed here are permitted as a dev/test convenience.',
+                '`customer`/`broker` self-register with no token. `super_admin` self-registers with no token only while none exists yet (one-time bootstrap); afterwards, and for `admin`/`agency_admin`/`builder`/`internal_sales` always, a bearer token from a role permitted to create the target role is required (see the /auth/register endpoint description).',
               enum: [
                 'customer',
                 'broker',
