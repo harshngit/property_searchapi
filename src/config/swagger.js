@@ -46,7 +46,7 @@ const options = {
             role: {
               type: 'string',
               description:
-                'All platform roles are listed here for reference. Only `customer` and `broker` can self-register through this endpoint — every other role returns 403 and must be created by an Admin/Super Admin via the invite flow.',
+                'In production, only `customer` and `broker` can self-register through this endpoint — every other role returns 403 and must be created by an Admin/Super Admin via the invite flow. Outside production (or with ALLOW_ALL_ROLE_REGISTRATION=true), all roles listed here are permitted as a dev/test convenience.',
               enum: [
                 'customer',
                 'broker',

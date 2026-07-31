@@ -3,10 +3,20 @@ const crypto = require('crypto');
 const pool = require('../config/db');
 const { generateOtp, getOtpExpiry } = require('../utils/otp');
 
-// Roles allowed to self-register through the public /auth/register endpoint.
-// All other roles (agency_admin, builder, internal_sales, admin, super_admin)
-// must be created via the admin invite flow.
+// Roles allowed to self-register through the public /auth/register endpoint
+// in production. All other roles (agency_admin, builder, internal_sales,
+// admin, super_admin) must be created via the admin invite flow there.
 const PUBLIC_REGISTER_ROLES = ['customer', 'broker'];
+
+// Outside production (local/dev/test), /auth/register accepts every role,
+// including admin/super_admin - purely a convenience for spinning up test
+// accounts without going through the invite flow. Never enable this in a
+// real deployment: it lets any unauthenticated caller grant themselves
+// admin rights. Can be forced on/off explicitly via ALLOW_ALL_ROLE_REGISTRATION.
+const OPEN_ROLE_REGISTRATION =
+  process.env.ALLOW_ALL_ROLE_REGISTRATION !== undefined
+    ? process.env.ALLOW_ALL_ROLE_REGISTRATION === 'true'
+    : process.env.NODE_ENV !== 'production';
 
 async function getRoleByName(roleName) {
   const result = await pool.query('SELECT id, name FROM roles WHERE name = $1', [roleName]);
@@ -38,7 +48,7 @@ async function findUserById(id) {
 }
 
 async function registerUser({ fullName, email, mobile, password, role, tenantId }) {
-  if (!PUBLIC_REGISTER_ROLES.includes(role)) {
+  if (!PUBLIC_REGISTER_ROLES.includes(role) && !OPEN_ROLE_REGISTRATION) {
     const err = new Error(
       `Role '${role}' cannot self-register. This role must be created by an Admin/Super Admin via the invite flow.`
     );
@@ -62,8 +72,15 @@ async function registerUser({ fullName, email, mobile, password, role, tenantId 
 
   const passwordHash = password ? await bcrypt.hash(password, 10) : null;
 
-  // customer -> active immediately, broker -> pending_approval
-  const status = role === 'customer' ? 'active' : 'pending_approval';
+  // customer -> active immediately, broker -> pending_approval (needs
+  // Agency Admin/Admin activation). Roles only reachable via the
+  // OPEN_ROLE_REGISTRATION dev bypass go active immediately too - there's
+  // no admin/invite loop to approve them in a fresh dev setup, so leaving
+  // them pending_approval would just soft-lock the account.
+  const status =
+    role === 'customer' || (OPEN_ROLE_REGISTRATION && !PUBLIC_REGISTER_ROLES.includes(role))
+      ? 'active'
+      : 'pending_approval';
 
   const result = await pool.query(
     `INSERT INTO users (tenant_id, role_id, full_name, email, mobile, password_hash, status)
@@ -296,6 +313,7 @@ async function acceptInvite(rawToken, password) {
 
 module.exports = {
   PUBLIC_REGISTER_ROLES,
+  OPEN_ROLE_REGISTRATION,
   INVITE_PERMISSIONS,
   getRoleByName,
   findUserByEmailOrMobile,

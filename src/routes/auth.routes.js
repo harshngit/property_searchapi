@@ -6,6 +6,8 @@ const authController = require('../controllers/auth.controller');
 const validate = require('../middlewares/validate');
 const { authenticate } = require('../middlewares/auth');
 
+const ALL_ROLES = ['customer', 'broker', 'agency_admin', 'builder', 'internal_sales', 'admin', 'super_admin'];
+
 /**
  * @swagger
  * tags:
@@ -19,16 +21,19 @@ const { authenticate } = require('../middlewares/auth');
  *   post:
  *     summary: Register a new user
  *     description: >
- *       Public self-registration endpoint. The **role** dropdown lists every
- *       role used across PropertySerch.com for reference, but only
- *       `customer` and `broker` are permitted to self-register here.
+ *       Public self-registration endpoint.
  *
  *       - `customer` → account is created with status `active` immediately.
  *       - `broker` → account is created with status `pending_approval` and
  *         must be activated by an Agency Admin/Admin.
  *       - `agency_admin`, `builder`, `internal_sales`, `admin`, `super_admin`
- *         → **not allowed** through this endpoint (returns `403`). These
- *         roles are created only by an Admin/Super Admin via the invite flow.
+ *         → **blocked in production** (returns `403`) — these roles are
+ *         normally created only by an Admin/Super Admin via the invite flow.
+ *         **Outside production** (`NODE_ENV !== 'production'`, or forced via
+ *         the `ALLOW_ALL_ROLE_REGISTRATION` env var), this restriction is
+ *         lifted as a dev/test convenience and these roles self-register
+ *         with status `active` immediately. Never enable this in a real
+ *         deployment — it lets any caller grant themselves admin rights.
  *     tags: [Authentication]
  *     requestBody:
  *       required: true
@@ -56,7 +61,7 @@ const { authenticate } = require('../middlewares/auth');
  *                 role: broker
  *                 tenantId: null
  *             agencyAdminBlocked:
- *               summary: agency_admin (blocked - returns 403)
+ *               summary: agency_admin (blocked with 403 in production; allowed outside production)
  *               value:
  *                 fullName: Suresh Rao
  *                 email: suresh@agency.com
@@ -76,7 +81,7 @@ const { authenticate } = require('../middlewares/auth');
  *                 data:
  *                   $ref: '#/components/schemas/RegisteredUser'
  *       403:
- *         description: Role not allowed to self-register (e.g. agency_admin, builder, admin, super_admin)
+ *         description: Role not allowed to self-register in production (e.g. agency_admin, builder, admin, super_admin)
  *         content:
  *           application/json:
  *             schema:
@@ -101,7 +106,7 @@ router.post(
     body('email').optional().isEmail().withMessage('Valid email required'),
     body('mobile').optional().isMobilePhone().withMessage('Valid mobile number required'),
     body('password').optional().isLength({ min: 6 }).withMessage('Password must be at least 6 characters'),
-    body('role').isIn(['customer', 'broker']).withMessage('Role must be customer or broker'),
+    body('role').isIn(ALL_ROLES).withMessage(`Role must be one of: ${ALL_ROLES.join(', ')}`),
   ],
   validate,
   authController.register

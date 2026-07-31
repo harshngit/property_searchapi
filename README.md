@@ -137,12 +137,23 @@ Raw OpenAPI JSON: `http://localhost:5000/api-docs.json`
 
 ## Role registration rule
 
-Only **customer** and **broker** roles are allowed through `/api/auth/register`.
-`agency_admin`, `builder`, `internal_sales`, `admin`, `super_admin` must be created
-by an Admin/Super Admin via an invite flow (separate module — not part of this file set).
+In **production** (`NODE_ENV=production`), only **customer** and **broker** roles are
+allowed through `/api/auth/register`. `agency_admin`, `builder`, `internal_sales`, `admin`,
+`super_admin` must be created by an Admin/Super Admin via the invite flow
+(`/api/admin/users/invite` → `/api/admin/users/accept-invite`).
 
 - customer -> status becomes `active` immediately
 - broker -> status becomes `pending_approval`, needs Agency Admin/Admin to activate
+- every other role -> blocked with `403` in production
+
+**Outside production** (`NODE_ENV !== 'production'`, the default in `.env.example`), this
+restriction is lifted: `/api/auth/register` accepts **all** roles, including `admin` and
+`super_admin`, and they go `active` immediately (no invite/approval loop to wait on). This
+is purely a local/dev/test convenience for spinning up accounts quickly — set
+`ALLOW_ALL_ROLE_REGISTRATION=false` to force it off even in dev, or `=true` to force it on
+even in production. **Never enable this in a real deployment** — it lets any
+unauthenticated caller grant themselves admin rights. See `OPEN_ROLE_REGISTRATION` in
+`src/services/auth.service.js`.
 
 ## Property Listings, Search & Projects — design notes
 
