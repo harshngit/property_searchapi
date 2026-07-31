@@ -20,6 +20,9 @@ const dealRoutes = require('./routes/deal.routes');
 const documentRoutes = require('./routes/document.routes');
 const paymentRoutes = require('./routes/payment.routes');
 const reportRoutes = require('./routes/report.routes');
+const whatsappRoutes = require('./routes/whatsapp.routes');
+const aiRoutes = require('./routes/ai.routes');
+const matchingRoutes = require('./routes/matching.routes');
 const { notFoundHandler, errorHandler } = require('./middlewares/errorHandler');
 
 const app = express();
@@ -70,6 +73,9 @@ app.use('/api/deals', dealRoutes);
 app.use('/api/documents', documentRoutes);
 app.use('/api/payments', paymentRoutes);
 app.use('/api/reports', reportRoutes);
+app.use('/api/whatsapp', whatsappRoutes);
+app.use('/api/ai', aiRoutes);
+app.use('/api/matching', matchingRoutes);
 
 // 404 + error handler (must be last)
 app.use(notFoundHandler);

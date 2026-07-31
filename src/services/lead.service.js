@@ -1,6 +1,7 @@
 const pool = require('../config/db');
 const { isAdmin } = require('../utils/ownership');
 const customerService = require('./customer.service');
+const whatsappService = require('./whatsapp.service');
 
 function notFound(message = 'Lead not found') {
   const err = new Error(message);
@@ -111,12 +112,26 @@ async function createLead(data, user) {
     });
 
     await client.query('COMMIT');
+    await sendAcknowledgement(lead.id, user);
     return lead;
   } catch (err) {
     await client.query('ROLLBACK');
     throw err;
   } finally {
     client.release();
+  }
+}
+
+// Fires the WhatsApp lead-acknowledgement template right after a lead is
+// committed. Runs outside the lead's own transaction (an external API call
+// has no place inside a DB transaction) and never throws - a WhatsApp
+// failure (missing config, no phone on file, provider error) must not
+// break lead creation.
+async function sendAcknowledgement(leadId, user) {
+  try {
+    await whatsappService.acknowledgeLead(leadId, { actingUser: user || null });
+  } catch (err) {
+    console.error(`WhatsApp acknowledge-lead failed for lead ${leadId}:`, err.message);
   }
 }
 
@@ -147,6 +162,7 @@ async function createPublicInquiry(data) {
     });
 
     await client.query('COMMIT');
+    await sendAcknowledgement(lead.id, null);
     return lead;
   } catch (err) {
     await client.query('ROLLBACK');

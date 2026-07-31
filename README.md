@@ -3,7 +3,8 @@
 Node.js + Express + PostgreSQL backend covering Authentication & Access,
 Property Listings, Property Search, Projects/Units (Builder),
 Lead Management & Customer 360, Tasks/Follow-ups & Broker CRM Dashboard,
-Deal Pipeline & Document Management, and Payment Tracking & Analytics/Reports.
+Deal Pipeline & Document Management, Payment Tracking & Analytics/Reports,
+WhatsApp Integration, AI Lead Qualification, and Property Matching.
 
 ## Setup
 
@@ -121,6 +122,18 @@ Raw OpenAPI JSON: `http://localhost:5000/api-docs.json`
 | GET    | /api/reports/payments               | Yes | Roles: admin, super_admin, agency_admin. Collected/pending/overdue totals |
 | GET    | /api/reports/revenue                 | Yes | Roles: admin, super_admin, agency_admin. Closed-won deal value + commission, by broker/agency |
 | GET    | /api/reports/export                  | Yes | `?report=<type>`. Returns **CSV**, not the JSON envelope. Brokers may only export `report=brokers`, self-scoped |
+| POST   | /api/whatsapp/send-template          | Yes | Roles: broker, agency_admin, internal_sales, admin, super_admin. **Stubbed** Meta Cloud API call — logs the message and returns a mocked provider id |
+| POST   | /api/whatsapp/webhook                | No  | Meta's inbound webhook. Signature verification is a **TODO** stub — see whatsapp.service.js |
+| GET    | /api/whatsapp/conversations/:leadId  | Yes | Chronological conversation history for a lead |
+| POST   | /api/whatsapp/share-property         | Yes | Same stub pattern as send-template, pre-filled with the property title |
+| POST   | /api/whatsapp/acknowledge-lead       | Yes | Manually (re)send the acknowledgement template. The same logic also fires **automatically** right after a lead is created — see lead.service.js |
+| POST   | /api/ai/lead-summary                 | Yes | Roles: broker, agency_admin, internal_sales, admin, super_admin. Calls the Anthropic API to extract budget/location/type/intent/timeline + a hot/warm/cold read, saves to `ai_lead_insights` |
+| POST   | /api/ai/lead-score                   | Yes | Re-extracts, then blends a rule-based score (budget-on-file + engagement recency + source quality) with the AI's own read (60/40), saves the final score |
+| POST   | /api/ai/extract-intent               | Yes | Same extraction as lead-summary, but preview-only — nothing is saved |
+| GET    | /api/ai/lead/:id/analysis            | Yes | Latest saved `ai_lead_insights` row for a lead (`null` if none yet) |
+| GET    | /api/matching/properties/:customerId | Yes | Ranks approved, tenant-scoped properties against the customer's saved preferences; saves top 20 to `property_match_results` |
+| POST   | /api/matching/rerun                  | Yes | Re-runs the above for a customer, overwriting its previous (customer-level) results |
+| GET    | /api/matching/recommendations/:leadId | Yes | Same ranking, keyed off a lead via `leads.customer_id`; saved separately from the customer-level results |
 
 ## Role registration rule
 
@@ -308,13 +321,30 @@ by an Admin/Super Admin via an invite flow (separate module — not part of this
   in this module that doesn't use `success()`/`error()`, since it streams `text/csv` with a
   `Content-Disposition: attachment` header instead of a JSON envelope.
 
+## WhatsApp Integration, AI Lead Qualification & Property Matching — design notes
+
+- **No live Meta Cloud API / Anthropic tokens are hardcoded anywhere.** `whatsapp.service.js#sendTemplateMessage` inserts the `whatsapp_conversations` row and returns a mocked `stub_wamid_<hex>` provider id — the real `axios.post` call against `graph.facebook.com` is a `TODO` comment showing exactly where it goes. The AI service's Anthropic call is real (reads `ANTHROPIC_API_KEY` from the environment), since the brief explicitly asked for the real Anthropic integration while keeping WhatsApp stubbed.
+- **`lead_id`/`customer_id` are nullable on `whatsapp_conversations`**, deviating from the brief's flat column list — an inbound webhook message can arrive from a phone number that doesn't match any known lead/customer yet, and it's still worth logging, just unlinked.
+- **The webhook payload is deliberately simplified.** Meta's real webhook shape is deeply nested (`entry[].changes[].value.messages[]/statuses[]`); `POST /api/whatsapp/webhook` accepts a flattened `{ type: 'message'|'status', phoneNumber, providerMessageId, messageBody, status }` stand-in instead, with a `TODO` marking where real payload parsing and `X-Hub-Signature-256` verification would go.
+- **Lead acknowledgement is wired two ways, sharing one function.** `whatsapp.service.js#acknowledgeLead(leadId, { phoneNumber, actingUser })` is called both from `POST /api/whatsapp/acknowledge-lead` and directly from `lead.service.js#createLead`/`#createPublicInquiry`, *after* each lead's own transaction commits (an external API call has no place inside a DB transaction). It never throws — a missing phone number is a no-op, and any other failure is caught and logged in `lead.service.js#sendAcknowledgement`, so WhatsApp can never break lead creation.
+- **`ai_lead_insights` is append-only**, like `lead_activity_log`/`deal_stage_history` elsewhere in this schema — every `lead-summary`/`lead-score` run inserts a fresh row rather than upserting, so `GET /lead/:id/analysis` reads the latest via `ORDER BY created_at DESC LIMIT 1`. This also means `lead-summary` and `lead-score` never clobber each other's history.
+- **Model choice deviates from the brief's exact string.** The spec named `claude-sonnet-4-6` (a real, active model), but that generation doesn't support the Messages API's structured-outputs feature (`output_config.format` with a `json_schema`) — `claude-sonnet-5` does, which gets a guaranteed-parseable extraction instead of hoping the model's prose JSON parses cleanly. Same tier the brief asked for, current generation.
+- **AI failures never break lead creation or the qualification endpoints' callers.** `ai.service.js#extractInsight` never calls the Anthropic API at all if a lead has no notes/inquiry text (nothing to extract, no point spending a request). `#safeGenerateLeadSummary` exists specifically for internal callers that must never throw; the direct `POST /api/ai/*` endpoints do propagate AI failures (as `502`), since a caller who explicitly asked for extraction needs to know it failed.
+- **The rule-based scorer in `POST /api/ai/lead-score`** is a simple, tunable heuristic (max 100): 40 pts for having both budget bounds on file in `customer_preferences`, up to 35 pts for engagement recency (based on the latest `lead_activity_log` row), and up to 25 pts for source quality (`whatsapp`/`website` outrank `manual`/`campaign`). It's blended with the AI's own hot/warm/cold read at a fixed 60/40 weight — see the code comment in `ai.service.js#scoreLead` for exactly why that split.
+- **Property Matching scopes candidate properties by the *customer's* tenant**, not the caller's — `matching.service.js#runMatchingForCustomer` filters `status = 'approved' AND (tenant_id = customer.tenant_id OR tenant_id IS NULL)`. Tenant-less properties (if any exist) are treated as globally visible; this wasn't specified in the brief and is flagged as an assumption in the code.
+- **Relevance scoring is computed in JS, not SQL** — a loose SQL prefilter (`status='approved'` + tenant scope) pulls candidate rows, then `matching.service.js#scoreProperty` applies the weighted score (location 40 / budget fit 35 / property type 15 / transaction type 10) and takes the top 20. The dataset sizes this module targets don't justify pushing that logic into SQL.
+- **`property_match_results` distinguishes customer-level from lead-level runs via `lead_id`.** `GET /matching/properties/:customerId` and `POST /matching/rerun` both operate on the `lead_id IS NULL` slot for that customer; `GET /matching/recommendations/:leadId` operates on its own `lead_id`-scoped slot, so running one never overwrites the other.
+
 ## Not yet wired (TODO — next modules)
 
 - Actual SMS/Email provider integration for OTP & reset link delivery (currently returned
   in the API response only when `NODE_ENV !== production`, for local testing)
 - Tenant onboarding APIs
 - File upload infrastructure for property/customer/deal document media (currently URL-only)
-- WhatsApp module (`GET /api/customers/:id/conversations` is a placeholder)
+- Real Meta WhatsApp Cloud API integration (send + webhook signature verification) — see the
+  `TODO` comments in `whatsapp.service.js`. `GET /api/customers/:id/conversations` still returns
+  its original empty-array placeholder rather than querying the new `whatsapp_conversations`
+  table — left untouched since it wasn't part of this module's requested scope
 - A real scheduled job for overdue-task detection/notification (currently computed lazily on
   read — see Tasks design notes above) and for `lead_assigned`/`follow_up_due` notifications
 - `GET /api/properties/:id/inquiries` could now be implemented for real (leads have a
