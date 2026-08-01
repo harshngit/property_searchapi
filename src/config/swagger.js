@@ -15,7 +15,7 @@ const options = {
         description: 'Local development server',
       },
       {
-        url: 'https://api.propertyserch.co.in/api',
+        url: 'https://api.propertyserch.com/api',
         description: 'Production server',
       },
     ],

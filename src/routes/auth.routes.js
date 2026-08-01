@@ -81,7 +81,7 @@ const ALL_ROLES = ['customer', 'broker', 'agency_admin', 'builder', 'internal_sa
  *               summary: super_admin (no token needed only while none exist yet)
  *               value:
  *                 fullName: Founding Super Admin
- *                 email: root@propertyserch.co.in
+ *                 email: root@propertyserch.com
  *                 password: Passw0rd!123
  *                 role: super_admin
  *                 tenantId: null
