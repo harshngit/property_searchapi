@@ -28,6 +28,15 @@ const { notFoundHandler, errorHandler } = require('./middlewares/errorHandler');
 
 const app = express();
 
+// The VPS deployment sits behind a reverse proxy (e.g. Nginx), which adds an
+// X-Forwarded-For header. Without this, Express ignores that header (so
+// req.ip is always the proxy's own IP) and express-rate-limit throws
+// ERR_ERL_UNEXPECTED_X_FORWARDED_FOR since it can't safely tell which client
+// is which. `1` means "trust exactly one hop in front of this app" - correct
+// for a single reverse proxy on the same box; raise it if another layer
+// (e.g. a load balancer) sits in front of that.
+app.set('trust proxy', 1);
+
 app.use(helmet());
 app.use(cors());
 app.use(express.json());

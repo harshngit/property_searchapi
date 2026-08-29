@@ -1,4 +1,5 @@
 const OTP_SEND_URL = 'https://control.msg91.com/api/v5/otp';
+const FLOW_SEND_URL = 'https://control.msg91.com/api/v5/flow/';
 
 // Each otp_purpose gets its own DLT-approved template (different wording per
 // purpose, e.g. "...complete registration..." vs "...login..."), so there is
@@ -36,16 +37,17 @@ function isMobileIdentifier(identifier) {
   return !identifier.includes('@') && /^\+?[0-9\s-]{8,15}$/.test(identifier);
 }
 
-// Delivers an already-generated OTP via SMS using MSG91's SendOTP API in
-// "custom OTP" mode (the `otp` param) - our own otp_verifications row, with
-// its own expiry and attempt-limiting (see auth.service.js), stays the
-// single source of truth for verification. MSG91 is used purely as the
+// Delivers an already-generated OTP via SMS using MSG91's dedicated SendOTP
+// API in "custom OTP" mode (the `otp` param) - our own otp_verifications
+// row, with its own expiry and attempt-limiting (see auth.service.js), stays
+// the single source of truth for verification. MSG91 is used purely as the
 // delivery channel, never asked to verify anything itself.
 //
-// templateId must point at a DLT-approved template (created in the MSG91
-// dashboard under SendOTP > Templates, one per purpose) whose body includes
-// the ##OTP## variable, otherwise MSG91 will reject the request.
-async function sendOtpSms(identifier, otpCode, templateId) {
+// templateId must point at a DLT-approved template (MSG91 dashboard ->
+// SendOTP > Templates, one per purpose) whose body includes the ##OTP##
+// variable - that placeholder name is specific to this API, which is why
+// it's the default mode (see sendModeViaFlow below for the alternative).
+async function sendOtpViaOtpApi(identifier, otpCode, templateId) {
   const params = new URLSearchParams({
     template_id: templateId,
     mobile: formatMobile(identifier),
@@ -62,16 +64,62 @@ async function sendOtpSms(identifier, otpCode, templateId) {
   const data = await response.json().catch(() => ({}));
 
   if (!response.ok || data.type !== 'success') {
-    const err = new Error(`Failed to send OTP via MSG91: ${data.message || response.statusText}`);
+    const err = new Error(`Failed to send OTP via MSG91 OTP API: ${data.message || response.statusText}`);
     err.statusCode = 502;
     throw err;
   }
 
+  return data;
+}
+
+// Alternative delivery path via MSG91's general "Send SMS" / Flow API,
+// for accounts where the OTP-specific product isn't the one actually
+// provisioned. Templates for this path are normally written with a named
+// variable like ##OTP## too (mapped 1:1 to a same-named key on the
+// recipient object below) - if your client's template instead uses the
+// older {#var#} DLT syntax with no name, use VAR1 as the key instead.
+// Toggle with MSG91_SEND_MODE=flow (default remains the OTP API above).
+async function sendOtpViaFlowApi(identifier, otpCode, templateId) {
+  const response = await fetch(FLOW_SEND_URL, {
+    method: 'POST',
+    headers: {
+      authkey: process.env.MSG91_AUTH_KEY,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify({
+      template_id: templateId,
+      short_url: '0',
+      recipients: [
+        {
+          mobiles: formatMobile(identifier),
+          OTP: otpCode,
+        },
+      ],
+    }),
+  });
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok || data.type !== 'success') {
+    const err = new Error(`Failed to send OTP via MSG91 Flow/SMS API: ${data.message || response.statusText}`);
+    err.statusCode = 502;
+    throw err;
+  }
+
+  return data;
+}
+
+async function sendOtpSms(identifier, otpCode, templateId) {
+  const useFlow = process.env.MSG91_SEND_MODE === 'flow';
+  const data = useFlow
+    ? await sendOtpViaFlowApi(identifier, otpCode, templateId)
+    : await sendOtpViaOtpApi(identifier, otpCode, templateId);
+
   // "success" only means MSG91 accepted the request, not that the carrier
-  // delivered it. Logged in full (response shape isn't fully confirmed yet)
-  // so it can be matched against MSG91 dashboard -> SendOTP > Logs, which
-  // can also just be searched directly by mobile number.
-  console.log(`[msg91] OTP send accepted for ${formatMobile(identifier)}:`, data);
+  // delivered it. Logged in full so it can be matched against MSG91
+  // dashboard -> SendOTP > Logs, which can also just be searched by number.
+  console.log(`[msg91] OTP send accepted (mode: ${useFlow ? 'flow' : 'otp'}) for ${formatMobile(identifier)}:`, data);
 
   return data;
 }
