@@ -2,6 +2,7 @@ const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const pool = require('../config/db');
 const { generateOtp, getOtpExpiry } = require('../utils/otp');
+const msg91Service = require('./msg91.service');
 const { uploadBuffer, deleteObject, getReadUrl } = require('../utils/storage');
 
 // Roles that can always self-register through /auth/register with no token.
@@ -220,7 +221,22 @@ async function createOtp(identifier, purpose, userId = null) {
     [userId, identifier, otpCode, purpose, expiresAt]
   );
 
-  // NOTE: integrate with SMS/Email provider here to actually deliver the OTP.
+  if (msg91Service.isMobileIdentifier(identifier)) {
+    const templateId = msg91Service.getTemplateIdForPurpose(purpose);
+    if (process.env.MSG91_AUTH_KEY && templateId) {
+      await msg91Service.sendOtpSms(identifier, otpCode, templateId);
+    } else if (process.env.NODE_ENV === 'production') {
+      const err = new Error(`SMS delivery is not configured for purpose '${purpose}' (missing MSG91_AUTH_KEY or its template id env var)`);
+      err.statusCode = 500;
+      throw err;
+    }
+    // Else: MSG91 isn't configured for this purpose in a non-production
+    // environment - fall through silently so local/dev testing keeps
+    // working off the debug OTP echo in auth.controller.js, with no MSG91
+    // account required.
+  }
+  // NOTE: email identifiers aren't delivered yet - see the SMTP TODO above.
+
   return otpCode;
 }
 
