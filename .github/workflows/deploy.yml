@@ -20,8 +20,10 @@ jobs:
           key: ${{ secrets.VPS_SSH_KEY }}
           port: ${{ secrets.VPS_PORT }}
           script: |
+            export PATH="/home/asynk/.nvm/versions/node/v24.18.1/bin:$PATH"
             cd ~/property_searchapi
-            git pull origin main
+            git fetch origin main
+            git reset --hard origin/main
             npm install
             npm run migrate
             pm2 restart property-search-api
