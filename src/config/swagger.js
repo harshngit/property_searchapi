@@ -15,8 +15,8 @@ const options = {
         description: 'Local development server',
       },
       {
-        url: 'https://propertysearch-api-prod-487162063318.asia-south1.run.app/api',
-        description: 'Production server',
+        url: 'https://api.propertyserch.com/api',
+        description: 'Production server (VPS)',
       },
     ],
     components: {
