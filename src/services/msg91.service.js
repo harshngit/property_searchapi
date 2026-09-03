@@ -19,6 +19,24 @@ function getTemplateIdForPurpose(purpose) {
   return envVar ? process.env[envVar] : undefined;
 }
 
+// DLT_TE_ID is the DLT REGISTRY's own template id (assigned by the telecom
+// operator's DLT platform when the template was approved) - a different id
+// from MSG91's own template_id above. Per MSG91 support, some routes need
+// both for the carrier to independently verify the message against DLT;
+// without it, MSG91 can accept the request while the carrier silently drops
+// it. Optional per purpose - only send it when configured.
+const DLT_TE_ID_ENV_VAR_BY_PURPOSE = {
+  register: 'MSG91_DLT_TE_ID_REGISTER',
+  login: 'MSG91_DLT_TE_ID_LOGIN',
+  reset_password: 'MSG91_DLT_TE_ID_RESET_PASSWORD',
+  mobile_verification: 'MSG91_DLT_TE_ID_MOBILE_VERIFICATION',
+};
+
+function getDltTeIdForPurpose(purpose) {
+  const envVar = DLT_TE_ID_ENV_VAR_BY_PURPOSE[purpose];
+  return envVar ? process.env[envVar] : undefined;
+}
+
 // MSG91 expects the mobile number with a country code and no leading '+',
 // spaces or dashes. The only shape stored today is a bare 10-digit Indian
 // number (see users.mobile / swagger examples), so that's what gets the
@@ -47,7 +65,7 @@ function isMobileIdentifier(identifier) {
 // SendOTP > Templates, one per purpose) whose body includes the ##OTP##
 // variable - that placeholder name is specific to this API, which is why
 // it's the default mode (see sendModeViaFlow below for the alternative).
-async function sendOtpViaOtpApi(identifier, otpCode, templateId) {
+async function sendOtpViaOtpApi(identifier, otpCode, templateId, dltTeId) {
   const params = new URLSearchParams({
     template_id: templateId,
     mobile: formatMobile(identifier),
@@ -55,6 +73,7 @@ async function sendOtpViaOtpApi(identifier, otpCode, templateId) {
     otp: otpCode,
     otp_expiry: String(Number(process.env.OTP_EXPIRY_MINUTES) || 5),
   });
+  if (dltTeId) params.set('DLT_TE_ID', dltTeId);
 
   const response = await fetch(`${OTP_SEND_URL}?${params.toString()}`, {
     method: 'POST',
@@ -79,7 +98,10 @@ async function sendOtpViaOtpApi(identifier, otpCode, templateId) {
 // recipient object below) - if your client's template instead uses the
 // older {#var#} DLT syntax with no name, use VAR1 as the key instead.
 // Toggle with MSG91_SEND_MODE=flow (default remains the OTP API above).
-async function sendOtpViaFlowApi(identifier, otpCode, templateId) {
+async function sendOtpViaFlowApi(identifier, otpCode, templateId, dltTeId) {
+  const recipient = { mobiles: formatMobile(identifier), OTP: otpCode };
+  if (dltTeId) recipient.DLT_TE_ID = dltTeId;
+
   const response = await fetch(FLOW_SEND_URL, {
     method: 'POST',
     headers: {
@@ -90,12 +112,7 @@ async function sendOtpViaFlowApi(identifier, otpCode, templateId) {
     body: JSON.stringify({
       template_id: templateId,
       short_url: '0',
-      recipients: [
-        {
-          mobiles: formatMobile(identifier),
-          OTP: otpCode,
-        },
-      ],
+      recipients: [recipient],
     }),
   });
 
@@ -110,11 +127,12 @@ async function sendOtpViaFlowApi(identifier, otpCode, templateId) {
   return data;
 }
 
-async function sendOtpSms(identifier, otpCode, templateId) {
+async function sendOtpSms(identifier, otpCode, templateId, purpose) {
   const useFlow = process.env.MSG91_SEND_MODE === 'flow';
+  const dltTeId = getDltTeIdForPurpose(purpose);
   const data = useFlow
-    ? await sendOtpViaFlowApi(identifier, otpCode, templateId)
-    : await sendOtpViaOtpApi(identifier, otpCode, templateId);
+    ? await sendOtpViaFlowApi(identifier, otpCode, templateId, dltTeId)
+    : await sendOtpViaOtpApi(identifier, otpCode, templateId, dltTeId);
 
   // "success" only means MSG91 accepted the request, not that the carrier
   // delivered it. Logged in full so it can be matched against MSG91

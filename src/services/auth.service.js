@@ -224,7 +224,7 @@ async function createOtp(identifier, purpose, userId = null) {
   if (msg91Service.isMobileIdentifier(identifier)) {
     const templateId = msg91Service.getTemplateIdForPurpose(purpose);
     if (process.env.MSG91_AUTH_KEY && templateId) {
-      await msg91Service.sendOtpSms(identifier, otpCode, templateId);
+      await msg91Service.sendOtpSms(identifier, otpCode, templateId, purpose);
     } else if (process.env.NODE_ENV === 'production') {
       const err = new Error(`SMS delivery is not configured for purpose '${purpose}' (missing MSG91_AUTH_KEY or its template id env var)`);
       err.statusCode = 500;
