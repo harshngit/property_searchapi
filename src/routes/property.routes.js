@@ -29,6 +29,28 @@ const EXTENDED_FIELD_VALIDATORS = [
   body('yieldQualifier').optional().isString().isLength({ max: 100 }),
 ];
 
+// Also shared across POST /properties and PUT /properties/:id - display
+// fields the dashboard frontend already reads/writes (about section, RERA,
+// floor/furnishing/parking details, tags, badge, verified flag, FAQs).
+const DISPLAY_FIELD_VALIDATORS = [
+  body('aboutExtended').optional().isString(),
+  body('carpetAreaSqft').optional().isFloat({ min: 0 }),
+  body('facing').optional().isString().isLength({ max: 50 }),
+  body('tags').optional().isArray(),
+  body('badge').optional().isString().isLength({ max: 50 }),
+  body('verified').optional().isBoolean(),
+  body('reraNumber').optional().isString().isLength({ max: 100 }),
+  body('possessionStatus').optional().isString().isLength({ max: 50 }),
+  body('floorNumber').optional().isInt({ min: 0 }),
+  body('totalFloors').optional().isInt({ min: 0 }),
+  body('furnishing').optional().isString().isLength({ max: 50 }),
+  body('parkingSpots').optional().isInt({ min: 0 }),
+  body('parkingType').optional().isString().isLength({ max: 50 }),
+  body('ageOfProperty').optional().isString().isLength({ max: 50 }),
+  body('gatedCommunity').optional().isBoolean(),
+  body('faqs').optional().isArray(),
+];
+
 /**
  * @swagger
  * tags:
@@ -199,6 +221,7 @@ router.post(
     body('bathrooms').optional().isInt({ min: 0 }),
     body('amenities').optional().isArray(),
     ...EXTENDED_FIELD_VALIDATORS,
+    ...DISPLAY_FIELD_VALIDATORS,
   ],
   validate,
   propertyController.createProperty
@@ -244,6 +267,7 @@ router.put(
     body('bathrooms').optional().isInt({ min: 0 }),
     body('amenities').optional().isArray(),
     ...EXTENDED_FIELD_VALIDATORS,
+    ...DISPLAY_FIELD_VALIDATORS,
   ],
   validate,
   propertyController.updateProperty

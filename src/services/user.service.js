@@ -5,6 +5,7 @@ const { deleteObject, getReadUrl, signUrls } = require('../utils/storage');
 
 const USER_COLUMNS = `u.id, u.tenant_id, t.name AS tenant_name, u.full_name, u.email, u.mobile, u.status,
     u.email_verified, u.mobile_verified, u.profile_picture_url, u.signup_source,
+    u.builder_rating, u.builder_experience_years, u.builder_projects_count,
     u.last_login_at, u.created_at, u.updated_at, r.name AS role_name`;
 const USER_JOINS = `JOIN roles r ON r.id = u.role_id LEFT JOIN tenants t ON t.id = u.tenant_id`;
 
@@ -111,7 +112,16 @@ async function listUsers(actingUser, filters, page, limit) {
 // Shared by the admin "edit user" endpoint and the self-service "edit my
 // profile" endpoint - `allowedFields` controls which columns each may touch.
 async function applyProfileUpdate(id, updates, allowedFields) {
-  const columnMap = { fullName: 'full_name', email: 'email', mobile: 'mobile', status: 'status', tenantId: 'tenant_id' };
+  const columnMap = {
+    fullName: 'full_name',
+    email: 'email',
+    mobile: 'mobile',
+    status: 'status',
+    tenantId: 'tenant_id',
+    builderRating: 'builder_rating',
+    builderExperienceYears: 'builder_experience_years',
+    builderProjectsCount: 'builder_projects_count',
+  };
   const set = [];
   const params = [];
 
@@ -133,7 +143,16 @@ async function applyProfileUpdate(id, updates, allowedFields) {
 
 async function updateUser(actingUser, id, updates) {
   await fetchUserRow(actingUser, id);
-  await applyProfileUpdate(id, updates, ['fullName', 'email', 'mobile', 'status', 'tenantId']);
+  await applyProfileUpdate(id, updates, [
+    'fullName',
+    'email',
+    'mobile',
+    'status',
+    'tenantId',
+    'builderRating',
+    'builderExperienceYears',
+    'builderProjectsCount',
+  ]);
   return getUserById(actingUser, id);
 }
 

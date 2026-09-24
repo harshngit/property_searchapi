@@ -179,6 +179,9 @@ router.get(
  *               mobile: { type: string, example: "9876543210" }
  *               status: { type: string, enum: [active, pending_approval, inactive, suspended] }
  *               tenantId: { type: string, format: uuid, nullable: true }
+ *               builderRating: { type: number, minimum: 0, maximum: 5, description: Builder profile only }
+ *               builderExperienceYears: { type: integer, minimum: 0, description: Builder profile only }
+ *               builderProjectsCount: { type: integer, minimum: 0, description: Builder profile only }
  *     responses:
  *       200:
  *         description: User updated successfully
@@ -196,6 +199,9 @@ router.put(
     body('email').optional().isEmail().withMessage('Valid email required'),
     body('mobile').optional().isMobilePhone().withMessage('Valid mobile number required'),
     body('status').optional().isIn(USER_STATUSES),
+    body('builderRating').optional().isFloat({ min: 0, max: 5 }),
+    body('builderExperienceYears').optional().isInt({ min: 0 }),
+    body('builderProjectsCount').optional().isInt({ min: 0 }),
   ],
   validate,
   userController.updateUser

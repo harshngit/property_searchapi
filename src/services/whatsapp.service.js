@@ -1,6 +1,7 @@
-const crypto = require('crypto');
 const pool = require('../config/db');
 const { isAdmin } = require('../utils/ownership');
+const metaWhatsappService = require('./metaWhatsapp.service');
+const customerService = require('./customer.service');
 
 function notFound(message = 'Not found') {
   const err = new Error(message);
@@ -14,8 +15,57 @@ function badRequest(message) {
   return err;
 }
 
-const ACK_TEMPLATE = 'lead_acknowledgement';
-const PROPERTY_SHARE_TEMPLATE = 'property_share';
+// Template names must match templates already approved in Meta Business Manager.
+const ACK_TEMPLATE = process.env.WHATSAPP_TEMPLATE_ACK || 'lead_acknowledgement';
+const PROPERTY_SHARE_TEMPLATE = process.env.WHATSAPP_TEMPLATE_PROPERTY_SHARE || 'property_share';
+
+// Stored/looked-up customer mobiles are bare 10-digit Indian numbers, while
+// WhatsApp gives us the full international form (919876543210).
+function toLocalMobile(phone) {
+  const digits = String(phone || '').replace(/\D/g, '');
+  const countryCode = process.env.WHATSAPP_COUNTRY_CODE || '91';
+  if (digits.length === 10 + countryCode.length && digits.startsWith(countryCode)) {
+    return digits.slice(countryCode.length);
+  }
+  return digits;
+}
+
+// The inverse - Meta's `to` field needs the full international number
+// (919876543210), while stored customer mobiles are bare 10-digit numbers.
+function toInternationalMobile(phone) {
+  const digits = String(phone || '').replace(/\D/g, '');
+  const countryCode = process.env.WHATSAPP_COUNTRY_CODE || '91';
+  if (digits.length === 10) return `${countryCode}${digits}`;
+  return digits;
+}
+
+const CRORE = 10000000;
+const LAKH = 100000;
+
+// Turns a bot's free-form budget answer ("50L-1Cr", "₹1Cr - ₹2Cr", "2Cr+",
+// "50-80 lakh", "1 crore") into { min, max } rupee amounts (null = open).
+function parseBudget(text) {
+  if (!text) return { min: null, max: null };
+  const source = String(text).toLowerCase().replace(/[,₹]|rs\.?|inr/g, '');
+  const matches = [...source.matchAll(/(\d+(?:\.\d+)?)\s*(crores?|cr|lakhs?|lacs?|lac|l|k)?/g)];
+  if (matches.length === 0) return { min: null, max: null };
+
+  const unitValue = (unit) => {
+    if (!unit) return null;
+    if (unit.startsWith('c')) return CRORE;
+    if (unit.startsWith('l')) return LAKH;
+    if (unit === 'k') return 1000;
+    return null;
+  };
+
+  const nums = matches.slice(0, 2).map((m) => ({ value: Number(m[1]), unit: unitValue(m[2]) }));
+  const fallbackUnit = nums.map((n) => n.unit).find(Boolean) || 1;
+  const amounts = nums.map((n) => Math.round(n.value * (n.unit || fallbackUnit)));
+
+  if (amounts.length === 2) return { min: Math.min(...amounts), max: Math.max(...amounts) };
+  if (/\+|above|more than|over|plus/.test(source)) return { min: amounts[0], max: null };
+  return { min: null, max: amounts[0] };
+}
 
 async function getLeadWithCustomer(leadId) {
   const result = await pool.query(
@@ -28,38 +78,39 @@ async function getLeadWithCustomer(leadId) {
   return result.rows[0];
 }
 
-// Sends via the Meta Cloud API. Stubbed for now - inserts the outbound
-// whatsapp_conversations row and returns it, but makes no real HTTP call.
-//
-// TODO: replace the block below with a real Meta Cloud API call, e.g.:
-//   const resp = await axios.post(
-//     `https://graph.facebook.com/v19.0/${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`,
-//     { messaging_product: 'whatsapp', to: phoneNumber, type: 'template',
-//       template: { name: templateName, language: { code: 'en_US' } } },
-//     { headers: { Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}` } }
-//   );
-//   const providerMessageId = resp.data.messages[0].id;
-// and use `providerMessageId` below instead of the stubbed value.
-async function sendTemplateMessage({ tenantId, leadId, customerId, phoneNumber, templateName, messageBody }) {
+// Sends an approved template via Meta's WhatsApp Cloud API and logs it in
+// whatsapp_conversations. A provider failure is logged as a 'failed' row
+// (so it shows in the lead's conversation history) and then re-thrown.
+async function sendTemplateMessage({ tenantId, leadId, customerId, phoneNumber, templateName, messageBody, variables }) {
   if (!phoneNumber) throw badRequest('No phone number available to send to');
 
-  const providerMessageId = `stub_wamid_${crypto.randomBytes(10).toString('hex')}`;
+  let providerMessageId = null;
+  let status = 'sent';
+  let sendError = null;
+  try {
+    const sent = await metaWhatsappService.sendTemplate({ to: toInternationalMobile(phoneNumber), templateName, variables });
+    providerMessageId = sent.providerMessageId;
+  } catch (err) {
+    status = 'failed';
+    sendError = err;
+  }
 
   const result = await pool.query(
     `INSERT INTO whatsapp_conversations (
        tenant_id, lead_id, customer_id, phone_number, direction, message_type,
        template_name, message_body, provider_message_id, status
-     ) VALUES ($1, $2, $3, $4, 'outbound', 'template', $5, $6, $7, 'sent')
+     ) VALUES ($1, $2, $3, $4, 'outbound', 'template', $5, $6, $7, $8)
      RETURNING *`,
-    [tenantId || null, leadId || null, customerId || null, phoneNumber, templateName, messageBody || null, providerMessageId]
+    [tenantId || null, leadId || null, customerId || null, phoneNumber, templateName, messageBody || null, providerMessageId, status]
   );
 
+  if (sendError) throw sendError;
   return result.rows[0];
 }
 
 // POST /api/whatsapp/send-template
 async function sendTemplate(data, user) {
-  const { leadId, templateName, phoneNumber } = data;
+  const { leadId, templateName, phoneNumber, variables } = data;
 
   const lead = await getLeadWithCustomer(leadId);
   if (!isAdmin(user.role) && lead.tenant_id !== user.tenant_id) {
@@ -73,6 +124,7 @@ async function sendTemplate(data, user) {
     customerId: lead.customer_id,
     phoneNumber: toNumber,
     templateName,
+    variables: Array.isArray(variables) ? variables : [lead.customer_full_name],
   });
 
   await pool.query(
@@ -103,6 +155,7 @@ async function shareProperty(data, user) {
     phoneNumber: toNumber,
     templateName: PROPERTY_SHARE_TEMPLATE,
     messageBody: `Shared property: ${property.rows[0].title}`,
+    variables: [lead.customer_full_name, property.rows[0].title],
   });
 
   await pool.query(
@@ -133,6 +186,7 @@ async function acknowledgeLead(leadId, { phoneNumber, actingUser } = {}) {
     phoneNumber: toNumber,
     templateName: ACK_TEMPLATE,
     messageBody: `Hi ${lead.customer_full_name}, thanks for reaching out to PropertySerch - our team will get in touch shortly.`,
+    variables: [lead.customer_full_name],
   });
 
   await pool.query(
@@ -171,57 +225,225 @@ async function getConversations(leadId, user) {
   return result.rows;
 }
 
-// POST /api/whatsapp/webhook (public, no auth)
-// Simplified webhook body - real Meta payloads are deeply nested
-// (entry[].changes[].value.messages[]/statuses[]); this stub accepts a
-// flattened shape and the TODO below shows where real payload parsing +
-// signature verification (X-Hub-Signature-256) would go.
-//
-// TODO: verify the request signature before trusting the payload, e.g.:
-//   const expected = crypto.createHmac('sha256', process.env.WHATSAPP_APP_SECRET)
-//     .update(rawRequestBody).digest('hex');
-//   if (`sha256=${expected}` !== req.headers['x-hub-signature-256']) throw 401
+// POST /api/whatsapp/webhook - Meta calls this directly. Signature is
+// checked by middlewares/metaSignature.js before this runs. Meta's real
+// payload is deeply nested: entry[].changes[].value.{messages[],statuses[]}.
+// Logs every status update and inbound message, then returns the inbound
+// messages so the controller can hand each one to whatsappBot.service.js -
+// kept separate to avoid a circular require (the bot service needs
+// captureLead from this file).
 async function handleWebhook(payload) {
-  const { type, phoneNumber, providerMessageId, messageBody, status } = payload;
+  const inboundMessages = [];
 
-  if (type === 'status') {
-    if (!providerMessageId) throw badRequest('providerMessageId is required for a status update');
-    const result = await pool.query(
-      `UPDATE whatsapp_conversations SET status = $1 WHERE provider_message_id = $2 RETURNING *`,
-      [status, providerMessageId]
-    );
-    if (result.rows.length === 0) throw notFound('No conversation found for this providerMessageId');
-    return result.rows[0];
+  for (const entry of payload.entry || []) {
+    for (const change of entry.changes || []) {
+      const value = change.value || {};
+
+      for (const statusUpdate of value.statuses || []) {
+        // No-op if nothing matches (e.g. a status for a message this
+        // server didn't send) - Meta must always get a 200 regardless.
+        await pool.query(`UPDATE whatsapp_conversations SET status = $1 WHERE provider_message_id = $2`, [
+          statusUpdate.status,
+          statusUpdate.id,
+        ]);
+      }
+
+      for (const message of value.messages || []) {
+        const phoneNumber = message.from;
+        let text = null;
+        let buttonReplyId = null;
+        let buttonReplyTitle = null;
+
+        if (message.type === 'text') {
+          text = message.text?.body || null;
+        } else if (message.type === 'interactive') {
+          const reply = message.interactive?.button_reply || message.interactive?.list_reply;
+          buttonReplyId = reply?.id || null;
+          buttonReplyTitle = reply?.title || null;
+        } else if (message.type === 'button') {
+          buttonReplyId = message.button?.payload || null;
+          buttonReplyTitle = message.button?.text || null;
+        }
+
+        const customerResult = await pool.query('SELECT id, tenant_id FROM customers WHERE mobile = $1 LIMIT 1', [
+          toLocalMobile(phoneNumber),
+        ]);
+        const customer = customerResult.rows[0] || null;
+
+        let lead = null;
+        if (customer) {
+          const leadResult = await pool.query(
+            'SELECT id, tenant_id FROM leads WHERE customer_id = $1 ORDER BY created_at DESC LIMIT 1',
+            [customer.id]
+          );
+          lead = leadResult.rows[0] || null;
+        }
+
+        await pool.query(
+          `INSERT INTO whatsapp_conversations (
+             tenant_id, lead_id, customer_id, phone_number, direction, message_type,
+             message_body, provider_message_id, status
+           ) VALUES ($1, $2, $3, $4, 'inbound', 'text', $5, $6, 'delivered')`,
+          [
+            lead?.tenant_id || customer?.tenant_id || null,
+            lead?.id || null,
+            customer?.id || null,
+            phoneNumber,
+            text || buttonReplyTitle || null,
+            message.id || null,
+          ]
+        );
+
+        inboundMessages.push({ phoneNumber, text, buttonReplyId, buttonReplyTitle, messageId: message.id });
+      }
+    }
   }
 
-  // type === 'message' (inbound). Try to resolve an existing customer/lead
-  // by phone number; if none is found the message is still logged, just
-  // unlinked (lead_id/customer_id stay NULL).
-  const customerResult = await pool.query('SELECT id, tenant_id FROM customers WHERE mobile = $1 LIMIT 1', [phoneNumber]);
-  const customer = customerResult.rows[0] || null;
+  return { inboundMessages };
+}
 
-  let lead = null;
-  if (customer) {
-    const leadResult = await pool.query(
-      'SELECT id, tenant_id FROM leads WHERE customer_id = $1 ORDER BY created_at DESC LIMIT 1',
+function mapTransactionType(requirement) {
+  const text = String(requirement || '').toLowerCase();
+  if (text.includes('rent')) return 'rent';
+  if (/buy|purchase|invest/.test(text)) return 'buy';
+  return null;
+}
+
+function mapPropertyType(text) {
+  const value = String(text || '').toLowerCase();
+  if (/farm/.test(value)) return 'farmhouse';
+  if (/villa/.test(value)) return 'villa';
+  if (/independent|house/.test(value)) return 'independent_house';
+  if (/plot|land/.test(value)) return 'plot';
+  if (/commercial|shop|office/.test(value)) return 'commercial';
+  if (/bhk|flat|apartment/.test(value)) return 'apartment';
+  return null;
+}
+
+function parseBedrooms(text) {
+  const match = String(text || '').match(/(\d+)\s*bhk/i);
+  return match ? Number(match[1]) : null;
+}
+
+// POST /api/whatsapp/lead-capture (called by the MSG91 bot / WhatsApp Flow
+// once the customer has answered every question). Finds-or-creates the
+// customer by phone, stores their answers as preferences, and opens a
+// 'whatsapp' lead - or, if that customer already has an open lead, adds the
+// new answers to it instead of creating a duplicate.
+async function captureLead(data) {
+  const { phone, name, requirement, location, budget, propertyType, notes } = data;
+
+  const mobile = toLocalMobile(phone);
+  if (mobile.length < 8) throw badRequest('A valid phone number is required');
+
+  const defaultTenantId = process.env.WHATSAPP_DEFAULT_TENANT_ID || null;
+  const cleanName = name && name.trim() ? name.trim() : null;
+
+  let customer = await customerService.findOrCreateCustomerByContact({
+    fullName: cleanName || `WhatsApp ${mobile}`,
+    mobile,
+  });
+  if (cleanName && /^WhatsApp \d+$/.test(customer.full_name)) {
+    const updated = await pool.query('UPDATE customers SET full_name = $1 WHERE id = $2 RETURNING *', [cleanName, customer.id]);
+    customer = updated.rows[0];
+  }
+  if (!customer.tenant_id && defaultTenantId) {
+    const updated = await pool.query('UPDATE customers SET tenant_id = $1 WHERE id = $2 RETURNING *', [defaultTenantId, customer.id]);
+    customer = updated.rows[0];
+  }
+
+  const { min: budgetMin, max: budgetMax } = parseBudget(budget);
+  const summaryLines = [
+    requirement && `Requirement: ${requirement}`,
+    location && `Location: ${location}`,
+    budget && `Budget: ${budget}`,
+    propertyType && `Property type: ${propertyType}`,
+    notes && `Notes: ${notes}`,
+  ].filter(Boolean);
+  const summary = summaryLines.join('\n');
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    await client.query(
+      `INSERT INTO customer_preferences (
+         customer_id, budget_min, budget_max, preferred_locations, property_type,
+         transaction_type, bedrooms, notes
+       ) VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8)
+       ON CONFLICT (customer_id) DO UPDATE SET
+         budget_min = COALESCE(EXCLUDED.budget_min, customer_preferences.budget_min),
+         budget_max = COALESCE(EXCLUDED.budget_max, customer_preferences.budget_max),
+         preferred_locations = CASE WHEN EXCLUDED.preferred_locations = '[]'::jsonb
+                                    THEN customer_preferences.preferred_locations
+                                    ELSE EXCLUDED.preferred_locations END,
+         property_type = COALESCE(EXCLUDED.property_type, customer_preferences.property_type),
+         transaction_type = COALESCE(EXCLUDED.transaction_type, customer_preferences.transaction_type),
+         bedrooms = COALESCE(EXCLUDED.bedrooms, customer_preferences.bedrooms),
+         notes = COALESCE(EXCLUDED.notes, customer_preferences.notes)`,
+      [
+        customer.id,
+        budgetMin,
+        budgetMax,
+        JSON.stringify(location ? [location] : []),
+        mapPropertyType(propertyType),
+        mapTransactionType(requirement),
+        parseBedrooms(propertyType),
+        summary ? `Captured via WhatsApp bot\n${summary}` : null,
+      ]
+    );
+
+    const existing = await client.query(
+      `SELECT id FROM leads WHERE customer_id = $1 AND status NOT IN ('won', 'lost')
+       ORDER BY created_at DESC LIMIT 1`,
       [customer.id]
     );
-    lead = leadResult.rows[0] || null;
+
+    let leadId;
+    let isNewLead = false;
+    if (existing.rows.length > 0) {
+      leadId = existing.rows[0].id;
+    } else {
+      const inserted = await client.query(
+        `INSERT INTO leads (tenant_id, source, customer_id, status)
+         VALUES ($1, 'whatsapp', $2, 'new') RETURNING id`,
+        [customer.tenant_id || defaultTenantId, customer.id]
+      );
+      leadId = inserted.rows[0].id;
+      isNewLead = true;
+      await client.query(
+        `INSERT INTO lead_activity_log (lead_id, user_id, action, details) VALUES ($1, NULL, 'lead_created', $2)`,
+        [leadId, JSON.stringify({ source: 'whatsapp', channel: 'whatsapp_bot' })]
+      );
+    }
+
+    await client.query(
+      `INSERT INTO lead_activity_log (lead_id, user_id, action, details) VALUES ($1, NULL, 'whatsapp_lead_captured', $2)`,
+      [leadId, JSON.stringify({ requirement, location, budget, propertyType, notes, phone: mobile })]
+    );
+
+    await client.query(
+      `INSERT INTO whatsapp_conversations (
+         tenant_id, lead_id, customer_id, phone_number, direction, message_type, message_body, status
+       ) VALUES ($1, $2, $3, $4, 'inbound', 'text', $5, 'delivered')`,
+      [customer.tenant_id || defaultTenantId, leadId, customer.id, String(phone).replace(/\D/g, '').slice(0, 20), summary || 'WhatsApp bot lead capture']
+    );
+
+    await client.query('COMMIT');
+    return { leadId, customerId: customer.id, isNewLead };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
   }
-
-  const result = await pool.query(
-    `INSERT INTO whatsapp_conversations (
-       tenant_id, lead_id, customer_id, phone_number, direction, message_type,
-       message_body, provider_message_id, status
-     ) VALUES ($1, $2, $3, $4, 'inbound', 'text', $5, $6, 'delivered')
-     RETURNING *`,
-    [lead?.tenant_id || customer?.tenant_id || null, lead?.id || null, customer?.id || null, phoneNumber, messageBody || null, providerMessageId || null]
-  );
-
-  return result.rows[0];
 }
 
 module.exports = {
+  captureLead,
+  parseBudget,
+  toLocalMobile,
+  toInternationalMobile,
   sendTemplate,
   shareProperty,
   acknowledgeLead,

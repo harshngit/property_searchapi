@@ -1,6 +1,6 @@
 const pool = require('../config/db');
 const { isAdmin } = require('../utils/ownership');
-const { uploadBuffer, deleteObject, signUrls } = require('../utils/storage');
+const { uploadBuffer, deleteObject, signUrls, getReadUrl } = require('../utils/storage');
 const customerService = require('./customer.service');
 
 function notFound(message = 'Property not found') {
@@ -29,12 +29,37 @@ const PROPERTY_SELECT = `
   SELECT p.*,
          creator.full_name AS created_by_name,
          broker.full_name AS broker_name,
-         builder.full_name AS builder_name
+         builder.full_name AS builder_name,
+         builder.builder_rating AS builder_rating,
+         builder.builder_experience_years AS builder_experience_years,
+         builder.builder_projects_count AS builder_projects_count,
+         (SELECT COALESCE(json_agg(json_build_object(
+            'id', pm.id, 'mediaType', pm.media_type, 'url', pm.url,
+            'displayOrder', pm.display_order, 'isPrimary', pm.is_primary
+          ) ORDER BY pm.display_order ASC, pm.created_at ASC), '[]'::json)
+          FROM property_media pm WHERE pm.property_id = p.id) AS media
   FROM properties p
   LEFT JOIN users creator ON creator.id = p.created_by
   LEFT JOIN users broker ON broker.id = p.broker_id
   LEFT JOIN users builder ON builder.id = p.builder_id
 `;
+
+// PROPERTY_SELECT's `media` column is a lightweight aggregate (no signed
+// URLs yet) - used as-is by listProperties for list/grid views.
+// getPropertyById below fetches the full property_media rows separately and
+// overwrites this with that, so a single property page always gets every
+// media column, not just the four aggregated here.
+async function signPropertyMedia(rows) {
+  const list = Array.isArray(rows) ? rows : [rows];
+  const signed = await Promise.all(
+    list.map(async (row) => {
+      if (!row) return row;
+      const media = await Promise.all((row.media || []).map(async (m) => ({ ...m, url: await getReadUrl(m.url) })));
+      return { ...row, media };
+    })
+  );
+  return Array.isArray(rows) ? signed : signed[0];
+}
 
 // Restricts a listing query to the caller's own tenant/records unless
 // they are admin/super_admin, per the module's tenant-isolation rule.
@@ -101,7 +126,7 @@ async function listProperties(user, filters, page, limit) {
   );
 
   return {
-    items: result.rows,
+    items: await signPropertyMedia(result.rows),
     pagination: {
       page,
       limit,
@@ -116,6 +141,8 @@ async function getPropertyById(id) {
   const property = result.rows[0];
   if (!property) throw notFound();
 
+  // Overwrites PROPERTY_SELECT's lightweight media aggregate with the full
+  // property_media rows (every column, not just the four aggregated there).
   const media = await pool.query(
     'SELECT * FROM property_media WHERE property_id = $1 ORDER BY display_order ASC, created_at ASC',
     [id]
@@ -152,6 +179,22 @@ async function createProperty(data, user) {
     occupancyPercent,
     yieldPercent,
     yieldQualifier,
+    aboutExtended,
+    carpetAreaSqft,
+    facing,
+    tags,
+    badge,
+    verified,
+    reraNumber,
+    possessionStatus,
+    floorNumber,
+    totalFloors,
+    furnishing,
+    parkingSpots,
+    parkingType,
+    ageOfProperty,
+    gatedCommunity,
+    faqs,
   } = data;
 
   const result = await pool.query(
@@ -160,10 +203,14 @@ async function createProperty(data, user) {
        property_type, transaction_type, price, city, locality, address,
        latitude, longitude, area_sqft, bedrooms, bathrooms, amenities, status,
        rate, listing_category, annual_appreciation_percent, estimated_rent_monthly,
-       locality_rating, auction_date, source_bank, occupancy_percent, yield_percent, yield_qualifier
+       locality_rating, auction_date, source_bank, occupancy_percent, yield_percent, yield_qualifier,
+       about_extended, carpet_area_sqft, facing, tags, badge, is_verified, rera_number,
+       possession_status, floor_number, total_floors, furnishing, parking_spots, parking_type,
+       age_of_property, gated_community, faqs
      ) VALUES (
        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, 'pending_approval',
-       $19, $20, $21, $22, $23, $24, $25, $26, $27, $28
+       $19, $20, $21, $22, $23, $24, $25, $26, $27, $28,
+       $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44
      ) RETURNING *`,
     [
       user.tenant_id || null,
@@ -194,6 +241,22 @@ async function createProperty(data, user) {
       occupancyPercent ?? null,
       yieldPercent ?? null,
       yieldQualifier || null,
+      aboutExtended || null,
+      carpetAreaSqft ?? null,
+      facing || null,
+      JSON.stringify(tags || []),
+      badge || null,
+      verified ?? false,
+      reraNumber || null,
+      possessionStatus || null,
+      floorNumber ?? null,
+      totalFloors ?? null,
+      furnishing || null,
+      parkingSpots ?? null,
+      parkingType || null,
+      ageOfProperty || null,
+      gatedCommunity ?? false,
+      JSON.stringify(faqs || []),
     ]
   );
 
@@ -223,6 +286,20 @@ const UPDATABLE_FIELDS = {
   occupancyPercent: 'occupancy_percent',
   yieldPercent: 'yield_percent',
   yieldQualifier: 'yield_qualifier',
+  aboutExtended: 'about_extended',
+  carpetAreaSqft: 'carpet_area_sqft',
+  facing: 'facing',
+  badge: 'badge',
+  verified: 'is_verified',
+  reraNumber: 'rera_number',
+  possessionStatus: 'possession_status',
+  floorNumber: 'floor_number',
+  totalFloors: 'total_floors',
+  furnishing: 'furnishing',
+  parkingSpots: 'parking_spots',
+  parkingType: 'parking_type',
+  ageOfProperty: 'age_of_property',
+  gatedCommunity: 'gated_community',
 };
 
 async function updateProperty(id, data) {
@@ -238,6 +315,14 @@ async function updateProperty(id, data) {
   if (data.amenities !== undefined) {
     params.push(JSON.stringify(data.amenities));
     set.push(`amenities = $${params.length}`);
+  }
+  if (data.tags !== undefined) {
+    params.push(JSON.stringify(data.tags));
+    set.push(`tags = $${params.length}`);
+  }
+  if (data.faqs !== undefined) {
+    params.push(JSON.stringify(data.faqs));
+    set.push(`faqs = $${params.length}`);
   }
 
   if (set.length === 0) throw badRequest('No updatable fields provided');

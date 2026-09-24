@@ -5,23 +5,24 @@ const router = express.Router();
 const whatsappController = require('../controllers/whatsapp.controller');
 const validate = require('../middlewares/validate');
 const { authenticate, authorize } = require('../middlewares/auth');
+const verifyWebhookSecret = require('../middlewares/webhookSecret');
+const verifyMetaSignature = require('../middlewares/metaSignature');
 
 const WHATSAPP_ROLES = ['broker', 'agency_admin', 'internal_sales', 'admin', 'super_admin'];
-const WEBHOOK_TYPES = ['message', 'status'];
-const WEBHOOK_STATUSES = ['sent', 'delivered', 'read', 'failed'];
 
 /**
  * @swagger
  * tags:
  *   name: WhatsApp
  *   description: >
- *     WhatsApp Cloud API integration - outbound template messages,
- *     property sharing, lead acknowledgement, conversation history, and
- *     the inbound webhook. Every endpoint requires authentication and is
- *     tenant-scoped, except `/whatsapp/webhook` which is the public
- *     endpoint Meta calls directly. The actual Meta Cloud API call is
- *     stubbed everywhere - see the TODO comments in whatsapp.service.js
- *     for exactly where a real integration goes.
+ *     WhatsApp via Meta's Cloud API (direct - no MSG91 or other BSP in the
+ *     path) - outbound template messages, property sharing, lead
+ *     acknowledgement, conversation history, a question-by-question bot
+ *     flow, and the inbound webhook. CRM endpoints require authentication
+ *     and are tenant-scoped. `/whatsapp/webhook` is called by Meta and is
+ *     verified via its X-Hub-Signature-256 header (env WHATSAPP_APP_SECRET);
+ *     `/whatsapp/lead-capture` is a separate, secret-guarded entry point
+ *     (env WHATSAPP_WEBHOOK_SECRET) for anything that isn't the bot itself.
  */
 
 /**
@@ -57,6 +58,7 @@ router.post(
     body('leadId').isUUID().withMessage('leadId is required'),
     body('templateName').notEmpty().withMessage('templateName is required'),
     body('phoneNumber').optional().isString(),
+    body('variables').optional().isArray(),
   ],
   validate,
   whatsappController.sendTemplate
@@ -65,15 +67,39 @@ router.post(
 /**
  * @swagger
  * /whatsapp/webhook:
+ *   get:
+ *     summary: Webhook verification challenge (Meta calls this once, during setup)
+ *     description: >
+ *       Register this URL in Meta App Dashboard -> WhatsApp -> Configuration
+ *       with a verify token matching WHATSAPP_VERIFY_TOKEN.
+ *     tags: [WhatsApp]
+ *     parameters:
+ *       - in: query
+ *         name: hub.mode
+ *         schema: { type: string }
+ *       - in: query
+ *         name: hub.verify_token
+ *         schema: { type: string }
+ *       - in: query
+ *         name: hub.challenge
+ *         schema: { type: string }
+ *     responses:
+ *       200:
+ *         description: Echoes hub.challenge back to Meta
+ *       403:
+ *         description: Token mismatch
  *   post:
  *     summary: Inbound webhook for messages/delivery status from Meta
  *     description: >
- *       Public endpoint (no authentication) - this is what Meta calls
- *       directly. Signature verification (X-Hub-Signature-256) is stubbed
- *       - see the TODO in whatsapp.service.js#handleWebhook. Accepts a
- *       simplified, flattened payload shape rather than Meta's real deeply
- *       nested `entry[].changes[].value` structure.
+ *       Called directly by Meta's WhatsApp Cloud API. Verified via the
+ *       X-Hub-Signature-256 header against WHATSAPP_APP_SECRET. Every
+ *       inbound message is also fed into the question-by-question bot flow.
  *     tags: [WhatsApp]
+ *     parameters:
+ *       - in: header
+ *         name: x-hub-signature-256
+ *         required: true
+ *         schema: { type: string }
  *     requestBody:
  *       required: true
  *       content:
@@ -83,22 +109,65 @@ router.post(
  *     responses:
  *       200:
  *         description: Webhook processed successfully
- *       400:
- *         description: Invalid payload
- *       404:
- *         description: No matching conversation found for a status update
+ *       401:
+ *         description: Invalid or missing signature
+ *       503:
+ *         description: WHATSAPP_APP_SECRET is not configured
+ */
+router.get('/webhook', whatsappController.verifyWebhook);
+
+router.post('/webhook', verifyMetaSignature, whatsappController.webhook);
+
+/**
+ * @swagger
+ * /whatsapp/lead-capture:
+ *   post:
+ *     summary: Create/update a lead from structured WhatsApp answers
+ *     description: >
+ *       An alternative entry point to the bot flow, for anything that isn't
+ *       Meta's own webhook (e.g. a WhatsApp Flow's completion callback).
+ *       Finds-or-creates the customer by phone, saves budget/location/
+ *       property type as their preferences, and opens a `whatsapp` lead -
+ *       or adds to the customer's existing open lead instead of duplicating
+ *       it. Requires the `x-webhook-secret` header to match WHATSAPP_WEBHOOK_SECRET.
+ *     tags: [WhatsApp]
+ *     parameters:
+ *       - in: header
+ *         name: x-webhook-secret
+ *         required: true
+ *         schema: { type: string }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: '#/components/schemas/WhatsAppLeadCaptureRequest'
+ *     responses:
+ *       201:
+ *         description: New lead created
+ *       200:
+ *         description: Customer already had an open lead - answers added to it
+ *       401:
+ *         description: Missing or wrong webhook secret
+ *       422:
+ *         description: Validation failed
+ *       503:
+ *         description: WHATSAPP_WEBHOOK_SECRET is not configured
  */
 router.post(
-  '/webhook',
+  '/lead-capture',
+  verifyWebhookSecret,
   [
-    body('type').isIn(WEBHOOK_TYPES).withMessage('type must be one of: message, status'),
-    body('phoneNumber').optional().isString(),
-    body('providerMessageId').optional().isString(),
-    body('messageBody').optional().isString(),
-    body('status').optional().isIn(WEBHOOK_STATUSES),
+    body('phone').isString().notEmpty().isLength({ max: 20 }).withMessage('phone is required'),
+    body('name').optional({ nullable: true }).isString().isLength({ max: 150 }),
+    body('requirement').optional({ nullable: true }).isString().isLength({ max: 100 }),
+    body('location').optional({ nullable: true }).isString().isLength({ max: 150 }),
+    body('budget').optional({ nullable: true }).isString().isLength({ max: 100 }),
+    body('propertyType').optional({ nullable: true }).isString().isLength({ max: 100 }),
+    body('notes').optional({ nullable: true }).isString().isLength({ max: 1000 }),
   ],
   validate,
-  whatsappController.webhook
+  whatsappController.leadCapture
 );
 
 /**

@@ -39,7 +39,9 @@ app.set('trust proxy', 1);
 
 app.use(helmet());
 app.use(cors());
-app.use(express.json());
+// `verify` stashes the exact request bytes on req.rawBody before parsing -
+// needed to check Meta's X-Hub-Signature-256 on the WhatsApp webhook.
+app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
 app.use(express.urlencoded({ extended: true }));
 app.use(morgan('dev'));
 
