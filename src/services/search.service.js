@@ -1,5 +1,5 @@
 const pool = require('../config/db');
-const { signUrls } = require('../utils/storage');
+const { signUrls, getReadUrl } = require('../utils/storage');
 
 function notFound(message = 'Property not found') {
   const err = new Error(message);
@@ -12,6 +12,16 @@ const SORT_OPTIONS = {
   rate_desc: 'rate DESC NULLS LAST',
   newest: 'properties.created_at DESC',
 };
+
+// `images` comes back as a plain array of stored object paths (one row's
+// json_agg, not per-item objects like the dashboard's media aggregate) -
+// signUrls only signs a single flat field per row, so each url in the array
+// needs its own getReadUrl() call.
+async function signImageArrays(rows, field) {
+  return Promise.all(
+    rows.map(async (row) => ({ ...row, [field]: await Promise.all((row[field] || []).map((url) => getReadUrl(url))) }))
+  );
+}
 
 async function searchProperties(filters, page, limit, sort) {
   // Qualified with the table name (harmless when unjoined, e.g. in the
@@ -63,7 +73,9 @@ async function searchProperties(filters, page, limit, sort) {
             bedrooms, bathrooms, amenities, properties.created_at,
             builder.full_name AS builder_name,
             (SELECT url FROM property_media pm WHERE pm.property_id = properties.id
-             ORDER BY pm.is_primary DESC, pm.display_order ASC LIMIT 1) AS primary_image
+             ORDER BY pm.is_primary DESC, pm.display_order ASC LIMIT 1) AS primary_image,
+            (SELECT COALESCE(json_agg(pm.url ORDER BY pm.is_primary DESC, pm.display_order ASC), '[]'::json)
+             FROM property_media pm WHERE pm.property_id = properties.id) AS images
      FROM properties
      LEFT JOIN users builder ON builder.id = properties.builder_id
      ${whereClause}
@@ -72,8 +84,10 @@ async function searchProperties(filters, page, limit, sort) {
     params
   );
 
+  const signed = await signImageArrays(await signUrls(result.rows, 'primary_image'), 'images');
+
   return {
-    items: await signUrls(result.rows, 'primary_image'),
+    items: signed,
     pagination: {
       page,
       limit,

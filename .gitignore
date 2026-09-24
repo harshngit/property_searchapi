@@ -28,3 +28,7 @@ coverage/
 # Build output
 dist/
 build/
+
+# Internal working docs (handoff notes, integration status) - not part of the
+# published API, kept local only
+docs/
