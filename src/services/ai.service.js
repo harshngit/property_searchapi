@@ -266,7 +266,162 @@ async function getLatestInsight(leadId) {
   return result.rows[0] || null;
 }
 
+// Leads visible to the caller (same rule as leads listing: admins see all,
+// others their tenant / own / assigned).
+function leadScope(user, alias, where, params) {
+  if (['admin', 'super_admin'].includes(user.role)) return;
+  params.push(user.tenant_id || null, user.id, user.id);
+  where.push(
+    `(${alias}.tenant_id = $${params.length - 2} OR ${alias}.created_by = $${params.length - 1} OR ${alias}.assigned_to = $${params.length})`
+  );
+}
+
+// GET /api/ai/insights - latest insight per lead, newest first, with the
+// lead/customer context and the latest human review (if any) - backs the
+// CRM "Recent AI qualifications" list.
+async function listInsights(user, { score, reviewed, page = 1, limit = 20 } = {}) {
+  const where = [];
+  const params = [];
+  leadScope(user, 'l', where, params);
+  if (score) {
+    params.push(score);
+    where.push(`COALESCE(r.new_score, i.score) = $${params.length}`);
+  }
+  if (reviewed === 'true') where.push('r.id IS NOT NULL');
+  if (reviewed === 'false') where.push('r.id IS NULL');
+  const whereClause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
+  const base = `
+    FROM (SELECT DISTINCT ON (lead_id) * FROM ai_lead_insights ORDER BY lead_id, created_at DESC) i
+    JOIN leads l ON l.id = i.lead_id
+    JOIN customers c ON c.id = l.customer_id
+    LEFT JOIN users assignee ON assignee.id = l.assigned_to
+    LEFT JOIN properties p ON p.id = l.property_id
+    LEFT JOIN LATERAL (
+      SELECT * FROM ai_insight_reviews ar WHERE ar.insight_id = i.id ORDER BY ar.created_at DESC LIMIT 1
+    ) r ON true`;
+
+  const count = await pool.query(`SELECT COUNT(*) ${base} ${whereClause}`, params);
+  const offset = (Number(page) - 1) * Number(limit);
+  params.push(limit, offset);
+  const result = await pool.query(
+    `SELECT i.id, i.lead_id, i.summary, i.score AS ai_score, COALESCE(r.new_score, i.score) AS effective_score,
+            i.confidence, i.extracted_budget_min, i.extracted_budget_max, i.extracted_location,
+            i.extracted_property_type, i.extracted_intent, i.extracted_timeline, i.created_at,
+            l.status AS lead_status, l.source AS lead_source,
+            c.full_name AS customer_name, assignee.full_name AS assigned_to_name, p.title AS property_title,
+            r.action AS review_action, r.reason AS review_reason, r.created_at AS reviewed_at
+     ${base} ${whereClause}
+     ORDER BY i.created_at DESC
+     LIMIT $${params.length - 1} OFFSET $${params.length}`,
+    params
+  );
+
+  return {
+    items: result.rows,
+    pagination: {
+      page: Number(page),
+      limit: Number(limit),
+      total: Number(count.rows[0].count),
+      totalPages: Math.ceil(Number(count.rows[0].count) / Number(limit)),
+    },
+  };
+}
+
+// GET /api/ai/stats - AI page headline cards over the last `days` days:
+// leads qualified, average confidence, score mix, manual overrides, and
+// agreement rate (confirmed / reviewed) as the "routing accuracy" proxy.
+async function getStats(user, { days = 7 } = {}) {
+  const span = Math.min(Math.max(Number(days) || 7, 1), 365);
+  const where = [`i.created_at > now() - ($1 || ' days')::interval`];
+  const params = [span];
+  leadScope(user, 'l', where, params);
+  const whereClause = `WHERE ${where.join(' AND ')}`;
+
+  const [insights, reviews] = await Promise.all([
+    pool.query(
+      `SELECT COUNT(DISTINCT i.lead_id)::int AS leads_qualified,
+              ROUND(AVG(i.confidence) * 100)::int AS avg_confidence_percent,
+              COUNT(*) FILTER (WHERE i.score = 'hot')::int AS hot,
+              COUNT(*) FILTER (WHERE i.score = 'warm')::int AS warm,
+              COUNT(*) FILTER (WHERE i.score = 'cold')::int AS cold
+       FROM ai_lead_insights i JOIN leads l ON l.id = i.lead_id ${whereClause}`,
+      params
+    ),
+    pool.query(
+      `SELECT COUNT(*) FILTER (WHERE r.action = 'override')::int AS manual_overrides,
+              COUNT(*) FILTER (WHERE r.action = 'confirm')::int AS confirmed
+       FROM ai_insight_reviews r JOIN leads l ON l.id = r.lead_id
+       WHERE r.created_at > now() - ($1 || ' days')::interval ${where.length > 1 ? `AND ${where.slice(1).join(' AND ')}` : ''}`,
+      params
+    ),
+  ]);
+
+  const { manual_overrides: overrides, confirmed } = reviews.rows[0];
+  const reviewed = overrides + confirmed;
+  return {
+    days: span,
+    ...insights.rows[0],
+    manual_overrides: overrides,
+    confirmed,
+    agreement_rate_percent: reviewed > 0 ? Math.round((confirmed / reviewed) * 100) : null,
+    override_rate_percent: reviewed > 0 ? Math.round((overrides / reviewed) * 100) : null,
+  };
+}
+
+// POST /api/ai/lead/:id/review - a human confirms or overrides the latest
+// AI score. Kept in its own append-only table; an override also moves the
+// lead's status to the new hot/warm/cold value (with an activity entry) so
+// the CRM pipeline reflects the human decision.
+async function reviewInsight(leadId, { action, score, reason }, user) {
+  const latest = await getLatestInsight(leadId);
+  if (!latest) {
+    const err = new Error('This lead has no AI insight to review yet');
+    err.statusCode = 404;
+    throw err;
+  }
+  if (action === 'override' && !score) {
+    const err = new Error('score is required when overriding');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const review = await client.query(
+      `INSERT INTO ai_insight_reviews (insight_id, lead_id, action, original_score, new_score, reason, reviewed_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+      [latest.id, leadId, action, latest.score, action === 'override' ? score : latest.score, reason || null, user.id]
+    );
+
+    if (action === 'override') {
+      const current = await client.query('SELECT status FROM leads WHERE id = $1 FOR UPDATE', [leadId]);
+      const previous = current.rows[0]?.status;
+      // Only temperature statuses follow the AI score; a lead already won,
+      // lost or mid-pipeline keeps its status.
+      if (['new', 'contacted', 'qualified', 'hot', 'warm', 'cold'].includes(previous) && previous !== score) {
+        await client.query('UPDATE leads SET status = $1 WHERE id = $2', [score, leadId]);
+        await client.query(
+          `INSERT INTO lead_activity_log (lead_id, user_id, action, details) VALUES ($1, $2, 'status_changed', $3)`,
+          [leadId, user.id, JSON.stringify({ from: previous, to: score, via: 'ai_score_override', reason: reason || null })]
+        );
+      }
+    }
+    await client.query('COMMIT');
+    return review.rows[0];
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 module.exports = {
+  listInsights,
+  getStats,
+  reviewInsight,
   generateLeadSummary,
   safeGenerateLeadSummary,
   scoreLead,

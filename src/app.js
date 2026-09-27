@@ -24,6 +24,12 @@ const reportRoutes = require('./routes/report.routes');
 const whatsappRoutes = require('./routes/whatsapp.routes');
 const aiRoutes = require('./routes/ai.routes');
 const matchingRoutes = require('./routes/matching.routes');
+const adminRoutes = require('./routes/admin.routes');
+const { geoRouter, disclaimerRouter } = require('./routes/geo.routes');
+const contentRoutes = require('./routes/content.routes');
+const bdLeadRoutes = require('./routes/bdLead.routes');
+const opportunityRoutes = require('./routes/opportunity.routes');
+const { investorRouter, nriRouter, hniRouter, toolsRouter } = require('./routes/investor.routes');
 const { notFoundHandler, errorHandler } = require('./middlewares/errorHandler');
 
 const app = express();
@@ -88,6 +94,16 @@ app.use('/api/reports', reportRoutes);
 app.use('/api/whatsapp', whatsappRoutes);
 app.use('/api/ai', aiRoutes);
 app.use('/api/matching', matchingRoutes);
+app.use('/api/admin', adminRoutes);
+app.use('/api/geo', geoRouter);
+app.use('/api/disclaimers', disclaimerRouter);
+app.use('/api/content', contentRoutes);
+app.use('/api/bd-leads', bdLeadRoutes);
+app.use('/api/opportunities', opportunityRoutes);
+app.use('/api/investors', investorRouter);
+app.use('/api/nri', nriRouter);
+app.use('/api/hni', hniRouter);
+app.use('/api/tools', toolsRouter);
 
 // 404 + error handler (must be last)
 app.use(notFoundHandler);

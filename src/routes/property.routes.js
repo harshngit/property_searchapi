@@ -51,6 +51,34 @@ const DISPLAY_FIELD_VALIDATORS = [
   body('faqs').optional().isArray(),
 ];
 
+// Engine 4 opportunity fields (auction / special situation) - also shared
+// by POST and PUT. Scores (discount %, investment score, liquidity) are
+// computed server-side and can't be set directly.
+const OPPORTUNITY_SOURCE_TYPES = [
+  'sarfaesi_bank_auction', 'nbfc_repossession', 'arc_asset', 'drt_auction', 'nclt_liquidation',
+  'housing_board', 'legal_notice', 'broker_sourced', 'direct_seller', 'internal_crm', 'other',
+];
+const SITUATION_TAGS = ['urgent_sale', 'financial_distress', 'investor_exit', 'time_bound_sale'];
+const RISK_INDICATORS = ['documentation_pending', 'possession_unclear', 'legal_complexity', 'tenant_occupied'];
+const OPPORTUNITY_FIELD_VALIDATORS = [
+  body('priceValue').optional({ nullable: true }).isFloat({ min: 0 }).withMessage('priceValue must be a positive number (INR)'),
+  body('opportunitySourceType').optional({ nullable: true }).isIn(OPPORTUNITY_SOURCE_TYPES),
+  body('reservePrice').optional({ nullable: true }).isFloat({ min: 0 }),
+  body('emdAmount').optional({ nullable: true }).isFloat({ min: 0 }),
+  body('emdDeadline').optional({ nullable: true }).isISO8601(),
+  body('inspectionDate').optional({ nullable: true }).isISO8601(),
+  body('auctionReferenceId').optional({ nullable: true }).isString().isLength({ max: 150 }),
+  body('auctionPortalUrl').optional({ nullable: true }).isURL(),
+  body('possessionType').optional({ nullable: true }).isIn(['physical', 'symbolic', 'vacant', 'occupied', 'unknown']),
+  body('legalStatusNote').optional({ nullable: true }).isString(),
+  body('estimatedMarketValue').optional({ nullable: true }).isFloat({ min: 0 }),
+  body('situationTags').optional().isArray(),
+  body('situationTags.*').optional().isIn(SITUATION_TAGS).withMessage(`situationTags must be from: ${SITUATION_TAGS.join(', ')}`),
+  body('riskIndicators').optional().isArray(),
+  body('riskIndicators.*').optional().isIn(RISK_INDICATORS).withMessage(`riskIndicators must be from: ${RISK_INDICATORS.join(', ')}`),
+  body('isInstitutionalAsset').optional().isBoolean(),
+];
+
 /**
  * @swagger
  * tags:
@@ -114,6 +142,8 @@ router.get(
     query('status').optional().isIn(PROPERTY_STATUSES),
     query('minRate').optional().isFloat({ min: 0 }),
     query('maxRate').optional().isFloat({ min: 0 }),
+    query('listingCategory').optional().isIn(LISTING_CATEGORIES),
+    query('search').optional().isString(),
   ],
   validate,
   propertyController.listProperties
@@ -222,6 +252,7 @@ router.post(
     body('amenities').optional().isArray(),
     ...EXTENDED_FIELD_VALIDATORS,
     ...DISPLAY_FIELD_VALIDATORS,
+    ...OPPORTUNITY_FIELD_VALIDATORS,
   ],
   validate,
   propertyController.createProperty
@@ -268,6 +299,7 @@ router.put(
     body('amenities').optional().isArray(),
     ...EXTENDED_FIELD_VALIDATORS,
     ...DISPLAY_FIELD_VALIDATORS,
+    ...OPPORTUNITY_FIELD_VALIDATORS,
   ],
   validate,
   propertyController.updateProperty

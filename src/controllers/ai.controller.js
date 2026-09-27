@@ -55,7 +55,43 @@ async function getAnalysis(req, res, next) {
   }
 }
 
+// GET /api/ai/insights
+async function listInsights(req, res, next) {
+  try {
+    const page = Math.max(Number(req.query.page) || 1, 1);
+    const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100);
+    const data = await aiService.listInsights(req.user, { score: req.query.score, reviewed: req.query.reviewed, page, limit });
+    return success(res, 200, 'AI insights fetched successfully', data);
+  } catch (err) {
+    next(err);
+  }
+}
+
+// GET /api/ai/stats
+async function getStats(req, res, next) {
+  try {
+    const stats = await aiService.getStats(req.user, { days: req.query.days });
+    return success(res, 200, 'AI qualification stats fetched successfully', stats);
+  } catch (err) {
+    next(err);
+  }
+}
+
+// POST /api/ai/lead/:id/review
+async function reviewInsight(req, res, next) {
+  try {
+    await assertLeadAccess(req);
+    const review = await aiService.reviewInsight(req.params.id, req.body, req.user);
+    return success(res, 201, req.body.action === 'override' ? 'AI score overridden' : 'AI score confirmed', review);
+  } catch (err) {
+    next(err);
+  }
+}
+
 module.exports = {
+  listInsights,
+  getStats,
+  reviewInsight,
   leadSummary,
   leadScore,
   extractIntent,

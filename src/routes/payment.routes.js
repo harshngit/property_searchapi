@@ -1,5 +1,5 @@
 const express = require('express');
-const { body, param } = require('express-validator');
+const { body, param, query } = require('express-validator');
 const router = express.Router();
 
 const paymentController = require('../controllers/payment.controller');
@@ -20,6 +20,64 @@ const MILESTONE_ROLES = ['broker', 'agency_admin', 'admin', 'super_admin'];
  *     except the gateway webhook. Non-admin roles are scoped to their own
  *     tenant (via the parent deal's tenant_id).
  */
+
+/**
+ * @swagger
+ * /payments:
+ *   get:
+ *     summary: List payments across all visible deals (tenant-scoped for non-admins)
+ *     tags: [Payments]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - { in: query, name: status, schema: { type: string, enum: [initiated, success, failed, refunded] } }
+ *       - { in: query, name: gateway, schema: { type: string, enum: [razorpay, payu, manual] } }
+ *       - { in: query, name: dealId, schema: { type: string, format: uuid } }
+ *       - { in: query, name: customerId, schema: { type: string, format: uuid } }
+ *       - { in: query, name: dateFrom, schema: { type: string, format: date-time } }
+ *       - { in: query, name: dateTo, schema: { type: string, format: date-time } }
+ *       - { in: query, name: search, schema: { type: string }, description: Customer name or gateway order/payment id }
+ *       - { in: query, name: page, schema: { type: integer } }
+ *       - { in: query, name: limit, schema: { type: integer } }
+ *     responses:
+ *       200: { description: Paginated payments with customer, milestone and property context }
+ */
+router.get(
+  '/',
+  authenticate,
+  [
+    query('status').optional().isIn(['initiated', 'success', 'failed', 'refunded']),
+    query('gateway').optional().isIn(GATEWAYS),
+    query('dealId').optional().isUUID(),
+    query('customerId').optional().isUUID(),
+    query('dateFrom').optional().isISO8601(),
+    query('dateTo').optional().isISO8601(),
+  ],
+  validate,
+  paymentController.listPayments
+);
+
+/**
+ * @swagger
+ * /payments/stats:
+ *   get:
+ *     summary: Payment headline numbers - collected, pending, failed, outstanding and overdue milestones
+ *     tags: [Payments]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - { in: query, name: from, schema: { type: string, format: date-time } }
+ *       - { in: query, name: to, schema: { type: string, format: date-time } }
+ *     responses:
+ *       200: { description: Stats }
+ */
+router.get(
+  '/stats',
+  authenticate,
+  [query('from').optional().isISO8601(), query('to').optional().isISO8601()],
+  validate,
+  paymentController.getPaymentStats
+);
 
 /**
  * @swagger

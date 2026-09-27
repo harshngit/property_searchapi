@@ -218,7 +218,111 @@ async function updateMilestone(id, data, user) {
   return result.rows[0];
 }
 
+// GET /api/payments - every payment across the caller's visible deals, for
+// the CRM Payments screen (tenant-scoped for non-admins, like every other
+// payment read). Joins the human-readable context the table needs.
+async function listPayments(user, filters, page, limit) {
+  const where = [];
+  const params = [];
+
+  if (!isAdmin(user.role)) {
+    params.push(user.tenant_id || null);
+    where.push(`p.tenant_id = $${params.length}`);
+  }
+  for (const [key, column] of [['status', 'p.status'], ['gateway', 'p.gateway'], ['dealId', 'p.deal_id'], ['customerId', 'p.customer_id']]) {
+    if (filters[key]) {
+      params.push(filters[key]);
+      where.push(`${column} = $${params.length}`);
+    }
+  }
+  if (filters.dateFrom) {
+    params.push(filters.dateFrom);
+    where.push(`p.created_at >= $${params.length}`);
+  }
+  if (filters.dateTo) {
+    params.push(filters.dateTo);
+    where.push(`p.created_at <= $${params.length}`);
+  }
+  if (filters.search) {
+    params.push(`%${filters.search}%`);
+    where.push(`(c.full_name ILIKE $${params.length} OR p.gateway_order_id ILIKE $${params.length} OR p.gateway_payment_id ILIKE $${params.length})`);
+  }
+
+  const whereClause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const from = `FROM payments p
+    JOIN customers c ON c.id = p.customer_id
+    JOIN deals d ON d.id = p.deal_id
+    LEFT JOIN payment_milestones m ON m.id = p.milestone_id
+    LEFT JOIN properties pr ON pr.id = d.property_id
+    LEFT JOIN users initiator ON initiator.id = p.initiated_by`;
+
+  const countResult = await pool.query(`SELECT COUNT(*) ${from} ${whereClause}`, params);
+  const offset = (page - 1) * limit;
+  params.push(limit, offset);
+  const result = await pool.query(
+    `SELECT p.*, c.full_name AS customer_name, m.milestone_name, d.stage AS deal_stage,
+            pr.title AS property_title, initiator.full_name AS initiated_by_name
+     ${from} ${whereClause}
+     ORDER BY p.created_at DESC
+     LIMIT $${params.length - 1} OFFSET $${params.length}`,
+    params
+  );
+
+  return {
+    items: result.rows,
+    pagination: {
+      page,
+      limit,
+      total: Number(countResult.rows[0].count),
+      totalPages: Math.ceil(Number(countResult.rows[0].count) / limit),
+    },
+  };
+}
+
+// GET /api/payments/stats - headline numbers for the Payments screen.
+async function getPaymentStats(user, { from, to } = {}) {
+  const where = [];
+  const params = [];
+  if (!isAdmin(user.role)) {
+    params.push(user.tenant_id || null);
+    where.push(`tenant_id = $${params.length}`);
+  }
+  if (from) {
+    params.push(from);
+    where.push(`created_at >= $${params.length}`);
+  }
+  if (to) {
+    params.push(to);
+    where.push(`created_at <= $${params.length}`);
+  }
+  const whereClause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
+  const [payments, milestones] = await Promise.all([
+    pool.query(
+      `SELECT COUNT(*)::int AS total_payments,
+              COALESCE(SUM(amount) FILTER (WHERE status = 'success'), 0) AS collected_amount,
+              COUNT(*) FILTER (WHERE status = 'success')::int AS successful,
+              COUNT(*) FILTER (WHERE status = 'initiated')::int AS pending,
+              COUNT(*) FILTER (WHERE status = 'failed')::int AS failed,
+              COUNT(*) FILTER (WHERE status = 'refunded')::int AS refunded
+       FROM payments ${whereClause}`,
+      params
+    ),
+    pool.query(
+      `SELECT COUNT(*) FILTER (WHERE status = 'pending')::int AS pending_milestones,
+              COUNT(*) FILTER (WHERE status = 'overdue' OR (status = 'pending' AND due_date < now()))::int AS overdue_milestones,
+              COALESCE(SUM(due_amount) FILTER (WHERE status IN ('pending', 'overdue')), 0) AS outstanding_amount
+       FROM payment_milestones ${whereClause}`,
+      params
+    ),
+  ]);
+
+  return { ...payments.rows[0], ...milestones.rows[0] };
+}
+
 module.exports = {
+  listPayments,
+  getPaymentStats,
   initiatePayment,
   handleWebhook,
   getPaymentById,

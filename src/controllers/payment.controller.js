@@ -71,7 +71,40 @@ async function updateMilestone(req, res, next) {
   }
 }
 
+// GET /api/payments
+async function listPayments(req, res, next) {
+  try {
+    const page = Math.max(Number(req.query.page) || 1, 1);
+    const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100);
+    const filters = {
+      status: req.query.status,
+      gateway: req.query.gateway,
+      dealId: req.query.dealId,
+      customerId: req.query.customerId,
+      dateFrom: req.query.dateFrom,
+      dateTo: req.query.dateTo,
+      search: req.query.search,
+    };
+    const data = await paymentService.listPayments(req.user, filters, page, limit);
+    return success(res, 200, 'Payments fetched successfully', data);
+  } catch (err) {
+    next(err);
+  }
+}
+
+// GET /api/payments/stats
+async function getPaymentStats(req, res, next) {
+  try {
+    const stats = await paymentService.getPaymentStats(req.user, { from: req.query.from, to: req.query.to });
+    return success(res, 200, 'Payment stats fetched successfully', stats);
+  } catch (err) {
+    next(err);
+  }
+}
+
 module.exports = {
+  listPayments,
+  getPaymentStats,
   initiatePayment,
   handleWebhook,
   getPayment,

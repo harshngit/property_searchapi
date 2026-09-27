@@ -43,4 +43,14 @@ async function markAllRead(req, res, next) {
   }
 }
 
-module.exports = { listNotifications, markRead, markAllRead };
+// GET /api/notifications/unread-count
+async function getUnreadCount(req, res, next) {
+  try {
+    const count = await notificationService.getUnreadCount(req.user.id);
+    return success(res, 200, 'Unread count fetched successfully', { count });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { listNotifications, markRead, markAllRead, getUnreadCount };

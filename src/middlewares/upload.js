@@ -34,4 +34,33 @@ const uploadProfilePicture = multer({
   fileFilter: fileFilter(IMAGE_TYPES),
 });
 
-module.exports = { uploadPropertyMedia, uploadProjectMedia, uploadProfilePicture, IMAGE_TYPES, VIDEO_TYPES };
+// Admin bulk imports (localities, circle rates, stamp duty, auction lists):
+// CSV only, up to 5MB. Browsers report CSV under several mimetypes.
+const CSV_TYPES = ['text/csv', 'application/csv', 'application/vnd.ms-excel', 'text/plain'];
+const uploadCsv = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: fileFilter(CSV_TYPES),
+});
+
+// Careers applications ("Work With Us"): resume as PDF/DOC/DOCX, up to 5MB.
+const DOCUMENT_TYPES = [
+  'application/pdf',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+];
+const uploadResume = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: fileFilter(DOCUMENT_TYPES),
+});
+
+module.exports = {
+  uploadPropertyMedia,
+  uploadProjectMedia,
+  uploadProfilePicture,
+  uploadCsv,
+  uploadResume,
+  IMAGE_TYPES,
+  VIDEO_TYPES,
+};

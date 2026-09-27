@@ -298,7 +298,65 @@ async function getReportData(reportType, user, filters, forcedBrokerId) {
   return generator(user, filters, forcedBrokerId);
 }
 
+// Day-by-day series for the Reports page trend chart: new leads, new deals
+// and deals won per day over the last `days` days (default 7, max 90),
+// including zero days so the chart has no gaps. Tenant-scoped like every
+// other report here.
+async function getTrend(user, { days = 7 } = {}) {
+  const span = Math.min(Math.max(Number(days) || 7, 1), 90);
+  const leadWhere = [];
+  const leadParams = [span];
+  tenantClause(user, 'l.', leadWhere, leadParams);
+  const dealWhere = [];
+  const dealParams = [span];
+  tenantClause(user, 'd.', dealWhere, dealParams);
+
+  const extra = (where) => (where.length ? `AND ${where.join(' AND ')}` : '');
+  const [leads, deals, won] = await Promise.all([
+    pool.query(
+      `SELECT (l.created_at AT TIME ZONE 'Asia/Kolkata')::date AS day, COUNT(*)::int AS count FROM leads l
+       WHERE l.created_at >= (now() AT TIME ZONE 'Asia/Kolkata')::date - ($1::int - 1) ${extra(leadWhere)}
+       GROUP BY 1`,
+      leadParams
+    ),
+    pool.query(
+      `SELECT (d.created_at AT TIME ZONE 'Asia/Kolkata')::date AS day, COUNT(*)::int AS count FROM deals d
+       WHERE d.created_at >= (now() AT TIME ZONE 'Asia/Kolkata')::date - ($1::int - 1) ${extra(dealWhere)}
+       GROUP BY 1`,
+      dealParams
+    ),
+    pool.query(
+      `SELECT (d.closed_at AT TIME ZONE 'Asia/Kolkata')::date AS day, COUNT(*)::int AS count FROM deals d
+       WHERE d.stage = 'closed_won' AND d.closed_at >= (now() AT TIME ZONE 'Asia/Kolkata')::date - ($1::int - 1) ${extra(dealWhere)}
+       GROUP BY 1`,
+      dealParams
+    ),
+  ]);
+
+  const toMap = (rows) => new Map(rows.map((r) => [String(r.day), r.count]));
+  const leadMap = toMap(leads.rows);
+  const dealMap = toMap(deals.rows);
+  const wonMap = toMap(won.rows);
+
+  const series = [];
+  const today = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+  for (let i = span - 1; i >= 0; i--) {
+    const d = new Date(today);
+    d.setDate(today.getDate() - i);
+    const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    series.push({
+      date: key,
+      day: d.toLocaleDateString('en-US', { weekday: 'short' }),
+      leads: leadMap.get(key) || 0,
+      deals: dealMap.get(key) || 0,
+      won: wonMap.get(key) || 0,
+    });
+  }
+  return { days: span, series };
+}
+
 module.exports = {
+  getTrend,
   getLeadsReport,
   getPropertiesReport,
   getBrokersReport,

@@ -70,7 +70,17 @@ async function markAllRead(userId) {
   return { updated: result.rows.length };
 }
 
+// Header bell badge - cheap single count, polled by both frontends.
+async function getUnreadCount(userId) {
+  const result = await pool.query(
+    'SELECT COUNT(*)::int AS count FROM notifications WHERE user_id = $1 AND is_read = false',
+    [userId]
+  );
+  return result.rows[0].count;
+}
+
 module.exports = {
+  getUnreadCount,
   listNotifications,
   createNotification,
   markRead,

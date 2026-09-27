@@ -22,8 +22,45 @@ const TRANSACTION_TYPES = ['buy', 'sell', 'rent'];
  * /search/properties:
  *   get:
  *     summary: Search approved property listings
+ *     description: >
+ *       Residential (and commercial) listings by default - auction, special-situation
+ *       and institutional listings are excluded unless `listingCategory` asks for them,
+ *       in which case they come back as masked teasers (full detail is at
+ *       /opportunities/{id}). Full addresses are never returned publicly and
+ *       coordinates are rounded to ~100 m. Response includes `disclaimers`.
  *     tags: [Search]
  *     parameters:
+ *       - in: query
+ *         name: listingCategory
+ *         schema: { type: string, enum: [residential, institutional, special_situation, auction] }
+ *       - in: query
+ *         name: purpose
+ *         schema: { type: string, enum: [buy, rent] }
+ *         description: Website menu - buy = listings for sale (transaction_type sell), rent = rental/lease listings
+ *       - in: query
+ *         name: q
+ *         schema: { type: string }
+ *         description: Free-text match on title / locality / city
+ *       - in: query
+ *         name: minPrice
+ *         schema: { type: number }
+ *         description: Minimum price in INR (numeric price_value)
+ *       - in: query
+ *         name: maxPrice
+ *         schema: { type: number }
+ *       - in: query
+ *         name: bedrooms
+ *         schema: { type: integer }
+ *         description: Minimum bedrooms
+ *       - in: query
+ *         name: furnishing
+ *         schema: { type: string }
+ *       - in: query
+ *         name: possessionStatus
+ *         schema: { type: string }
+ *       - in: query
+ *         name: verified
+ *         schema: { type: boolean }
  *       - in: query
  *         name: city
  *         schema: { type: string }
@@ -50,7 +87,7 @@ const TRANSACTION_TYPES = ['buy', 'sell', 'rent'];
  *         description: Comma-separated list of required amenities, e.g. "parking,gym"
  *       - in: query
  *         name: sort
- *         schema: { type: string, enum: [rate_asc, rate_desc, newest], default: newest }
+ *         schema: { type: string, enum: [rate_asc, rate_desc, price_asc, price_desc, newest, verified], default: newest }
  *       - in: query
  *         name: page
  *         schema: { type: integer, default: 1 }
@@ -66,9 +103,15 @@ router.get(
   [
     query('propertyType').optional().isIn(PROPERTY_TYPES),
     query('transactionType').optional().isIn(TRANSACTION_TYPES),
+    query('listingCategory').optional().isIn(['residential', 'institutional', 'special_situation', 'auction']),
+    query('purpose').optional().isIn(['buy', 'rent']),
     query('minRate').optional().isFloat({ min: 0 }),
     query('maxRate').optional().isFloat({ min: 0 }),
-    query('sort').optional().isIn(['rate_asc', 'rate_desc', 'newest']),
+    query('minPrice').optional().isFloat({ min: 0 }),
+    query('maxPrice').optional().isFloat({ min: 0 }),
+    query('bedrooms').optional().isInt({ min: 0 }),
+    query('verified').optional().isBoolean(),
+    query('sort').optional().isIn(['rate_asc', 'rate_desc', 'price_asc', 'price_desc', 'newest', 'verified']),
     query('page').optional().isInt({ min: 1 }),
     query('limit').optional().isInt({ min: 1, max: 100 }),
   ],
@@ -112,6 +155,19 @@ router.get(
  *         description: Available filter options
  */
 router.get('/filters', searchController.getFilters);
+
+/**
+ * @swagger
+ * /search/home:
+ *   get:
+ *     summary: Website home page feed in one call
+ *     description: Headline counts, verified + latest residential listings, top cities, auction highlights (teasers), featured articles, disclaimers.
+ *     tags: [Search]
+ *     responses:
+ *       200:
+ *         description: Home page data
+ */
+router.get('/home', searchController.getHome);
 
 /**
  * @swagger

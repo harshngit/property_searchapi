@@ -15,6 +15,19 @@ const { authenticate } = require('../middlewares/auth');
 
 /**
  * @swagger
+ * /notifications/unread-count:
+ *   get:
+ *     summary: Unread notification count for the header bell
+ *     tags: [Notifications]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200: { description: "{ count }" }
+ */
+router.get('/unread-count', authenticate, notificationController.getUnreadCount);
+
+/**
+ * @swagger
  * /notifications:
  *   get:
  *     summary: List the current user's notifications

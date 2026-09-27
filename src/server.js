@@ -9,7 +9,9 @@ require('dns').setDefaultResultOrder('ipv4first');
 
 const app = require('./app');
 
-const PORT = process.env.PORT || 5000;
+// Port 5000 is commonly occupied by macOS ControlCenter on local machines.
+// Keep it configurable while using 5001 as the development fallback.
+const PORT = process.env.PORT || 5001;
 
 app.listen(PORT, () => {
   console.log(`PropertySerch Auth Service running on http://localhost:${PORT}`);

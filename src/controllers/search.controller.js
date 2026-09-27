@@ -12,21 +12,30 @@ async function searchProperties(req, res, next) {
       locality: req.query.locality,
       propertyType: req.query.propertyType,
       transactionType: req.query.transactionType,
+      listingCategory: req.query.listingCategory,
+      purpose: req.query.purpose,
+      q: req.query.q,
       minRate: req.query.minRate,
       maxRate: req.query.maxRate,
+      minPrice: req.query.minPrice,
+      maxPrice: req.query.maxPrice,
+      bedrooms: req.query.bedrooms,
+      furnishing: req.query.furnishing,
+      possessionStatus: req.query.possessionStatus,
+      verified: req.query.verified === 'true',
       amenities: req.query.amenities
         ? String(req.query.amenities).split(',').map((a) => a.trim())
         : undefined,
     };
 
-    const { items, pagination } = await searchService.searchProperties(
+    const { items, pagination, disclaimers } = await searchService.searchProperties(
       filters,
       page,
       limit,
       req.query.sort
     );
 
-    return success(res, 200, 'Properties fetched successfully', { items, pagination });
+    return success(res, 200, 'Properties fetched successfully', { items, pagination, disclaimers });
   } catch (err) {
     next(err);
   }
@@ -62,4 +71,14 @@ async function getProperty(req, res, next) {
   }
 }
 
-module.exports = { searchProperties, getFilters, getSuggestions, getProperty };
+// GET /api/search/home
+async function getHome(req, res, next) {
+  try {
+    const data = await searchService.getHomeData();
+    return success(res, 200, 'Home page data fetched successfully', data);
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { searchProperties, getFilters, getSuggestions, getProperty, getHome };

@@ -2,6 +2,9 @@ const pool = require('../config/db');
 const { isAdmin } = require('../utils/ownership');
 const { uploadBuffer, deleteObject, signUrls, getReadUrl } = require('../utils/storage');
 const customerService = require('./customer.service');
+const opportunityScoring = require('./opportunityScoring.service');
+const { assertCleanContent } = require('../utils/contentGuard');
+const { parsePriceToNumber } = require('../utils/price');
 
 function notFound(message = 'Property not found') {
   const err = new Error(message);
@@ -61,6 +64,52 @@ async function signPropertyMedia(rows) {
   return Array.isArray(rows) ? signed : signed[0];
 }
 
+// Sec. 0.3 / 0.4 / 11.2: brand spelling, forbidden terms and contact
+// details (phones, emails, URLs, contact phrases) are rejected in any
+// user-visible listing text before it is written. No role can bypass this.
+const GUARDED_TEXT_FIELDS = ['title', 'description', 'aboutExtended', 'faqs', 'tags', 'badge', 'yieldQualifier', 'legalStatusNote'];
+
+async function guardListingText(data) {
+  const fields = Object.fromEntries(
+    GUARDED_TEXT_FIELDS.filter((key) => data[key] !== undefined && data[key] !== null).map((key) => [key, data[key]])
+  );
+  if (Object.keys(fields).length) await assertCleanContent(fields, { blockContact: true });
+}
+
+// Engine 4 opportunity fields + the numeric price. Kept out of the big
+// INSERT in createProperty (applied as a follow-up UPDATE in the same
+// request) so that statement doesn't have to grow for every new variant.
+const OPPORTUNITY_FIELDS = {
+  priceValue: 'price_value',
+  opportunitySourceType: 'opportunity_source_type',
+  reservePrice: 'reserve_price',
+  emdAmount: 'emd_amount',
+  emdDeadline: 'emd_deadline',
+  inspectionDate: 'inspection_date',
+  auctionReferenceId: 'auction_reference_id',
+  auctionPortalUrl: 'auction_portal_url',
+  possessionType: 'possession_type',
+  legalStatusNote: 'legal_status_note',
+  estimatedMarketValue: 'estimated_market_value',
+  isInstitutionalAsset: 'is_institutional_asset',
+};
+const OPPORTUNITY_JSON_FIELDS = { situationTags: 'situation_tags', riskIndicators: 'risk_indicators' };
+
+function buildOpportunitySet(data, params, set) {
+  for (const [key, column] of Object.entries(OPPORTUNITY_FIELDS)) {
+    if (data[key] !== undefined) {
+      params.push(data[key]);
+      set.push(`${column} = $${params.length}`);
+    }
+  }
+  for (const [key, column] of Object.entries(OPPORTUNITY_JSON_FIELDS)) {
+    if (data[key] !== undefined) {
+      params.push(JSON.stringify(data[key] || []));
+      set.push(`${column} = $${params.length}`);
+    }
+  }
+}
+
 // Restricts a listing query to the caller's own tenant/records unless
 // they are admin/super_admin, per the module's tenant-isolation rule.
 function applyTenantScope(user, where, params) {
@@ -90,6 +139,14 @@ async function listProperties(user, filters, page, limit) {
   if (filters.status) {
     params.push(filters.status);
     where.push(`p.status = $${params.length}`);
+  }
+  if (filters.listingCategory) {
+    params.push(filters.listingCategory);
+    where.push(`p.listing_category = $${params.length}`);
+  }
+  if (filters.search) {
+    params.push(`%${filters.search}%`);
+    where.push(`(p.title ILIKE $${params.length} OR p.locality ILIKE $${params.length} OR p.city ILIKE $${params.length})`);
   }
   if (filters.minRate) {
     params.push(filters.minRate);
@@ -197,6 +254,8 @@ async function createProperty(data, user) {
     faqs,
   } = data;
 
+  await guardListingText(data);
+
   const result = await pool.query(
     `INSERT INTO properties (
        tenant_id, created_by, broker_id, builder_id, title, description,
@@ -259,8 +318,19 @@ async function createProperty(data, user) {
       JSON.stringify(faqs || []),
     ]
   );
+  const propertyId = result.rows[0].id;
 
-  return getPropertyById(result.rows[0].id);
+  const extra = { ...data, priceValue: data.priceValue ?? parsePriceToNumber(price) };
+  const set = [];
+  const params = [];
+  buildOpportunitySet(extra, params, set);
+  if (set.length) {
+    params.push(propertyId);
+    await pool.query(`UPDATE properties SET ${set.join(', ')} WHERE id = $${params.length}`, params);
+  }
+
+  await opportunityScoring.refreshScores(propertyId);
+  return getPropertyById(propertyId);
 }
 
 const UPDATABLE_FIELDS = {
@@ -303,6 +373,8 @@ const UPDATABLE_FIELDS = {
 };
 
 async function updateProperty(id, data) {
+  await guardListingText(data);
+
   const set = [];
   const params = [];
 
@@ -324,6 +396,7 @@ async function updateProperty(id, data) {
     params.push(JSON.stringify(data.faqs));
     set.push(`faqs = $${params.length}`);
   }
+  buildOpportunitySet(data, params, set);
 
   if (set.length === 0) throw badRequest('No updatable fields provided');
 
@@ -333,6 +406,7 @@ async function updateProperty(id, data) {
     params
   );
 
+  await opportunityScoring.refreshScores(id);
   return getPropertyById(id);
 }
 
@@ -426,8 +500,14 @@ async function updateAvailability(id, property, isAvailable) {
   return getPropertyById(id);
 }
 
+// price is free text; price_value follows it whenever the new text parses
+// as a number ("2.1 Cr"). "Price on Request" leaves the last numeric value.
 async function updatePricing(id, price) {
-  await pool.query('UPDATE properties SET price = $1 WHERE id = $2 RETURNING *', [price, id]);
+  await pool.query(
+    'UPDATE properties SET price = $1, price_value = COALESCE($2, price_value) WHERE id = $3 RETURNING *',
+    [price, parsePriceToNumber(price), id]
+  );
+  await opportunityScoring.refreshScores(id);
   return getPropertyById(id);
 }
 
@@ -439,7 +519,15 @@ async function approveProperty(id, adminUser) {
     [adminUser.id, id]
   );
   if (result.rows.length === 0) throw notFound();
-  return getPropertyById(id);
+
+  // Approving an auction / special-situation deal is what makes it live, so
+  // that's when matched investors get their alert (Engine 4). Required
+  // lazily - opportunity.service itself reads properties.
+  const property = await getPropertyById(id);
+  if (opportunityScoring.OPPORTUNITY_CATEGORIES.includes(property.listing_category)) {
+    require('./opportunity.service').safeSendAlerts(id);
+  }
+  return property;
 }
 
 async function rejectProperty(id, reason, adminUser) {

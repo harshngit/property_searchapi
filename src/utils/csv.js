@@ -32,4 +32,60 @@ function flattenToRows(value, prefix = '') {
   return rows;
 }
 
-module.exports = { toCsv, flattenToRows };
+// RFC 4180 reader for admin bulk uploads (localities, circle rates, stamp
+// duty, auction lists). First row is the header; returns one object per
+// data row keyed by trimmed header name. Handles quoted fields containing
+// commas, newlines and doubled quotes; skips fully blank lines.
+function parseCsv(text) {
+  const rows = [];
+  let row = [];
+  let field = '';
+  let inQuotes = false;
+  const input = String(text || '').replace(/^﻿/, '');
+
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+    if (inQuotes) {
+      if (ch === '"' && input[i + 1] === '"') {
+        field += '"';
+        i++;
+      } else if (ch === '"') {
+        inQuotes = false;
+      } else {
+        field += ch;
+      }
+    } else if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === ',') {
+      row.push(field);
+      field = '';
+    } else if (ch === '\n' || ch === '\r') {
+      if (ch === '\r' && input[i + 1] === '\n') i++;
+      row.push(field);
+      rows.push(row);
+      row = [];
+      field = '';
+    } else {
+      field += ch;
+    }
+  }
+  if (field !== '' || row.length > 0) {
+    row.push(field);
+    rows.push(row);
+  }
+
+  const nonEmpty = rows.filter((r) => r.some((cell) => cell.trim() !== ''));
+  if (nonEmpty.length === 0) return [];
+
+  const headers = nonEmpty[0].map((h) => h.trim());
+  return nonEmpty.slice(1).map((cells) => {
+    const obj = {};
+    headers.forEach((header, index) => {
+      const value = (cells[index] ?? '').trim();
+      obj[header] = value === '' ? null : value;
+    });
+    return obj;
+  });
+}
+
+module.exports = { toCsv, flattenToRows, parseCsv };

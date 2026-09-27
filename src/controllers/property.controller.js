@@ -16,6 +16,8 @@ async function listProperties(req, res, next) {
       status: req.query.status,
       minRate: req.query.minRate,
       maxRate: req.query.maxRate,
+      listingCategory: req.query.listingCategory,
+      search: req.query.search,
     };
 
     const { items, pagination } = await propertyService.listProperties(

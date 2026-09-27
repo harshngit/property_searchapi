@@ -102,7 +102,18 @@ async function exportReport(req, res, next) {
   }
 }
 
+// GET /api/reports/trend
+async function getTrend(req, res, next) {
+  try {
+    const data = await reportService.getTrend(req.user, { days: req.query.days });
+    return success(res, 200, 'Trend fetched successfully', data);
+  } catch (err) {
+    next(err);
+  }
+}
+
 module.exports = {
+  getTrend,
   getLeadsReport,
   getPropertiesReport,
   getBrokersReport,

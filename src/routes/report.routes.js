@@ -23,6 +23,28 @@ const dateRangeValidators = [query('from').optional().isISO8601(), query('to').o
 
 /**
  * @swagger
+ * /reports/trend:
+ *   get:
+ *     summary: Daily series of new leads, new deals and deals won (for the trend chart)
+ *     tags: [Reports]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - { in: query, name: days, schema: { type: integer, default: 7, maximum: 90 } }
+ *     responses:
+ *       200: { description: "{ days, series: [{ date, day, leads, deals, won }] } - zero-filled" }
+ */
+router.get(
+  '/trend',
+  authenticate,
+  authorize(...MANAGER_ROLES),
+  [query('days').optional().isInt({ min: 1, max: 90 })],
+  validate,
+  reportController.getTrend
+);
+
+/**
+ * @swagger
  * /reports/leads:
  *   get:
  *     summary: Lead counts by status, source, and assigned user

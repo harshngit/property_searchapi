@@ -12,11 +12,11 @@ WhatsApp Integration, AI Lead Qualification, and Property Matching.
 cp .env.example .env      # update DB credentials & JWT secrets
 npm install
 npm run migrate           # runs all pending files in src/db/migrations/, tracked via schema_migrations
-npm run dev                # starts on http://localhost:5000
+npm run dev                # starts on http://localhost:5001
 ```
 
-Swagger UI: `http://localhost:5000/api-docs`
-Raw OpenAPI JSON: `http://localhost:5000/api-docs.json`
+Swagger UI: `http://localhost:5001/api-docs`
+Raw OpenAPI JSON: `http://localhost:5001/api-docs.json`
 
 ## Endpoints implemented
 
@@ -359,6 +359,35 @@ database instead of the public API.
 - **Relevance scoring is computed in JS, not SQL** — a loose SQL prefilter (`status='approved'` + tenant scope) pulls candidate rows, then `matching.service.js#scoreProperty` applies the weighted score (location 40 / budget fit 35 / property type 15 / transaction type 10) and takes the top 20. The dataset sizes this module targets don't justify pushing that logic into SQL.
 - **`property_match_results` distinguishes customer-level from lead-level runs via `lead_id`.** `GET /matching/properties/:customerId` and `POST /matching/rerun` both operate on the `lead_id IS NULL` slot for that customer; `GET /matching/recommendations/:leadId` operates on its own `lead_id`-scoped slot, so running one never overwrites the other.
 
+## Platform foundation, website content, NRI/HNI & Opportunity Deals (migrations 016–020)
+
+New route groups (all documented in Swagger at `/api-docs`):
+
+| Base path | Who | What |
+|---|---|---|
+| `/api/admin/master/:entity` (+ `/import`) | admin, super_admin | CRUD + all-or-nothing CSV import for `countries, states, cities, localities, pincodes, stamp_duty_rules, circle_rates, sub_registrar_offices, feature_flags, disclaimers`. Parents can be referenced by code/slug/name (`{"state":"TG","cityName":"Hyderabad"}`). |
+| `/api/admin/config`, `/api/admin/audit-logs` | admin, super_admin | Every rate/threshold/weight/word-list lives in `app_config` (statutory keys = super_admin only). Audit log explorer. |
+| `/api/geo/*`, `/api/disclaimers` | public | Live states/cities/localities/pincodes, stamp duty, circle rate; disclaimers by content type + state. |
+| `/api/content/*` | public GET, admin `/content/manage/*` | CMS articles, city landing pages created from an admin-editable template, `sitemap.xml`. |
+| `/api/bd-leads` | public POST, staff GET | Get Involved / Advertise With Us enquiries → Super Admin first → assign (audit-logged). `/city-demand` ranks requested cities. |
+| `/api/search/home`, `/api/search/properties` | public | Home feed; search gained `listingCategory`, `q`, `minPrice/maxPrice`, `bedrooms`, `verified`, `furnishing`, `possessionStatus`, price sorts. |
+| `/api/opportunities/*` | mixed | Engine 4 bank auction / special situation deals: public teasers, gated full detail, interest pipeline, alerts, scoring, ingestion queue. |
+| `/api/investors/*`, `/api/nri/*`, `/api/hni/*` | investor + staff | Engine 3 NRI / HNI profiles, NRI management, HNI portfolio & curated deals. |
+| `/api/tools/*` | public | ROI, rental yield, appreciation, liquidity score (indicative, disclaimered). |
+| CRM gaps | staff | `GET /payments`, `GET /payments/stats`, `GET /ai/insights`, `GET /ai/stats`, `POST /ai/lead/:id/review`, `GET /reports/trend`, `GET /notifications/unread-count`. |
+
+Design notes:
+
+- **Everything configurable is data.** Code only holds the Annexure A default as a fallback to `configService.getConfig(key, default)`; the seeded `app_config` rows (migrations 016, 020) are the live values. Every config change is written to the append-only `audit_logs` table (a trigger rejects UPDATE/DELETE on it).
+- **Content guard (`utils/contentGuard.js`)** enforces the brand spellings, forbidden terms and — for listing text only — contact blocking (phones, emails, URLs, contact phrases) server-side, for every role. Violations return `422` with `errors: [{ field, rule, match, suggestion }]`. This now applies to `POST/PUT /properties`, CMS copy and disclaimers.
+- **`properties.price_value`** is the numeric INR price parsed from the free-text `price` ("2.1 Cr" → 21000000) on every write, backfilled by migration 019. `rate` remains price/sq.ft.
+- **Public search privacy:** full `address` is never returned publicly and coordinates are rounded to ~100 m. Auction / special-situation / institutional listings are excluded from the default search and only ever returned publicly as masked teasers (no source bank, reference id, portal link, EMD, legal notes). Full detail is at `GET /opportunities/:id` for staff/broker roles (`opportunity.full_access_roles`) and verified NRI/HNI investors.
+- **Opportunity scoring** (`opportunityScoring.service.js`): discount to estimated market value, Module 14 liquidity band, risk indicators and yield, weights in `opportunity.scoring_weights`. Recomputed on every listing write; `POST /opportunities/:id/rescore` forces it.
+- **Liquidity score** (`liquidity.service.js`) comes from platform data for the locality (widening to the city when thin): buyer requirements + fresh leads vs live listings, closed deals, and engagement. `null` band means "not enough data", never a made-up Low.
+- **Ingestion pipeline** (`POST /opportunities/ingest`, `/ingest/csv`): normalises Indian price/date/area formats, strips contact details, confidence-scores, de-duplicates (source + reference id, or city + locality + reserve ±1% + same auction day), queues `needs_review`, and publishes through `property.service` so the content guard and scoring apply. Auto-publish is off by default and never applies to legal/newspaper notices. The crawlers themselves (layer 1) are not built yet — they only need to POST to this endpoint.
+- **NRI tenant phones** are AES-256-GCM encrypted (`utils/crypto.js`, `DATA_ENCRYPTION_KEY`) and only ever returned masked (`98XXXXXX67`).
+- **Tests:** `npm test` runs `tests/api.e2e.test.js` (Node's built-in test runner) against a running server and its `.env` database; it inserts its own uniquely-named users. Start the server with the same `OPPORTUNITY_INGEST_SECRET` and `PUBLIC_FORM_RATE_LIMIT_MAX=1000`.
+
 ## Not yet wired (TODO — next modules)
 
 - Actual SMS/Email provider integration for OTP & reset link delivery (currently returned
@@ -381,8 +410,9 @@ database instead of the public API.
   deal closes `closed_won`), so `GET /api/reports/revenue`'s commission figures aren't always 0
 - Automatic overdue detection for `payment_milestones` (currently manual), mirroring the
   Tasks module's lazy `syncOverdueTasks()` pattern
-- `invites` (migration `002_create_invites_table.sql`) and `admin.controller.js`/
-  `admin.routes.js` are gone — direct role-tree-gated registration via `POST
+- `invites` (migration `002_create_invites_table.sql`) and the old invite-flow
+  `admin.controller.js`/`admin.routes.js` are gone (the current files of those names are the
+  new master-data/config admin APIs) — direct role-tree-gated registration via `POST
   /api/auth/register` replaced the invite-link flow entirely. The `invites` table itself
   was left in place rather than dropped (no migration touches existing tables), but nothing
   reads or writes it anymore
