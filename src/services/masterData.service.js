@@ -250,6 +250,7 @@ function listEntities() {
     name,
     fields: Object.entries(e.fields).map(([key, f]) => ({
       key,
+      column: f.col,
       type: f.type,
       enum: f.enum || undefined,
       required: e.required.includes(key),

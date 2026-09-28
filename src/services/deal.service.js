@@ -1,6 +1,7 @@
 const pool = require('../config/db');
 const { isAdmin } = require('../utils/ownership');
 const leadService = require('./lead.service');
+const notificationService = require('./notification.service');
 
 function notFound(message = 'Deal not found') {
   const err = new Error(message);
@@ -243,6 +244,44 @@ async function changeStage(id, toStage, user, notes) {
   }
 }
 
+// Tells the customer (if they have a website account) about a visit booked
+// or changed by their representative - it shows in their dashboard too.
+// Best-effort: never fails the CRM action.
+async function notifyCustomerOfVisit(dealId, visit, kind) {
+  try {
+    const info = await pool.query(
+      `SELECT c.user_id, p.title FROM deals d
+       JOIN customers c ON c.id = d.customer_id
+       LEFT JOIN properties p ON p.id = d.property_id
+       WHERE d.id = $1`,
+      [dealId]
+    );
+    const row = info.rows[0];
+    if (!row?.user_id) return;
+    const when = new Date(visit.scheduled_at).toLocaleString('en-IN', {
+      timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit',
+    });
+    const place = row.title ? ` for ${row.title}` : '';
+    const text = {
+      scheduled: ['Site visit scheduled', `Your site visit${place} is booked for ${when}.`],
+      rescheduled: ['Site visit rescheduled', `Your site visit${place} has moved to ${when}.`],
+      cancelled: ['Site visit cancelled', `Your site visit${place} on ${when} was cancelled. Your representative will be in touch.`],
+      completed: ['Thanks for visiting', `Hope the visit${place} went well - your representative will follow up.`],
+    }[kind];
+    if (!text) return;
+    await notificationService.createNotification({
+      userId: row.user_id,
+      type: 'site_visit',
+      title: text[0],
+      message: text[1],
+      relatedEntityType: 'deal',
+      relatedEntityId: dealId,
+    });
+  } catch (err) {
+    console.error(`Visit notification failed for deal ${dealId}:`, err.message);
+  }
+}
+
 async function scheduleSiteVisit(dealId, data, user) {
   const result = await pool.query(
     `INSERT INTO site_visits (deal_id, scheduled_at, notes, created_by, status)
@@ -250,6 +289,7 @@ async function scheduleSiteVisit(dealId, data, user) {
      RETURNING *`,
     [dealId, data.scheduledAt, data.notes || null, user.id]
   );
+  await notifyCustomerOfVisit(dealId, result.rows[0], 'scheduled');
   return result.rows[0];
 }
 
@@ -281,6 +321,8 @@ async function updateSiteVisit(dealId, visitId, data) {
     params
   );
   if (result.rows.length === 0) throw notFound('Site visit not found for this deal');
+  const kind = data.status && data.status !== 'scheduled' ? data.status : data.scheduledAt ? 'rescheduled' : null;
+  if (kind) await notifyCustomerOfVisit(dealId, result.rows[0], kind);
   return result.rows[0];
 }
 

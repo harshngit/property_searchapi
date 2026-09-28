@@ -784,7 +784,7 @@ router.put(
  *         schema: { type: string, format: uuid }
  *     responses:
  *       200:
- *         description: Inquiries fetched (currently always empty)
+ *         description: Leads raised against the property with status, assigned owner, deal stage and visit count (staff only)
  */
 router.get(
   '/:id/inquiries',

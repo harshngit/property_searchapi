@@ -613,7 +613,26 @@ async function listFavorites(user, page, limit) {
   };
 }
 
+async function listPropertyInquiries(propertyId) {
+  const result = await pool.query(
+    `SELECT l.id, l.status, l.source, l.created_at,
+            c.id AS customer_id, c.full_name AS customer_name, c.mobile AS customer_mobile, c.email AS customer_email,
+            u.full_name AS assigned_to_name,
+            d.id AS deal_id, d.stage AS deal_stage,
+            (SELECT COUNT(*) FROM site_visits sv WHERE sv.deal_id = d.id)::int AS visits
+     FROM leads l
+     LEFT JOIN customers c ON c.id = l.customer_id
+     LEFT JOIN users u ON u.id = l.assigned_to
+     LEFT JOIN LATERAL (SELECT id, stage FROM deals WHERE lead_id = l.id ORDER BY created_at DESC LIMIT 1) d ON true
+     WHERE l.property_id = $1
+     ORDER BY l.created_at DESC`,
+    [propertyId]
+  );
+  return result.rows;
+}
+
 module.exports = {
+  listPropertyInquiries,
   listProperties,
   getPropertyById,
   createProperty,

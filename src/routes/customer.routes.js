@@ -423,4 +423,30 @@ router.get(
   customerController.getDeals
 );
 
+/**
+ * @swagger
+ * /customers/{id}/portal:
+ *   get:
+ *     summary: What the customer does on the website dashboard - roles, referral code, requirements, self-posted listings, rentals, saved items (staff)
+ *     tags: [Customers]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters: [{ in: path, name: id, required: true, schema: { type: string, format: uuid } }]
+ *     responses:
+ *       200: { description: Portal summary }
+ *       404: { description: Customer not found }
+ */
+router.get(
+  '/:id/portal',
+  authenticate,
+  authorize(...MANAGE_ROLES),
+  [param('id').isUUID().withMessage('Invalid customer id')],
+  validate,
+  require('../utils/asyncHandler')(async (req, res) => {
+    const customer = await require('../services/customer.service').getCustomerById(req.params.id);
+    require('../utils/ownership').assertTenantVisible(req.user, customer, 'Customer not found');
+    const summary = await require('../services/portal.service').getCustomerPortalSummary(req.params.id);
+    return require('../utils/response').success(res, 200, 'Customer portal activity fetched', summary);
+  })
+);
+
 module.exports = router;

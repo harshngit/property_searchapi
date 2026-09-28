@@ -16,7 +16,9 @@ const ASSIGN_ROLES = ['agency_admin', 'internal_sales', 'admin', 'super_admin'];
 // module exposed directly to the internet - keep it tightly rate limited.
 const publicInquiryLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 10,
+  // Same override as the other public forms, for automated test runs only;
+  // unset in production (10 per 15 min per IP).
+  max: Number(process.env.PUBLIC_FORM_RATE_LIMIT_MAX) || 10,
   standardHeaders: true,
   legacyHeaders: false,
   message: { success: false, message: 'Too many requests, please try again later.' },

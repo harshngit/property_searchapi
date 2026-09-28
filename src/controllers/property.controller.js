@@ -205,11 +205,20 @@ async function rejectProperty(req, res, next) {
 }
 
 // GET /api/properties/:id/inquiries
+// Every lead raised against the listing (website enquiries, portal
+// requirements, WhatsApp, manual) with its status, owner and deal stage.
+// Staff with access to the property only - customers use /me/listings.
 async function getPropertyInquiries(req, res, next) {
   try {
-    // Placeholder - the Lead/Inquiry module has not been built yet.
-    // Once it exists, this should list inquiries raised against this property.
-    return success(res, 200, 'Property inquiries fetched successfully', []);
+    const property = await propertyService.getPropertyById(req.params.id);
+    assertTenantVisible(req.user, property, 'Property not found', { ownerFields: ['created_by', 'broker_id', 'builder_id'] });
+    if (req.user.role === 'customer') {
+      const err = new Error('Customers see enquiries on their listings in their dashboard');
+      err.statusCode = 403;
+      throw err;
+    }
+    const inquiries = await propertyService.listPropertyInquiries(req.params.id);
+    return success(res, 200, 'Property inquiries fetched successfully', inquiries);
   } catch (err) {
     next(err);
   }

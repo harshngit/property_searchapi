@@ -865,3 +865,43 @@ test('website forms: enquiry message reaches the CRM lead, newsletter, filters, 
   });
   assert.equal(ad.status, 201);
 });
+
+// ------------------------------------------------- CRM integration pieces
+
+test('CRM: site visit notifies the customer, property enquiries, customer portal summary, admin metadata', async () => {
+  const A = ctx.admin.token;
+  const buyer = await createUser('customer', 'visitor');
+  const listing = await api('POST', '/properties', {
+    token: A,
+    body: { title: `2 BHK visit test ${RUN}`, propertyType: 'apartment', transactionType: 'sell', price: '90 Lakh', city: CITY, locality: 'Beta Nagar' },
+  });
+  assert.equal(listing.status, 201);
+  await api('GET', '/me/overview', { token: buyer.token }); // links the account to its customer record, as sign-up does
+  await api('POST', '/leads/public-inquiry', { body: { fullName: `visitor ${RUN}`, email: buyer.email, propertyId: listing.data.id, message: 'Visit please' } });
+
+  const inquiries = await api('GET', `/properties/${listing.data.id}/inquiries`, { token: A });
+  assert.equal(inquiries.data.length, 1);
+  assert.equal(inquiries.data[0].customer_email, buyer.email);
+  assert.ok([403, 404].includes((await api('GET', `/properties/${listing.data.id}/inquiries`, { token: buyer.token })).status), 'customers cannot read enquiries');
+
+  await api('PUT', `/leads/${inquiries.data[0].id}/assign`, { token: A, body: { assignedTo: ctx.broker.id } });
+  const deal = await api('POST', '/deals', { token: A, body: { leadId: inquiries.data[0].id } });
+  assert.equal(deal.status, 201);
+  const when = new Date(Date.now() + 2 * 86400000).toISOString();
+  const visit = await api('POST', `/deals/${deal.data.id}/site-visit`, { token: A, body: { scheduledAt: when } });
+  assert.equal(visit.status, 201);
+  await new Promise((r) => setTimeout(r, 200));
+  const note = await pool.query(`SELECT title FROM notifications WHERE user_id = $1 AND type = 'site_visit'`, [buyer.id]);
+  assert.equal(note.rows[0]?.title, 'Site visit scheduled');
+  const visits = await api('GET', '/me/visits', { token: buyer.token });
+  assert.equal(visits.data.length, 1, 'customer sees the visit in their dashboard');
+
+  const summary = await api('GET', `/customers/${inquiries.data[0].customer_id}/portal`, { token: A });
+  assert.equal(summary.status, 200);
+  assert.equal(summary.data.hasAccount, true);
+  assert.equal((await api('GET', `/customers/${inquiries.data[0].customer_id}/portal`, { token: buyer.token })).status, 403);
+
+  const meta = await api('GET', '/admin/master', { token: A });
+  const cities = meta.data.find((e) => e.name === 'cities');
+  assert.equal(cities.fields.find((f) => f.key === 'cityName').column, 'city_name');
+});

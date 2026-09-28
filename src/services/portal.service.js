@@ -835,7 +835,67 @@ async function uploadDocument(user, file, { documentType }) {
   );
 }
 
+// ------------------------------------------------------- staff (Customer 360)
+
+// What a customer does on the website dashboard, for the CRM customer page:
+// roles, referral code, requirements, self-posted listings, rentals and
+// saved items. Staff only (route-level role check).
+async function getCustomerPortalSummary(customerId) {
+  const customerResult = await pool.query(
+    `SELECT c.id, c.user_id, c.portal_roles, c.onboarded_at, u.referral_code, u.last_login_at
+     FROM customers c LEFT JOIN users u ON u.id = c.user_id WHERE c.id = $1`,
+    [customerId]
+  );
+  const customer = customerResult.rows[0];
+  if (!customer) throw notFound('Customer not found');
+
+  const [requirements, listings, leases, counts, referred] = await Promise.all([
+    pool.query(`SELECT * FROM requirements WHERE customer_id = $1 ORDER BY created_at DESC`, [customerId]),
+    customer.user_id
+      ? pool.query(
+          `SELECT p.id, p.title, p.status, p.transaction_type, p.price, p.price_value, p.city, p.locality, p.mandate_type, p.created_at,
+                  (SELECT COUNT(*) FROM leads l WHERE l.property_id = p.id)::int AS enquiry_count
+           FROM properties p WHERE p.created_by = $1 ORDER BY p.created_at DESC`,
+          [customer.user_id]
+        )
+      : { rows: [] },
+    pool.query(
+      `SELECT l.id, l.property_label, l.monthly_rent, l.start_date, l.end_date, l.status, l.tenant_confirmed_at,
+              CASE WHEN l.owner_customer_id = $1 THEN 'owner' ELSE 'tenant' END AS side,
+              oc.full_name AS owner_name, tc.full_name AS tenant_name,
+              (SELECT COUNT(*) FROM rent_payments rp WHERE rp.lease_id = l.id AND rp.status IN ('due', 'disputed'))::int AS rent_due,
+              (SELECT COUNT(*) FROM maintenance_requests m WHERE m.lease_id = l.id AND m.status IN ('open', 'in_progress'))::int AS open_maintenance
+       FROM leases l
+       JOIN customers oc ON oc.id = l.owner_customer_id
+       JOIN customers tc ON tc.id = l.tenant_customer_id
+       WHERE l.owner_customer_id = $1 OR l.tenant_customer_id = $1
+       ORDER BY l.start_date DESC`,
+      [customerId]
+    ),
+    pool.query(
+      `SELECT (SELECT COUNT(*) FROM property_favorites WHERE customer_id = $1)::int AS favourites,
+              (SELECT COUNT(*) FROM saved_searches WHERE customer_id = $1)::int AS saved_searches`,
+      [customerId]
+    ),
+    customer.user_id ? referralService.countReferrals(customer.user_id) : 0,
+  ]);
+
+  return {
+    hasAccount: !!customer.user_id,
+    portalRoles: customer.portal_roles || [],
+    onboardedAt: customer.onboarded_at,
+    lastLoginAt: customer.last_login_at || null,
+    referralCode: customer.referral_code || null,
+    referredUsers: referred,
+    ...counts.rows[0],
+    requirements: requirements.rows,
+    listings: listings.rows,
+    leases: leases.rows,
+  };
+}
+
 module.exports = {
+  getCustomerPortalSummary,
   PORTAL_ROLES,
   resolveCustomer,
   getProfile,
