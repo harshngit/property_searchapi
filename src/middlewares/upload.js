@@ -55,7 +55,21 @@ const uploadResume = multer({
   fileFilter: fileFilter(DOCUMENT_TYPES),
 });
 
+// Deal / customer documents (KYC, agreements, receipts): PDF, Office docs
+// or images, up to 20MB.
+const uploadDocumentFile = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 20 * 1024 * 1024 },
+  fileFilter: fileFilter([
+    ...DOCUMENT_TYPES,
+    ...IMAGE_TYPES,
+    'application/vnd.ms-excel',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  ]),
+});
+
 module.exports = {
+  uploadDocumentFile,
   uploadPropertyMedia,
   uploadProjectMedia,
   uploadProfilePicture,

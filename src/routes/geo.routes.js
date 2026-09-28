@@ -54,6 +54,31 @@ geoRouter.get(
 
 /**
  * @swagger
+ * /geo/nearest-city:
+ *   get:
+ *     summary: Resolve a visitor's coordinates to the nearest city (and the nearest city with live listings)
+ *     description: >
+ *       Uses the seeded city centres - no third-party geocoding. `city` is the
+ *       nearest city when the point is inside its match radius; `listingCity`
+ *       is the nearest city within 150 km that has live residential listings,
+ *       with `searchName` being the spelling to pass to /search/properties.
+ *       Clients should round coordinates (2 decimals is ~1 km) before sending.
+ *     tags: [Geography]
+ *     parameters:
+ *       - { in: query, name: lat, required: true, schema: { type: number, example: 28.46 } }
+ *       - { in: query, name: lng, required: true, schema: { type: number, example: 77.03 } }
+ *     responses:
+ *       200: { description: "{ city, listingCity } - either may be null" }
+ */
+geoRouter.get(
+  '/nearest-city',
+  [query('lat').isFloat({ min: -90, max: 90 }), query('lng').isFloat({ min: -180, max: 180 })],
+  validate,
+  geoController.nearestCity
+);
+
+/**
+ * @swagger
  * /geo/cities/{slug}:
  *   get:
  *     summary: Get one live city by slug

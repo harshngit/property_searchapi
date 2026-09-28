@@ -20,9 +20,14 @@ async function searchProperties(req, res, next) {
       minPrice: req.query.minPrice,
       maxPrice: req.query.maxPrice,
       bedrooms: req.query.bedrooms,
+      maxBedrooms: req.query.maxBedrooms,
+      tag: req.query.tag,
       furnishing: req.query.furnishing,
       possessionStatus: req.query.possessionStatus,
       verified: req.query.verified === 'true',
+      bhk: req.query.bhk,
+      parking: req.query.parking,
+      rera: req.query.rera === 'true',
       amenities: req.query.amenities
         ? String(req.query.amenities).split(',').map((a) => a.trim())
         : undefined,

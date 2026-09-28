@@ -53,11 +53,33 @@ const TRANSACTION_TYPES = ['buy', 'sell', 'rent'];
  *         schema: { type: integer }
  *         description: Minimum bedrooms
  *       - in: query
+ *         name: maxBedrooms
+ *         schema: { type: integer }
+ *         description: Maximum bedrooms (e.g. 1 for studio homes)
+ *       - in: query
+ *         name: tag
+ *         schema: { type: string }
+ *         description: Listing tag set in the CRM, case-insensitive (e.g. "PG", "Co-living")
+ *       - in: query
  *         name: furnishing
  *         schema: { type: string }
+ *         description: One or a comma-separated list, e.g. "Fully Furnished,Semi-Furnished"
  *       - in: query
  *         name: possessionStatus
  *         schema: { type: string }
+ *         description: One or a comma-separated list, e.g. "Ready to Move,Under Construction"
+ *       - in: query
+ *         name: bhk
+ *         schema: { type: string }
+ *         description: Comma-separated bedroom counts; 5 means 5 and above (e.g. "2,3,5")
+ *       - in: query
+ *         name: parking
+ *         schema: { type: string }
+ *         description: Comma-separated parking types - covered, open, none
+ *       - in: query
+ *         name: rera
+ *         schema: { type: boolean }
+ *         description: Only RERA-registered listings
  *       - in: query
  *         name: verified
  *         schema: { type: boolean }
@@ -69,7 +91,8 @@ const TRANSACTION_TYPES = ['buy', 'sell', 'rent'];
  *         schema: { type: string }
  *       - in: query
  *         name: propertyType
- *         schema: { type: string, enum: [apartment, villa, independent_house, plot, commercial, farmhouse, other] }
+ *         schema: { type: string }
+ *         description: One or a comma-separated list of apartment, villa, independent_house, plot, commercial, farmhouse, other
  *       - in: query
  *         name: transactionType
  *         schema: { type: string, enum: [buy, sell, rent] }
@@ -101,7 +124,13 @@ const TRANSACTION_TYPES = ['buy', 'sell', 'rent'];
 router.get(
   '/properties',
   [
-    query('propertyType').optional().isIn(PROPERTY_TYPES),
+    query('propertyType')
+      .optional()
+      .custom((v) => String(v).split(',').every((t) => PROPERTY_TYPES.includes(t.trim())))
+      .withMessage(`propertyType must be one or more of: ${PROPERTY_TYPES.join(', ')}`),
+    query('bhk').optional().matches(/^[0-9]+(,[0-9]+)*$/).withMessage('bhk is a comma-separated list of bedroom counts'),
+    query('parking').optional().matches(/^(covered|open|none)(,(covered|open|none))*$/i),
+    query('rera').optional().isBoolean(),
     query('transactionType').optional().isIn(TRANSACTION_TYPES),
     query('listingCategory').optional().isIn(['residential', 'institutional', 'special_situation', 'auction']),
     query('purpose').optional().isIn(['buy', 'rent']),
@@ -110,6 +139,8 @@ router.get(
     query('minPrice').optional().isFloat({ min: 0 }),
     query('maxPrice').optional().isFloat({ min: 0 }),
     query('bedrooms').optional().isInt({ min: 0 }),
+    query('maxBedrooms').optional().isInt({ min: 0 }),
+    query('tag').optional().isString().isLength({ max: 50 }),
     query('verified').optional().isBoolean(),
     query('sort').optional().isIn(['rate_asc', 'rate_desc', 'price_asc', 'price_desc', 'newest', 'verified']),
     query('page').optional().isInt({ min: 1 }),

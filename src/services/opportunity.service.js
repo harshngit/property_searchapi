@@ -973,7 +973,10 @@ async function publishItem(id, overrides, user, { auto = false } = {}) {
       situationTags: n.situation_tags || [],
       riskIndicators: n.risk_indicators || [],
     },
-    { id: user.id, role: user.role, tenant_id: null }
+    { id: user.id, role: user.role, tenant_id: null },
+    // Imported deals are published below after review, but never get the
+    // Verified badge automatically - that is for team-vetted listings.
+    { autoVerify: false }
   );
 
   await pool.query(

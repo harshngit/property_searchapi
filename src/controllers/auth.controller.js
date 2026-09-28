@@ -5,10 +5,10 @@ const { success, error } = require('../utils/response');
 // POST /api/auth/register
 async function register(req, res, next) {
   try {
-    const { fullName, email, mobile, password, role, tenantId } = req.body;
+    const { fullName, email, mobile, password, role, tenantId, referralCode } = req.body;
 
     const user = await authService.registerUser(
-      { fullName, email, mobile, password, role, tenantId },
+      { fullName, email, mobile, password, role, tenantId, referralCode },
       req.user // set by optionalAuthenticate - null if no/invalid bearer token was sent
     );
 

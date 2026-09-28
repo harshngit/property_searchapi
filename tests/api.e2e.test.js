@@ -1,7 +1,8 @@
-// End-to-end API tests for the modules added in migrations 016-020:
+// End-to-end API tests for the modules added in migrations 016-023:
 // admin master data & config, geography, disclaimers, content guard,
 // public search, CMS, business leads, CRM gap endpoints, NRI / HNI,
-// investment tools and opportunity deals (incl. ingestion).
+// investment tools, opportunity deals (incl. ingestion) and the customer
+// portal (buyer / tenant / seller / owner dashboard, rentals, referrals).
 //
 // Runs against a live server + its database (the one in .env):
 //   npm run dev                       # in one terminal
@@ -681,4 +682,186 @@ test('investment tools: roi, rental yield, appreciation, liquidity', async () =>
   assert.equal(liq.status, 200);
   assert.ok(['high', 'moderate', 'low', null].includes(liq.data.band));
   assert.ok(liq.data.disclaimers.length > 0);
+});
+
+// --------------------------------------------------------- customer portal
+
+test('customer portal: onboarding + referral code, listing with consent, requirement -> hot match alert, masked seller view', async () => {
+  const seller = await createUser('customer', 'seller');
+  const buyer = await createUser('customer', 'buyer');
+  const A = ctx.admin.token;
+
+  const staff = await api('GET', '/me/overview', { token: A });
+  assert.equal(staff.status, 403, 'staff use the CRM, not the customer dashboard');
+
+  const onboarded = await api('PUT', '/me/profile', { token: seller.token, body: { portalRoles: ['seller', 'owner'] } });
+  assert.equal(onboarded.status, 200);
+  assert.match(onboarded.data.referral.code, /^SE-[A-HJKMNP-Z2-9]{5}$/);
+  assert.equal(onboarded.data.tier.current, 'lite');
+  const code = onboarded.data.referral.code;
+  const again = await api('PUT', '/me/profile', { token: seller.token, body: { portalRoles: ['owner'] } });
+  assert.equal(again.data.referral.code, code, 'referral code is permanent');
+
+  // Referral attribution on sign-up; unknown code rejected.
+  const badRef = await api('POST', '/auth/register', {
+    body: { fullName: 'Ref Test', email: `badref.${RUN}@e2e.test`, password: PASSWORD, role: 'customer', referralCode: 'BU-ZZZZZ' },
+  });
+  assert.equal(badRef.status, 400);
+  const referred = await api('POST', '/auth/register', {
+    body: { fullName: 'Ref Test', email: `ref.${RUN}@e2e.test`, password: PASSWORD, role: 'customer', referralCode: code },
+  });
+  assert.equal(referred.status, 201);
+  const edge = await pool.query('SELECT referrer_id FROM referral_tree WHERE referred_id = $1', [referred.data.id]);
+  assert.equal(edge.rows[0].referrer_id, seller.id);
+  await assert.rejects(pool.query('DELETE FROM referral_tree WHERE referred_id = $1', [referred.data.id]), /append-only/);
+
+  const listingBody = {
+    title: `3 BHK apartment Sector 56 ${RUN}`, propertyType: 'apartment', transactionType: 'sell', price: '1.5 Cr',
+    city: CITY, locality: 'Sector 56', areaSqft: 1650, bedrooms: 3,
+  };
+  const noConsent = await api('POST', '/me/listings', { token: seller.token, body: { ...listingBody, feeConsent: false } });
+  assert.equal(noConsent.status, 400);
+  const withPhone = await api('POST', '/me/listings', { token: seller.token, body: { ...listingBody, title: 'Call 9876543210 now', feeConsent: true } });
+  assert.equal(withPhone.status, 422);
+  const listing = await api('POST', '/me/listings', { token: seller.token, body: { ...listingBody, feeConsent: true, mandateType: 'exclusive' } });
+  assert.equal(listing.status, 201);
+  assert.equal(listing.data.status, 'pending_approval');
+  assert.equal(listing.data.is_verified, false);
+
+  const req = await api('POST', '/me/requirements', {
+    token: buyer.token,
+    body: { purpose: 'buy', propertyType: 'apartment', city: CITY, localities: ['Sector 56'], budgetMin: 10000000, budgetMax: 20000000, bedrooms: 3, urgency: 'immediate', feeConsent: true },
+  });
+  assert.equal(req.status, 201);
+  assert.equal(req.data.temperature, 'hot');
+  const lead = await pool.query('SELECT status, source FROM leads WHERE id = $1', [req.data.lead_id]);
+  assert.deepEqual(lead.rows[0], { status: 'hot', source: 'website' });
+
+  assert.equal((await api('PUT', `/properties/${listing.data.id}/approve`, { token: A })).status, 200);
+  await new Promise((r) => setTimeout(r, 500));
+  const matches = await api('GET', '/me/matches', { token: buyer.token });
+  const match = matches.data.items.find((m) => m.property.id === listing.data.id);
+  assert.ok(match && match.hotMatch && match.score === 100);
+  assert.equal(match.property.created_by, undefined, 'no owner identity in match cards');
+  const alerts = await pool.query(`SELECT 1 FROM notifications WHERE user_id = $1 AND type = 'match_alert' AND related_entity_id = $2`, [buyer.id, listing.data.id]);
+  assert.equal(alerts.rows.length, 1);
+
+  // Buyer enquires; seller sees the count and a first name, never contact details.
+  await api('POST', '/leads/public-inquiry', { body: { fullName: `Buyer ${RUN}`, email: buyer.email, propertyId: listing.data.id } });
+  const enquiries = await api('GET', '/me/enquiries', { token: buyer.token });
+  const propEnquiry = enquiries.data.find((e) => e.property_id === listing.data.id);
+  assert.ok(propEnquiry);
+  const visitReq = await api('POST', `/me/enquiries/${propEnquiry.id}/visit-request`, {
+    token: buyer.token,
+    body: { preferredAt: new Date(Date.now() + 86400000).toISOString() },
+  });
+  assert.equal(visitReq.status, 200);
+  const other = await api('POST', `/me/enquiries/${propEnquiry.id}/visit-request`, { token: seller.token, body: { preferredAt: new Date(Date.now() + 86400000).toISOString() } });
+  assert.equal(other.status, 404, "cannot act on someone else's enquiry");
+
+  const mine = await api('GET', '/me/listings', { token: seller.token });
+  const row = mine.data.find((l) => l.id === listing.data.id);
+  assert.equal(row.enquiry_count, 1);
+  assert.ok(row.expires_at);
+  const masked = await api('GET', `/me/listings/${listing.data.id}/enquiries`, { token: seller.token });
+  assert.equal(masked.data[0].first_name, 'buyer');
+  assert.equal(masked.data[0].email, undefined);
+  assert.equal(masked.data[0].mobile, undefined);
+  const notMine = await api('GET', `/me/listings/${listing.data.id}/enquiries`, { token: buyer.token });
+  assert.equal(notMine.status, 404);
+
+  assert.equal((await api('POST', `/me/listings/${listing.data.id}/renew`, { token: seller.token })).status, 200);
+  const edited = await api('PUT', `/me/listings/${listing.data.id}`, { token: seller.token, body: { price: '1.45 Cr' } });
+  assert.equal(edited.data.status, 'pending_approval', 'edits go back through approval');
+  assert.equal(Number(edited.data.price_value), 14500000);
+
+  await api('PUT', `/properties/${listing.data.id}/approve`, { token: A });
+  assert.equal((await api('POST', `/properties/${listing.data.id}/favorite`, { token: buyer.token })).status, 200);
+  const favs = await api('GET', '/me/favourites', { token: buyer.token });
+  assert.ok(favs.data.ids.includes(listing.data.id));
+  assert.equal(favs.data.items[0].created_by_name, undefined);
+
+  const saved = await api('POST', '/me/saved-searches', { token: buyer.token, body: { name: 'Big flats', filters: { purpose: 'buy', city: CITY, bedrooms: 3, evil: 'x' } } });
+  assert.equal(saved.status, 201);
+  assert.equal(saved.data.filters.evil, undefined);
+});
+
+test('rentals: owner adds lease, tenant confirms and reports rent, owner confirms, maintenance lifecycle', async () => {
+  const owner = await createUser('customer', 'landlord');
+  const tenant = await createUser('customer', 'tenant');
+  const start = new Date();
+  start.setMonth(start.getMonth() - 1);
+
+  const lease = await api('POST', '/me/rentals', {
+    token: owner.token,
+    body: { propertyLabel: `Flat 402, ${CITY}`, tenantName: `Tenant ${RUN}`, tenantEmail: tenant.email, monthlyRent: 45000, securityDeposit: 90000, startDate: start.toISOString().slice(0, 10) },
+  });
+  assert.equal(lease.status, 201);
+  assert.equal(lease.data.side, 'owner');
+  assert.equal(lease.data.rent.length, 2, 'one rent row per month from the start');
+
+  const tenantView = await api('GET', '/me/rentals', { token: tenant.token });
+  assert.equal(tenantView.data[0].side, 'tenant');
+  assert.equal(tenantView.data[0].rent_due, 2);
+  const stranger = await api('GET', `/me/rentals/${lease.data.id}`, { token: ctx.casual.token });
+  assert.equal(stranger.status, 404);
+
+  assert.equal((await api('POST', `/me/rentals/${lease.data.id}/confirm`, { token: owner.token })).status, 403);
+  assert.ok((await api('POST', `/me/rentals/${lease.data.id}/confirm`, { token: tenant.token })).data.tenant_confirmed_at);
+
+  const pay = lease.data.rent[0];
+  const reported = await api('POST', `/me/rentals/${lease.data.id}/rent/${pay.id}/report`, {
+    token: tenant.token,
+    body: { paidOn: new Date().toISOString().slice(0, 10), paymentMode: 'upi', reference: 'UPI-1' },
+  });
+  assert.equal(reported.data.status, 'reported');
+  assert.equal((await api('POST', `/me/rentals/${lease.data.id}/rent/${pay.id}/review`, { token: tenant.token, body: { action: 'confirm' } })).status, 403);
+  const confirmed = await api('POST', `/me/rentals/${lease.data.id}/rent/${pay.id}/review`, { token: owner.token, body: { action: 'confirm' } });
+  assert.equal(confirmed.data.status, 'confirmed');
+
+  const mr = await api('POST', `/me/rentals/${lease.data.id}/maintenance`, { token: tenant.token, body: { title: 'Kitchen tap leaking', category: 'plumbing', priority: 'high' } });
+  assert.equal(mr.status, 201);
+  assert.equal((await api('PUT', `/me/rentals/${lease.data.id}/maintenance/${mr.data.id}`, { token: tenant.token, body: { status: 'resolved' } })).status, 403);
+  const resolved = await api('PUT', `/me/rentals/${lease.data.id}/maintenance/${mr.data.id}`, { token: owner.token, body: { status: 'resolved', ownerNote: 'Fixed' } });
+  assert.equal(resolved.data.status, 'resolved');
+  assert.ok(resolved.data.resolved_at);
+  const ownerNotes = await pool.query(`SELECT COUNT(*)::int AS n FROM notifications WHERE user_id = $1 AND type = 'rental'`, [owner.id]);
+  assert.ok(ownerNotes.rows[0].n >= 3, 'owner notified of confirmation, rent report and maintenance');
+
+  const ended = await api('PUT', `/me/rentals/${lease.data.id}`, { token: owner.token, body: { status: 'ended', endDate: new Date().toISOString().slice(0, 10) } });
+  assert.equal(ended.data.status, 'ended');
+});
+
+// ------------------------------------------------------- website forms
+
+test('website forms: enquiry message reaches the CRM lead, newsletter, filters, advertiser categories', async () => {
+  const A = ctx.admin.token;
+  const enquiry = await api('POST', '/leads/public-inquiry', {
+    body: { fullName: `Visitor ${RUN}`, mobile: `98${String(Date.now()).slice(-8)}`, message: '[List Property] villa | Noida - call after 6pm', source: 'website' },
+  });
+  assert.equal(enquiry.status, 201);
+  const timeline = await api('GET', `/leads/${enquiry.data.id}/timeline`, { token: A });
+  assert.ok(timeline.data.some((t) => t.type === 'note' && t.note.includes('call after 6pm')), 'message shown as a note in the CRM');
+
+  const email = `reader.${RUN}@e2e.test`;
+  assert.equal((await api('POST', '/content/newsletter', { body: { email } })).status, 201);
+  assert.equal((await api('POST', '/content/newsletter', { body: { email: email.toUpperCase() } })).status, 201, 'repeat is fine');
+  assert.equal((await api('POST', '/content/newsletter', { body: { email: 'not-an-email' } })).status, 422);
+  const subs = await api('GET', `/content/manage/newsletter?search=${encodeURIComponent(email)}`, { token: A });
+  assert.equal(subs.data.items.length, 1);
+  assert.equal((await api('GET', '/content/manage/newsletter', { token: ctx.casual.token })).status, 403);
+  const unsub = await api('PUT', `/content/manage/newsletter/${subs.data.items[0].id}`, { token: A, body: { status: 'unsubscribed' } });
+  assert.ok(unsub.data.unsubscribed_at);
+
+  const multi = await api('GET', '/search/properties?propertyType=apartment,villa&bhk=2,3,5&parking=covered,none&furnishing=Fully%20Furnished,Semi-Furnished');
+  assert.equal(multi.status, 200);
+  assert.equal((await api('GET', '/search/properties?propertyType=castle')).status, 422);
+  assert.equal((await api('GET', '/search/properties?bhk=two')).status, 422);
+
+  const cats = await api('GET', '/bd-leads/advertiser-categories');
+  assert.ok(cats.data.some((c) => c.value === 'nbfc'));
+  const ad = await api('POST', '/bd-leads', {
+    body: { category: 'advertiser', fullName: `Ad ${RUN}`, mobile: `97${String(Date.now()).slice(-8)}`, businessName: 'Loans Co', businessCategory: cats.data[0].value, desiredPlacement: 'Search results' },
+  });
+  assert.equal(ad.status, 201);
 });

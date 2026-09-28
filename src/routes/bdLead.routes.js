@@ -81,6 +81,30 @@ const publicLimiter = rateLimit({
  *       200: { description: Duplicate within 24h - existing enquiry returned }
  *       422: { description: Validation failed / advertiser category not eligible }
  */
+/**
+ * @swagger
+ * /bd-leads/advertiser-categories:
+ *   get:
+ *     summary: Business categories eligible to advertise (public - for the "Advertise With Us" form)
+ *     description: Read from app_config bd_leads.advertiser_eligible_categories, so the form always offers exactly what the backend accepts.
+ *     tags: [Business Leads]
+ *     responses: { 200: { description: "[{ value, label }]" } }
+ */
+router.get(
+  '/advertiser-categories',
+  require('../utils/asyncHandler')(async (req, res) => {
+    const configService = require('../services/config.service');
+    const eligible = await configService.getConfig('bd_leads.advertiser_eligible_categories', []);
+    const label = (v) => v.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()).replace('Nbfc', 'NBFC');
+    return require('../utils/response').success(
+      res,
+      200,
+      'Advertiser categories fetched',
+      eligible.map((value) => ({ value, label: label(value) }))
+    );
+  })
+);
+
 router.post(
   '/',
   publicLimiter,

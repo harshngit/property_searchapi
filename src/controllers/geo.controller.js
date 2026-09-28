@@ -103,7 +103,17 @@ async function listDisclaimers(req, res, next) {
   }
 }
 
+async function nearestCity(req, res, next) {
+  try {
+    const result = await geoService.findNearestCity(Number(req.query.lat), Number(req.query.lng));
+    return success(res, 200, 'Nearest city resolved', result);
+  } catch (err) {
+    next(err);
+  }
+}
+
 module.exports = {
+  nearestCity,
   listStates,
   listCities,
   getCity,

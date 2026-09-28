@@ -1,6 +1,6 @@
 const pool = require('../config/db');
 const { isAdmin } = require('../utils/ownership');
-const { signUrls } = require('../utils/storage');
+const { signUrls, uploadBuffer } = require('../utils/storage');
 
 function notFound(message = 'Document not found') {
   const err = new Error(message);
@@ -17,8 +17,21 @@ function badRequest(message) {
 function applyTenantScope(user, where, params) {
   if (isAdmin(user.role)) return;
   params.push(user.tenant_id || null, user.id);
-  where.push(`(tenant_id = $${params.length - 1} OR uploaded_by = $${params.length})`);
+  where.push(`(d.tenant_id = $${params.length - 1} OR d.uploaded_by = $${params.length})`);
 }
+
+// Human-readable context for list views: who the document belongs to and
+// who uploaded / reviewed it.
+const DOCUMENT_LIST_SELECT = `
+  SELECT d.*, c.full_name AS customer_name, p.title AS property_title,
+         uploader.full_name AS uploaded_by_name, reviewer.full_name AS reviewed_by_name
+  FROM documents d
+  LEFT JOIN customers c ON c.id = d.customer_id
+  LEFT JOIN deals dl ON dl.id = d.deal_id
+  LEFT JOIN properties p ON p.id = dl.property_id
+  LEFT JOIN users uploader ON uploader.id = d.uploaded_by
+  LEFT JOIN users reviewer ON reviewer.id = d.reviewed_by
+`;
 
 async function listDocuments(user, filters, page, limit) {
   const where = [];
@@ -28,31 +41,31 @@ async function listDocuments(user, filters, page, limit) {
 
   if (filters.documentType) {
     params.push(filters.documentType);
-    where.push(`document_type = $${params.length}`);
+    where.push(`d.document_type = $${params.length}`);
   }
   if (filters.status) {
     params.push(filters.status);
-    where.push(`status = $${params.length}`);
+    where.push(`d.status = $${params.length}`);
   }
   if (filters.customerId) {
     params.push(filters.customerId);
-    where.push(`customer_id = $${params.length}`);
+    where.push(`d.customer_id = $${params.length}`);
   }
   if (filters.dealId) {
     params.push(filters.dealId);
-    where.push(`deal_id = $${params.length}`);
+    where.push(`d.deal_id = $${params.length}`);
   }
 
   const whereClause = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const offset = (page - 1) * limit;
 
-  const countResult = await pool.query(`SELECT COUNT(*) FROM documents ${whereClause}`, params);
+  const countResult = await pool.query(`SELECT COUNT(*) FROM documents d ${whereClause}`, params);
 
   params.push(limit, offset);
   const result = await pool.query(
-    `SELECT * FROM documents
+    `${DOCUMENT_LIST_SELECT}
      ${whereClause}
-     ORDER BY created_at DESC
+     ORDER BY d.created_at DESC
      LIMIT $${params.length - 1} OFFSET $${params.length}`,
     params
   );
@@ -96,6 +109,15 @@ async function createDocument(data, user) {
   );
 
   return signUrls(result.rows[0], 'document_url');
+}
+
+// Stores an uploaded file privately in GCS (documents/<id-prefix>/...) and
+// records it like any other document - the stored value is the object path,
+// signed per request on read.
+async function uploadDocument(file, data, user) {
+  const folder = `documents/${data.dealId || data.customerId || 'general'}`;
+  const objectPath = await uploadBuffer(file.buffer, folder, file.originalname, file.mimetype);
+  return createDocument({ ...data, documentUrl: objectPath, fileName: data.fileName || file.originalname }, user);
 }
 
 const UPDATABLE_DOCUMENT_FIELDS = {
@@ -166,6 +188,7 @@ async function reviewDocument(id, { status, reviewNotes }, reviewer) {
 }
 
 module.exports = {
+  uploadDocument,
   listDocuments,
   getDocumentById,
   createDocument,

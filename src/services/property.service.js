@@ -208,7 +208,7 @@ async function getPropertyById(id) {
   return { ...property, media: await signUrls(media.rows, 'url') };
 }
 
-async function createProperty(data, user) {
+async function createProperty(data, user, { autoVerify = true } = {}) {
   const {
     title,
     description,
@@ -330,6 +330,15 @@ async function createProperty(data, user) {
   }
 
   await opportunityScoring.refreshScores(propertyId);
+
+  // A listing added by an admin is already vetted by the platform team: it
+  // goes live immediately and carries the Verified badge. Broker / builder
+  // listings still wait for admin approval. approveProperty also fires
+  // investor alerts for auction / special-situation deals.
+  if (autoVerify && isAdmin(user.role)) {
+    await pool.query('UPDATE properties SET is_verified = true WHERE id = $1', [propertyId]);
+    return approveProperty(propertyId, user);
+  }
   return getPropertyById(propertyId);
 }
 
@@ -526,6 +535,9 @@ async function approveProperty(id, adminUser) {
   const property = await getPropertyById(id);
   if (opportunityScoring.OPPORTUNITY_CATEGORIES.includes(property.listing_category)) {
     require('./opportunity.service').safeSendAlerts(id);
+  } else {
+    // Hot Match / saved-search alerts to customers (best-effort, not awaited).
+    require('./portal.service').notifyNewListing(id);
   }
   return property;
 }

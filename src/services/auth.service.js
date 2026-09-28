@@ -5,6 +5,7 @@ const pool = require('../config/db');
 const { generateOtp, getOtpExpiry } = require('../utils/otp');
 const msg91Service = require('./msg91.service');
 const customerService = require('./customer.service');
+const referralService = require('./referral.service');
 const { uploadBuffer, deleteObject, getReadUrl } = require('../utils/storage');
 
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
@@ -154,7 +155,7 @@ async function activateUser(targetUserId, actingUser) {
 //     target role, per ROLE_CREATION_PERMISSIONS.
 // `actingUser` is req.user from optionalAuthenticate - null when the caller
 // sent no (or an invalid) bearer token.
-async function registerUser({ fullName, email, mobile, password, role, tenantId }, actingUser) {
+async function registerUser({ fullName, email, mobile, password, role, tenantId, referralCode }, actingUser) {
   let status;
   let emailVerified = false;
 
@@ -194,6 +195,14 @@ async function registerUser({ fullName, email, mobile, password, role, tenantId 
     throw err;
   }
 
+  // Checked before the account exists so a mistyped code doesn't leave a
+  // half-registered user behind.
+  if (referralCode && !(await referralService.validateCode(referralCode))) {
+    const err = new Error('That referral code was not found - please check it or leave it blank');
+    err.statusCode = 400;
+    throw err;
+  }
+
   const passwordHash = password ? await bcrypt.hash(password, 10) : null;
 
   // A bearer token present at all (regardless of which role is being
@@ -220,7 +229,14 @@ async function registerUser({ fullName, email, mobile, password, role, tenantId 
     await customerService.findOrCreateCustomerByContact({ fullName, email, mobile, userId: newUser.id });
   }
 
-  return { ...newUser, role };
+  // Referral attribution (sec. 33.1A) - self sign-ups only; a blank code is
+  // recorded as organic (OG-00001). Staff-created accounts aren't referrals.
+  // Non-customer roles get their permanent code now; a customer gets theirs
+  // once they pick buyer / seller / owner / tenant in onboarding.
+  if (!actingUser) await referralService.recordReferral(newUser.id, referralCode);
+  const issuedCode = await referralService.ensureReferralCode(newUser.id, role);
+
+  return { ...newUser, role, referral_code: issuedCode };
 }
 
 // Verifies the ID token's signature, expiry and audience (must match our own
@@ -321,6 +337,8 @@ async function loginWithGoogle(googlePayload, allowSelfRegister, role, tenantId)
     if (targetRole === 'customer') {
       await customerService.findOrCreateCustomerByContact({ fullName, email, userId: user.id });
     }
+    await referralService.recordReferral(user.id, null);
+    await referralService.ensureReferralCode(user.id, targetRole);
   } else if (user.status !== 'active') {
     const err = new Error(`Account is ${user.status.replace('_', ' ')}. Please contact admin.`);
     err.statusCode = 403;

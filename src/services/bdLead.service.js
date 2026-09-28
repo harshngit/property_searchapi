@@ -62,6 +62,24 @@ async function notifyAdmins(lead) {
   );
 }
 
+// Stores a careers resume privately and links it to the enquiry. Returns
+// true / false instead of throwing, so a storage problem never loses the
+// application itself.
+async function attachResume(leadId, file, { onlyIfMissing = false } = {}) {
+  if (onlyIfMissing) {
+    const current = await pool.query('SELECT resume_url FROM bd_leads WHERE id = $1', [leadId]);
+    if (current.rows[0]?.resume_url) return true;
+  }
+  try {
+    const objectPath = await uploadBuffer(file.buffer, `bd-leads/${leadId}/resume`, file.originalname, file.mimetype);
+    await pool.query('UPDATE bd_leads SET resume_url = $1 WHERE id = $2', [objectPath, leadId]);
+    return true;
+  } catch (err) {
+    console.error(`Resume upload failed for bd lead ${leadId}:`, err.message);
+    return false;
+  }
+}
+
 async function createBdLead(data, file) {
   const missing = (CATEGORY_REQUIRED[data.category] || []).filter((k) => !data[k]);
   if (missing.length) throw badRequest(`Missing required field(s) for ${data.category}: ${missing.join(', ')}`);
@@ -86,7 +104,12 @@ async function createBdLead(data, file) {
      LIMIT 1`,
     [data.category, data.mobile || null, data.email || null]
   );
-  if (existing.rows[0]) return { lead: await getBdLeadById(existing.rows[0].id), duplicate: true };
+  if (existing.rows[0]) {
+    // A repeat submission that carries a resume the first one lacked (e.g.
+    // the upload failed earlier) attaches it rather than dropping it.
+    const resumeAttached = file ? await attachResume(existing.rows[0].id, file, { onlyIfMissing: true }) : null;
+    return { lead: await getBdLeadById(existing.rows[0].id), duplicate: true, resumeAttached };
+  }
 
   const result = await pool.query(
     `INSERT INTO bd_leads (category, full_name, mobile, email, city_name, area_name, territory_of_interest,
@@ -114,14 +137,16 @@ async function createBdLead(data, file) {
   );
   let lead = result.rows[0];
 
-  if (file) {
-    const objectPath = await uploadBuffer(file.buffer, `bd-leads/${lead.id}/resume`, file.originalname, file.mimetype);
-    const updated = await pool.query('UPDATE bd_leads SET resume_url = $1 WHERE id = $2 RETURNING *', [objectPath, lead.id]);
-    lead = updated.rows[0];
-  }
+  // The application is kept even if the resume can't be stored - the
+  // caller is told so the person can re-send it.
+  const resumeAttached = file ? await attachResume(lead.id, file) : null;
 
   if (lead.category !== 'city_addition') await notifyAdmins(lead);
-  return { lead: { id: lead.id, category: lead.category, status: lead.status, created_at: lead.created_at }, duplicate: false };
+  return {
+    lead: { id: lead.id, category: lead.category, status: lead.status, created_at: lead.created_at },
+    duplicate: false,
+    resumeAttached,
+  };
 }
 
 async function listBdLeads(user, query) {

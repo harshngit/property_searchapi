@@ -43,6 +43,21 @@ async function getDocument(req, res, next) {
 }
 
 // POST /api/documents
+// POST /api/documents/upload
+async function uploadDocument(req, res, next) {
+  try {
+    if (!req.file) {
+      const err = new Error('A file is required (field name: file)');
+      err.statusCode = 400;
+      throw err;
+    }
+    const document = await documentService.uploadDocument(req.file, req.body, req.user);
+    return success(res, 201, 'Document uploaded successfully', document);
+  } catch (err) {
+    next(err);
+  }
+}
+
 async function createDocument(req, res, next) {
   try {
     const document = await documentService.createDocument(req.body, req.user);
@@ -124,6 +139,7 @@ module.exports = {
   listDocuments,
   getDocument,
   createDocument,
+  uploadDocument,
   updateDocument,
   deleteDocument,
   bulkDeleteDocuments,

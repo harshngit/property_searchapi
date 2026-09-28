@@ -5,6 +5,7 @@ const router = express.Router();
 const documentController = require('../controllers/document.controller');
 const validate = require('../middlewares/validate');
 const { authenticate, authorize } = require('../middlewares/auth');
+const { uploadDocumentFile } = require('../middlewares/upload');
 
 const DOCUMENT_TYPES = ['kyc', 'agreement', 'payment_receipt', 'noc', 'other'];
 const DOCUMENT_STATUSES = ['pending', 'approved', 'rejected'];
@@ -166,6 +167,48 @@ router.get(
  *       422:
  *         description: Validation failed
  */
+/**
+ * @swagger
+ * /documents/upload:
+ *   post:
+ *     summary: Upload a document file (stored privately in GCS; read back via short-lived signed URLs)
+ *     description: Multipart form - `file` (PDF, Word, Excel or image, max 20MB) plus optional documentType, customerId, dealId, fileName. Starts in `pending` review status.
+ *     tags: [Documents]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         multipart/form-data:
+ *           schema:
+ *             type: object
+ *             required: [file]
+ *             properties:
+ *               file: { type: string, format: binary }
+ *               documentType: { type: string, enum: [kyc, agreement, payment_receipt, noc, other] }
+ *               customerId: { type: string, format: uuid }
+ *               dealId: { type: string, format: uuid }
+ *               fileName: { type: string }
+ *     responses:
+ *       201:
+ *         description: Document uploaded successfully
+ *       400:
+ *         description: No file / unsupported file type
+ */
+router.post(
+  '/upload',
+  authenticate,
+  uploadDocumentFile.single('file'),
+  [
+    body('documentType').optional().isIn(DOCUMENT_TYPES),
+    body('customerId').optional({ checkFalsy: true }).isUUID(),
+    body('dealId').optional({ checkFalsy: true }).isUUID(),
+    body('fileName').optional().isString(),
+  ],
+  validate,
+  documentController.uploadDocument
+);
+
 router.post(
   '/',
   authenticate,

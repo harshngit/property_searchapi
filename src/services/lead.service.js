@@ -179,6 +179,15 @@ async function createPublicInquiry(data) {
       message: message || null,
     });
 
+    // The visitor's message (form topic, details, note) becomes the first
+    // note on the lead, so the CRM timeline shows what they asked for.
+    if (message && message.trim()) {
+      await client.query('INSERT INTO lead_notes (lead_id, user_id, note) VALUES ($1, NULL, $2)', [
+        lead.id,
+        `Website enquiry: ${message.trim()}`,
+      ]);
+    }
+
     await client.query('COMMIT');
     await sendAcknowledgement(lead.id, null);
     return getLeadById(lead.id);

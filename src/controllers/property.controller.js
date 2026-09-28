@@ -48,7 +48,11 @@ async function getProperty(req, res, next) {
 async function createProperty(req, res, next) {
   try {
     const property = await propertyService.createProperty(req.body, req.user);
-    return success(res, 201, 'Property created successfully, pending approval', property);
+    const message =
+      property.status === 'approved'
+        ? 'Property created, verified and published'
+        : 'Property created successfully, pending approval';
+    return success(res, 201, message, property);
   } catch (err) {
     next(err);
   }

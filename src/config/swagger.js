@@ -43,6 +43,11 @@ const options = {
             email: { type: 'string', format: 'email', example: 'rahul@example.com' },
             mobile: { type: 'string', example: '9876543210' },
             password: { type: 'string', format: 'password', example: 'Passw0rd!123' },
+            referralCode: {
+              type: 'string',
+              example: 'BU-8Q2ZT',
+              description: "Optional referrer's permanent code (sec. 33.1). Blank = organic (OG-00001). An unknown code is rejected with 400.",
+            },
             role: {
               type: 'string',
               description:

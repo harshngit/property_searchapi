@@ -160,7 +160,86 @@ async function getCircleRate({ cityId, localityId, propertyType }) {
   return result.rows[0] || null;
 }
 
+// Listings store the city as typed, so a city can appear under an older or
+// alternate name as well.
+const CITY_ALIASES = {
+  delhi: ['new delhi'],
+  gurugram: ['gurgaon'],
+  bengaluru: ['bangalore'],
+  mumbai: ['bombay'],
+  kolkata: ['calcutta'],
+  chennai: ['madras'],
+  visakhapatnam: ['vizag'],
+  goa: ['panaji', 'panjim'],
+};
+
+// Largest distance at which a city with listings still counts as "near"
+// the visitor when their own city has none.
+const NEARBY_LISTINGS_KM = 150;
+
+// Resolves a visitor's coordinates to a city using the seeded city centres
+// (cities.lat_centroid / lng_centroid). Every city with coordinates is
+// considered, whatever its status, since this only names the city - it does
+// not expose inactive geography. Returns:
+//   city        - the nearest city, if the point is within its match radius
+//   listingCity - the nearest city (up to NEARBY_LISTINGS_KM) with live
+//                 residential listings; `searchName` is the spelling those
+//                 listings use, to pass straight to /search/properties
+async function findNearestCity(lat, lng) {
+  const near = await pool.query(
+    `SELECT city_name, slug, state_code, state_name, match_radius_km, distance_km FROM (
+       SELECT c.city_name, c.slug, s.state_code, s.state_name, c.match_radius_km::float8 AS match_radius_km,
+              6371 * 2 * ASIN(SQRT(
+                POWER(SIN(RADIANS(c.lat_centroid::float8 - $1::float8) / 2), 2) +
+                COS(RADIANS($1::float8)) * COS(RADIANS(c.lat_centroid::float8)) *
+                POWER(SIN(RADIANS(c.lng_centroid::float8 - $2::float8) / 2), 2)
+              )) AS distance_km
+       FROM cities c JOIN states s ON s.id = c.state_id
+       WHERE c.lat_centroid IS NOT NULL AND c.lng_centroid IS NOT NULL
+     ) d
+     WHERE distance_km <= $3
+     ORDER BY distance_km ASC
+     LIMIT 10`,
+    [lat, lng, NEARBY_LISTINGS_KM]
+  );
+  if (!near.rows.length) return { city: null, listingCity: null };
+
+  const namesFor = (cityName) => {
+    const key = cityName.toLowerCase();
+    return [key, ...(CITY_ALIASES[key] || [])];
+  };
+  const allNames = near.rows.flatMap((row) => namesFor(row.city_name));
+  const counts = await pool.query(
+    `SELECT LOWER(TRIM(city)) AS name, MIN(TRIM(city)) AS spelling, COUNT(*)::int AS listings
+     FROM properties
+     WHERE status = 'approved' AND listing_category = 'residential' AND LOWER(TRIM(city)) = ANY($1)
+     GROUP BY LOWER(TRIM(city))`,
+    [allNames]
+  );
+  const countByName = new Map(counts.rows.map((row) => [row.name, row]));
+
+  const shape = (row) => {
+    const variants = namesFor(row.city_name).map((name) => countByName.get(name)).filter(Boolean);
+    const top = variants.sort((a, b) => b.listings - a.listings)[0];
+    return {
+      name: row.city_name,
+      slug: row.slug,
+      stateCode: row.state_code,
+      stateName: row.state_name,
+      distanceKm: Math.round(row.distance_km * 10) / 10,
+      listings: variants.reduce((sum, v) => sum + v.listings, 0),
+      searchName: top ? top.spelling : row.city_name,
+    };
+  };
+
+  const nearest = near.rows[0];
+  const city = nearest.distance_km <= nearest.match_radius_km ? shape(nearest) : null;
+  const withListings = near.rows.map(shape).find((row) => row.listings > 0) || null;
+  return { city, listingCity: withListings };
+}
+
 module.exports = {
+  findNearestCity,
   listStates,
   listCities,
   getCityBySlug,

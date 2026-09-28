@@ -30,6 +30,7 @@ const contentRoutes = require('./routes/content.routes');
 const bdLeadRoutes = require('./routes/bdLead.routes');
 const opportunityRoutes = require('./routes/opportunity.routes');
 const { investorRouter, nriRouter, hniRouter, toolsRouter } = require('./routes/investor.routes');
+const portalRoutes = require('./routes/portal.routes');
 const { notFoundHandler, errorHandler } = require('./middlewares/errorHandler');
 
 const app = express();
@@ -104,6 +105,7 @@ app.use('/api/investors', investorRouter);
 app.use('/api/nri', nriRouter);
 app.use('/api/hni', hniRouter);
 app.use('/api/tools', toolsRouter);
+app.use('/api/me', portalRoutes);
 
 // 404 + error handler (must be last)
 app.use(notFoundHandler);

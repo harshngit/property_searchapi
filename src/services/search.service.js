@@ -78,9 +78,16 @@ function buildWhere(filters) {
     params.push(`%${filters.q}%`);
     where.push(`(title ILIKE $${params.length} OR locality ILIKE $${params.length} OR city ILIKE $${params.length})`);
   }
+  // propertyType / furnishing / possessionStatus accept one value or a
+  // comma-separated list (the website's multi-select filters).
+  const list = (value) =>
+    String(value)
+      .split(',')
+      .map((v) => v.trim())
+      .filter(Boolean);
   if (filters.propertyType) {
-    params.push(filters.propertyType);
-    where.push(`property_type = $${params.length}`);
+    params.push(list(filters.propertyType));
+    where.push(`property_type::text = ANY($${params.length}::text[])`);
   }
   if (filters.transactionType) {
     params.push(filters.transactionType);
@@ -111,18 +118,59 @@ function buildWhere(filters) {
     params.push(filters.bedrooms);
     where.push(`bedrooms >= $${params.length}`);
   }
+  if (filters.maxBedrooms) {
+    params.push(filters.maxBedrooms);
+    where.push(`(bedrooms IS NULL OR bedrooms <= $${params.length})`);
+  }
+  // Listing tags set in the CRM (e.g. "PG", "Co-living") - case-insensitive.
+  if (filters.tag) {
+    params.push(filters.tag);
+    where.push(`EXISTS (SELECT 1 FROM jsonb_array_elements_text(tags) t WHERE t ILIKE $${params.length})`);
+  }
   if (filters.furnishing) {
-    params.push(filters.furnishing);
-    where.push(`furnishing ILIKE $${params.length}`);
+    params.push(list(filters.furnishing));
+    where.push(`furnishing ILIKE ANY($${params.length}::text[])`);
   }
   if (filters.possessionStatus) {
-    params.push(filters.possessionStatus);
-    where.push(`possession_status ILIKE $${params.length}`);
+    params.push(list(filters.possessionStatus));
+    where.push(`possession_status ILIKE ANY($${params.length}::text[])`);
   }
+  // bhk=1,2,5 -> exactly 1 or 2 bedrooms, or 5 and above (the "5+" pill).
+  if (filters.bhk) {
+    const counts = list(filters.bhk).map(Number).filter((n) => Number.isInteger(n) && n >= 0);
+    if (counts.length) {
+      const exact = counts.filter((n) => n < 5);
+      const clauses = [];
+      if (exact.length) {
+        params.push(exact);
+        clauses.push(`bedrooms = ANY($${params.length}::int[])`);
+      }
+      if (counts.some((n) => n >= 5)) clauses.push('bedrooms >= 5');
+      where.push(`(${clauses.join(' OR ')})`);
+    }
+  }
+  // parking=covered,open,none - matches the CRM's parking type; "none"
+  // means no parking type and no spots recorded.
+  if (filters.parking) {
+    const kinds = list(filters.parking).map((k) => k.toLowerCase());
+    const clauses = [];
+    const typed = kinds.filter((k) => k !== 'none');
+    if (typed.length) {
+      params.push(typed);
+      clauses.push(`LOWER(parking_type) = ANY($${params.length}::text[])`);
+    }
+    if (kinds.includes('none')) clauses.push(`(COALESCE(parking_type, '') = '' AND COALESCE(parking_spots, 0) = 0)`);
+    if (clauses.length) where.push(`(${clauses.join(' OR ')})`);
+  }
+  if (filters.rera) where.push(`COALESCE(rera_number, '') <> ''`);
   if (filters.verified) where.push('is_verified = true');
+  // Every requested amenity must appear (case-insensitive, partial match -
+  // "pool" matches "Swimming pool") since amenities are typed in the CRM.
   if (filters.amenities && filters.amenities.length > 0) {
-    params.push(JSON.stringify(filters.amenities));
-    where.push(`amenities @> $${params.length}::jsonb`);
+    for (const amenity of filters.amenities) {
+      params.push(`%${amenity}%`);
+      where.push(`EXISTS (SELECT 1 FROM jsonb_array_elements_text(amenities) a WHERE a ILIKE $${params.length})`);
+    }
   }
 
   return { where, params };

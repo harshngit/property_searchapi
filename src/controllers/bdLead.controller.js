@@ -6,12 +6,14 @@ const handler = require('../utils/asyncHandler');
 module.exports = {
   // POST /api/bd-leads (public)
   create: handler(async (req, res) => {
-    const { lead, duplicate } = await bdLeadService.createBdLead(req.body, req.file);
+    const { lead, duplicate, resumeAttached } = await bdLeadService.createBdLead(req.body, req.file);
     return success(
       res,
       duplicate ? 200 : 201,
-      'Thank you - our team will review your enquiry and get in touch',
-      lead
+      resumeAttached === false
+        ? "Thank you - we've received your application, but your resume couldn't be attached. Please try sending it again."
+        : 'Thank you - our team will review your enquiry and get in touch',
+      { ...lead, resumeAttached }
     );
   }),
 

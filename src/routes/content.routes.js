@@ -4,7 +4,11 @@ const router = express.Router();
 
 const contentController = require('../controllers/content.controller');
 const validate = require('../middlewares/validate');
-const { authenticate, authorize } = require('../middlewares/auth');
+const rateLimit = require('express-rate-limit');
+const { authenticate, authorize, optionalAuthenticate } = require('../middlewares/auth');
+const newsletterService = require('../services/newsletter.service');
+const { success } = require('../utils/response');
+const handler = require('../utils/asyncHandler');
 
 const CONTENT_ROLES = ['admin', 'super_admin'];
 const STATUSES = ['draft', 'published', 'archived'];
@@ -274,5 +278,91 @@ router.put(
   contentController.manageUpdateCityPage
 );
 router.delete('/manage/city-pages/:id', manage, idParam, validate, contentController.manageDeleteCityPage);
+
+// ============================================================ Newsletter
+
+// Public sign-up - same limit as the other public website forms.
+const newsletterLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: Number(process.env.PUBLIC_FORM_RATE_LIMIT_MAX) || 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many requests, please try again later.' },
+});
+
+/**
+ * @swagger
+ * /content/newsletter:
+ *   post:
+ *     summary: Subscribe an email to the market newsletter (website "Stay ahead of the market")
+ *     description: Public. Re-subscribing an existing email reactivates it - never errors on a repeat.
+ *     tags: [Content]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [email]
+ *             properties:
+ *               email: { type: string, format: email }
+ *               sourcePage: { type: string, example: /news-guide/insights-guides }
+ *     responses:
+ *       201: { description: Subscribed }
+ *       422: { description: Invalid email }
+ */
+router.post(
+  '/newsletter',
+  newsletterLimiter,
+  optionalAuthenticate,
+  [body('email').trim().isEmail().withMessage('Enter a valid email address'), body('sourcePage').optional().isString().isLength({ max: 255 })],
+  validate,
+  handler(async (req, res) => success(res, 201, "You're subscribed", await newsletterService.subscribe(req.body, req.user)))
+);
+
+/**
+ * @swagger
+ * /content/manage/newsletter:
+ *   get:
+ *     summary: Newsletter subscribers with counts (admin)
+ *     tags: [Content]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters:
+ *       - { in: query, name: status, schema: { type: string, enum: [subscribed, unsubscribed] } }
+ *       - { in: query, name: search, schema: { type: string } }
+ *       - { in: query, name: page, schema: { type: integer } }
+ *       - { in: query, name: limit, schema: { type: integer } }
+ *     responses: { 200: { description: "{ items, pagination, stats }" } }
+ */
+router.get(
+  '/manage/newsletter',
+  manage,
+  [query('status').optional().isIn(['subscribed', 'unsubscribed'])],
+  validate,
+  handler(async (req, res) => success(res, 200, 'Subscribers fetched', await newsletterService.listSubscribers(req.query)))
+);
+
+/**
+ * @swagger
+ * /content/manage/newsletter/{id}:
+ *   put:
+ *     summary: Unsubscribe / resubscribe a newsletter subscriber (admin)
+ *     tags: [Content]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters: [{ in: path, name: id, required: true, schema: { type: string, format: uuid } }]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema: { type: object, required: [status], properties: { status: { type: string, enum: [subscribed, unsubscribed] } } }
+ *     responses: { 200: { description: Subscriber } }
+ */
+router.put(
+  '/manage/newsletter/:id',
+  manage,
+  [...idParam, body('status').isIn(['subscribed', 'unsubscribed'])],
+  validate,
+  handler(async (req, res) => success(res, 200, 'Subscriber updated', await newsletterService.setStatus(req.params.id, req.body.status)))
+);
 
 module.exports = router;

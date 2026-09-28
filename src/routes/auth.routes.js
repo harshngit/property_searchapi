@@ -133,6 +133,7 @@ router.post(
     body('mobile').optional().isMobilePhone().withMessage('Valid mobile number required'),
     body('password').optional().isLength({ min: 6 }).withMessage('Password must be at least 6 characters'),
     body('role').isIn(ALL_ROLES).withMessage(`Role must be one of: ${ALL_ROLES.join(', ')}`),
+    body('referralCode').optional({ checkFalsy: true }).isString().isLength({ max: 8 }),
   ],
   validate,
   authController.register
