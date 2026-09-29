@@ -125,6 +125,7 @@ async function handleWebhook(payload) {
     }
 
     await client.query('COMMIT');
+    if (status === 'success') require('./orchestration.service').safeEvaluate(payment.deal_id);
     return updated.rows[0];
   } catch (err) {
     await client.query('ROLLBACK');
@@ -214,7 +215,7 @@ async function updateMilestone(id, data, user) {
     `UPDATE payment_milestones SET ${set.join(', ')} WHERE id = $${params.length} RETURNING *`,
     params
   );
-
+  if (result.rows[0]) require('./orchestration.service').safeEvaluate(result.rows[0].deal_id);
   return result.rows[0];
 }
 

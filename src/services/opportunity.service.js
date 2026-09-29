@@ -177,6 +177,10 @@ function applyOpportunityFilters(query, where, params) {
     params.push(query.liquidityBand);
     where.push(`p.liquidity_band = $${params.length}`);
   }
+  if (query.possessionType) {
+    params.push(query.possessionType);
+    where.push(`p.possession_type = $${params.length}`);
+  }
   if (query.situationTag) {
     params.push(JSON.stringify([query.situationTag]));
     where.push(`p.situation_tags @> $${params.length}::jsonb`);
@@ -284,12 +288,23 @@ async function getOpportunity(id, user) {
   // Internal-only fields never leave the API even for eligible investors.
   const { tenant_id, created_by, approved_by, rejection_reason, address, ...publicFields } = property;
   const isStaff = STAFF_ROLES.includes(user.role);
+  // Deal advisory (non-legal risk-return / structure brief) and, for an
+  // investor, how well the deal fits them (AI investor-deal matching).
+  const { buildAdvisory } = require('./dealAdvisory.service');
+  let myMatch = null;
+  if (access.profile) {
+    const irm = require('./irm.service');
+    const behaviour = await irm.behaviourSummary(user.id);
+    myMatch = irm.scoreMatch(access.profile, behaviour, property, await irm.weights());
+  }
   return {
     ...publicFields,
     ...(isStaff ? { address, tenant_id, created_by } : {}),
     source_label: SOURCE_LABELS[property.opportunity_source_type] || null,
     media: await signUrls(media.rows, 'url'),
     my_interest: myInterest.rows[0] || null,
+    advisory: buildAdvisory(property),
+    my_match: myMatch,
     access: { full: true },
     disclaimers,
   };
@@ -551,48 +566,12 @@ async function assignInterest(id, assigneeId, user, meta = {}) {
 // ---------------------------------------------------------------------
 // Alerts (Engine 4 "auction alerts" + "notification priority integration")
 // ---------------------------------------------------------------------
+// Matching investors are alerted through the notification-intelligence
+// queue (investorAlert.service): priority deals now, the rest in each
+// investor's daily window, with fatigue control and channel choice.
 async function sendAlerts(propertyId) {
-  const result = await pool.query('SELECT * FROM properties WHERE id = $1', [propertyId]);
-  const property = result.rows[0];
-  if (!property || property.status !== 'approved' || !CATEGORIES.includes(property.listing_category)) return { sent: 0 };
-
-  const ticket = property.reserve_price ?? property.price_value;
-  const priorityScore = await configService.getConfig('opportunity.priority_alert_score', 75);
-  const isPriority = property.investment_score != null && property.investment_score >= Number(priorityScore);
-
-  // Verified investors whose stated preferences fit this deal. Empty
-  // preference lists mean "no restriction" for that dimension.
-  const matches = await pool.query(
-    `SELECT ip.user_id FROM investor_profiles ip
-     JOIN users u ON u.id = ip.user_id AND u.status = 'active'
-     WHERE ip.verification_status = 'verified' AND ip.alerts_enabled = true
-       AND (ip.preferred_cities = '[]'::jsonb OR EXISTS (
-             SELECT 1 FROM jsonb_array_elements_text(ip.preferred_cities) c WHERE LOWER(c) = LOWER($1)))
-       AND (ip.asset_class_preferences = '[]'::jsonb OR ip.asset_class_preferences ? $2)
-       AND ($3::numeric IS NULL OR ip.ticket_size_min IS NULL OR ip.ticket_size_min <= $3)
-       AND ($3::numeric IS NULL OR ip.ticket_size_max IS NULL OR ip.ticket_size_max >= $3)`,
-    [property.city, property.listing_category, ticket]
-  );
-
-  let sent = 0;
-  for (const { user_id: userId } of matches.rows) {
-    const inserted = await pool.query(
-      `INSERT INTO opportunity_alert_log (property_id, user_id, is_priority) VALUES ($1, $2, $3)
-       ON CONFLICT (property_id, user_id) DO NOTHING RETURNING id`,
-      [propertyId, userId, isPriority]
-    );
-    if (!inserted.rows[0]) continue;
-    await notificationService.createNotification({
-      userId,
-      type: isPriority ? 'opportunity_alert_priority' : 'opportunity_alert',
-      title: `${isPriority ? 'Priority: ' : ''}New ${property.listing_category === 'auction' ? 'auction' : 'special situation'} deal in ${property.city}`,
-      message: `${property.title}${ticket ? ` - ${formatInr(ticket)}` : ''}${property.investment_score != null ? ` (score ${property.investment_score})` : ''}`,
-      relatedEntityType: 'property',
-      relatedEntityId: propertyId,
-    });
-    sent++;
-  }
-  return { sent, matched: matches.rows.length, priority: isPriority };
+  const r = await require('./investorAlert.service').queueAlertsForDeal(propertyId);
+  return { sent: r.sentNow || 0, matched: r.matched || 0, queued: r.queued || 0, suppressed: r.suppressed || 0, priority: !!r.priority };
 }
 
 function safeSendAlerts(propertyId) {
@@ -820,7 +799,10 @@ async function getSystemUser() {
   return result.rows[0];
 }
 
-async function ingestItems(items, { sourceName, dataSource = 'api', defaultCategory = 'auction' }, user) {
+// `crawlerSourceId` links items to the crawler that produced them;
+// `requiresLegalReview` (legal / newspaper notice sources) holds every item
+// for the lawyer-panel review gate - never auto-published.
+async function ingestItems(items, { sourceName, dataSource = 'api', defaultCategory = 'auction', crawlerSourceId = null, requiresLegalReview = false }, user) {
   if (!Array.isArray(items) || items.length === 0) throw badRequest('items must be a non-empty array');
   if (items.length > 1000) throw badRequest('A single ingest call is limited to 1000 items');
 
@@ -851,8 +833,8 @@ async function ingestItems(items, { sourceName, dataSource = 'api', defaultCateg
 
     const inserted = await pool.query(
       `INSERT INTO opportunity_ingestion_items (source_name, source_url, external_ref, raw_payload, normalised,
-         confidence, issues, status, duplicate_of_property_id, ingested_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
+         confidence, issues, status, duplicate_of_property_id, ingested_by, crawler_source_id, requires_legal_review)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id`,
       [
         sourceName,
         normalised.auction_portal_url,
@@ -864,6 +846,8 @@ async function ingestItems(items, { sourceName, dataSource = 'api', defaultCateg
         status,
         duplicateOf,
         user?.id || null,
+        crawlerSourceId,
+        requiresLegalReview || normalised.opportunity_source_type === 'legal_notice',
       ]
     );
     const itemId = inserted.rows[0].id;
@@ -872,7 +856,7 @@ async function ingestItems(items, { sourceName, dataSource = 'api', defaultCateg
     // from a legal/newspaper notice (those always need the lawyer-panel
     // review gate before going live).
     const complete = PUBLISH_REQUIRED.every((f) => normalised[f] != null);
-    if (!duplicateOf && autoPublish && confidence >= Number(minConfidence) && complete && normalised.opportunity_source_type !== 'legal_notice') {
+    if (!duplicateOf && autoPublish && !requiresLegalReview && confidence >= Number(minConfidence) && complete && normalised.opportunity_source_type !== 'legal_notice') {
       try {
         await publishItem(itemId, {}, user || (await getSystemUser()), { auto: true });
         status = 'published';
@@ -908,7 +892,8 @@ async function listQueue(query) {
   params.push(limit, offset);
   const result = await pool.query(
     `SELECT id, source_name, external_ref, normalised, confidence, issues, status, duplicate_of_property_id,
-            property_id, review_notes, created_at, reviewed_at
+            property_id, review_notes, created_at, reviewed_at, crawler_source_id,
+            requires_legal_review, legal_reviewed_at, legal_review_notes
      FROM opportunity_ingestion_items ${whereClause}
      ORDER BY created_at DESC LIMIT $${params.length - 1} OFFSET $${params.length}`,
     params
@@ -939,6 +924,11 @@ async function publishItem(id, overrides, user, { auto = false } = {}) {
     throw badRequest('Item looks like a duplicate of an existing listing - pass forceDespiteDuplicate to publish anyway');
   }
 
+  // Legal / newspaper notices go live only after the lawyer-panel review.
+  if (item.requires_legal_review && !item.legal_reviewed_at) {
+    throw badRequest('This item came from a legal / newspaper notice - it needs legal review before publishing');
+  }
+
   const n = { ...item.normalised, ...(overrides.normalised || {}) };
   const missing = PUBLISH_REQUIRED.filter((f) => n[f] === null || n[f] === undefined || n[f] === '');
   if (missing.length) throw badRequest(`Cannot publish - missing: ${missing.join(', ')}`);
@@ -957,7 +947,9 @@ async function publishItem(id, overrides, user, { auto = false } = {}) {
       latitude: Number.isFinite(n.latitude) ? n.latitude : null,
       longitude: Number.isFinite(n.longitude) ? n.longitude : null,
       areaSqft: n.area_sqft || null,
-      listingCategory: n.listing_category || 'auction',
+      // Institutional assets found by the pipeline (school, college, hospital
+      // campuses...) are routed to the Institutional engine (Engine 7).
+      listingCategory: n.is_institutional_asset && !overrides.keepCategory ? 'institutional' : n.listing_category || 'auction',
       auctionDate: n.auction_date || null,
       sourceBank: n.source_bank || null,
       opportunitySourceType: n.opportunity_source_type || null,
@@ -998,6 +990,18 @@ async function publishItem(id, overrides, user, { auto = false } = {}) {
     after: { propertyId: property.id, confidence: item.confidence },
   });
   return propertyService.getPropertyById(property.id);
+}
+
+// Lawyer-panel sign-off for a legal / newspaper notice item.
+async function markLegalReviewed(id, notes, user) {
+  const item = await getQueueItem(id);
+  if (!item.requires_legal_review) throw badRequest('This item does not need legal review');
+  await pool.query(
+    `UPDATE opportunity_ingestion_items SET legal_reviewed_by = $1, legal_reviewed_at = now(), legal_review_notes = $2 WHERE id = $3`,
+    [user.id, notes || null, id]
+  );
+  await auditService.log({ actor: user, action: 'opportunity_legal_reviewed', entityType: 'opportunity_ingestion_item', entityId: id, after: { notes } });
+  return getQueueItem(id);
 }
 
 async function rejectItem(id, notes, user) {
@@ -1057,6 +1061,8 @@ module.exports = {
   listQueue,
   getQueueItem,
   publishItem,
+  markLegalReviewed,
   rejectItem,
   getSummary,
+  getSystemUser,
 };

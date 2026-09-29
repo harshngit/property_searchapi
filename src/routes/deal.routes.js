@@ -285,6 +285,7 @@ router.post(
  *                 type: string
  *                 enum: [inquiry, site_visit, negotiation, booking, documentation, payment, closed_won, closed_lost, on_hold]
  *               notes: { type: string, example: "Customer confirmed site visit for Saturday." }
+ *               override: { type: boolean, description: "Admin only - move forward although the target stage's requirements (Module 40) are not met; notes become the logged reason." }
  *     responses:
  *       200:
  *         description: Deal stage updated successfully
@@ -302,6 +303,7 @@ router.put(
     param('id').isUUID().withMessage('Invalid deal id'),
     body('stage').isIn(DEAL_STAGES).withMessage('Invalid deal stage'),
     body('notes').optional().isString(),
+    body('override').optional().isBoolean(),
   ],
   validate,
   dealController.changeStage

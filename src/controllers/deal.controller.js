@@ -100,7 +100,7 @@ async function changeStage(req, res, next) {
       ownerFields: DEAL_OWNER_FIELDS,
     });
 
-    const deal = await dealService.changeStage(req.params.id, req.body.stage, req.user, req.body.notes);
+    const deal = await dealService.changeStage(req.params.id, req.body.stage, req.user, req.body.notes, { override: req.body.override === true });
     return success(res, 200, 'Deal stage updated successfully', deal);
   } catch (err) {
     next(err);

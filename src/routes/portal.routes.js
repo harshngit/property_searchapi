@@ -71,7 +71,7 @@ router.get('/profile', portal.getProfile);
 router.put(
   '/profile',
   [
-    body('portalRoles').optional().isArray({ min: 1 }),
+    body('portalRoles').optional().isArray(),
     body('portalRoles.*').optional().isIn(['buyer', 'tenant', 'seller', 'owner']),
     body('preferences').optional().isObject(),
     body('preferences.budgetMin').optional({ nullable: true }).isFloat({ min: 0 }),
@@ -151,6 +151,9 @@ router.post(
     body('urgency').optional().isIn(['immediate', '30_days', 'flexible']),
     body('mandateType').optional().isIn(['standard', 'exclusive']),
     body('notes').optional().isString().isLength({ max: 2000 }),
+    body('amenities').optional().isArray({ max: 30 }),
+    body('latitude').optional({ nullable: true }).isFloat({ min: -90, max: 90 }),
+    body('longitude').optional({ nullable: true }).isFloat({ min: -180, max: 180 }),
     body('feeConsent').isBoolean().withMessage('Fee consent is required'),
   ],
   validate,
@@ -178,6 +181,9 @@ router.put(
     body('budgetMin').optional({ nullable: true }).isFloat({ min: 0 }),
     body('budgetMax').optional({ nullable: true }).isFloat({ min: 0 }),
     body('bedrooms').optional({ nullable: true }).isInt({ min: 0, max: 20 }),
+    body('amenities').optional().isArray({ max: 30 }),
+    body('latitude').optional({ nullable: true }).isFloat({ min: -90, max: 90 }),
+    body('longitude').optional({ nullable: true }).isFloat({ min: -180, max: 180 }),
   ],
   validate,
   portal.updateRequirement
@@ -185,9 +191,65 @@ router.put(
 
 /**
  * @swagger
+ * /me/requirements/{id}/renew:
+ *   post:
+ *     summary: Renew a requirement for another validity period (default 60 days) - also re-activates an expired one
+ *     tags: [Customer Portal]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters: [{ in: path, name: id, required: true, schema: { type: string, format: uuid } }]
+ *     responses: { 200: { description: Renewed requirement } }
+ */
+router.post('/requirements/:id/renew', idParam, validate, portal.renewRequirement);
+
+/**
+ * @swagger
+ * /me/match-scores:
+ *   get:
+ *     summary: Match badge data for property cards - best score, tier and parameter-wise breakdown against the caller's active requirements
+ *     tags: [Customer Portal]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters: [{ in: query, name: ids, required: true, schema: { type: string }, description: Comma-separated property ids (max 100) }]
+ *     responses: { 200: { description: "{ [propertyId]: { score, tier, breakdown } }" } }
+ */
+router.get('/match-scores', [query('ids').notEmpty()], validate, portal.matchScores);
+
+/**
+ * @swagger
+ * /me/match-events:
+ *   post:
+ *     summary: Record a buyer interaction with a matched property (clicked) - feeds the AI matching weights and the A/B test
+ *     tags: [Customer Portal]
+ *     security: [{ bearerAuth: [] }]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema: { type: object, required: [propertyId, event], properties: { propertyId: { type: string, format: uuid }, requirementId: { type: string, format: uuid }, event: { type: string, enum: [clicked] } } }
+ *     responses: { 201: { description: Recorded } }
+ */
+router.post(
+  '/match-events',
+  [body('propertyId').isUUID(), body('requirementId').optional().isUUID(), body('event').isIn(['clicked'])],
+  validate,
+  portal.matchEvent
+);
+
+/**
+ * @swagger
+ * /me/recommendations:
+ *   get:
+ *     summary: Properties recommended from the caller's requirement, favourites / enquiry history or preferences
+ *     tags: [Customer Portal]
+ *     security: [{ bearerAuth: [] }]
+ *     responses: { 200: { description: "{ basis, items: [{ score, tier, breakdown, property }] }" } }
+ */
+router.get('/recommendations', portal.recommendations);
+
+/**
+ * @swagger
  * /me/matches:
  *   get:
- *     summary: Matched properties for the caller's active requirements (Screen 6) - % score, Hot Match flag
+ *     summary: Matched properties for the caller's active requirements (Screen 6) - Hot + Warm (and Lukewarm sent by a representative), % score, tier and parameter-wise breakdown
  *     tags: [Customer Portal]
  *     security: [{ bearerAuth: [] }]
  *     parameters: [{ in: query, name: requirementId, schema: { type: string, format: uuid } }]
@@ -349,6 +411,13 @@ const listingValidators = (creating) => [
   body('amenities').optional().isArray(),
   body('description').optional().isLength({ max: 5000 }),
   body('mandateType').optional().isIn(['standard', 'exclusive']),
+  ...(creating
+    ? [
+        body('situationTags').optional().isArray({ max: 4 }),
+        body('situationTags.*').optional().isIn(['urgent_sale', 'financial_distress', 'investor_exit', 'time_bound_sale']),
+        body('estimatedMarketValue').optional({ nullable: true }).isFloat({ min: 1 }),
+      ]
+    : []),
   ...(creating ? [body('feeConsent').isBoolean().withMessage('Fee consent is required')] : []),
 ];
 

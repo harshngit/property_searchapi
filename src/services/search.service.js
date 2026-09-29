@@ -26,6 +26,14 @@ const SORT_OPTIONS = {
   price_desc: 'price_value DESC NULLS LAST',
   newest: 'properties.created_at DESC',
   verified: 'is_verified DESC, properties.created_at DESC',
+  // Sec. 8.3: listers with higher trust / badges rank higher (search
+  // boost from trust_scores), then verified listings, then newest.
+  // Sec. 9.1: plus the verification-level boost (System +5, Seller +15,
+  // Legally +25, Site +35 - verification.search_boost).
+  recommended: `(COALESCE((SELECT ts.search_boost FROM trust_scores ts
+                  WHERE ts.user_id = COALESCE(properties.broker_id, properties.created_by)), 0)
+                 + COALESCE((SELECT (ac.value->>(properties.verification_level::text))::numeric FROM app_config ac WHERE ac.config_key = 'verification.search_boost'), 0)) DESC,
+                is_verified DESC, properties.created_at DESC`,
 };
 
 // Public coordinates are rounded to ~100 m: enough to place the listing in
@@ -179,7 +187,7 @@ function buildWhere(filters) {
 async function searchProperties(filters, page, limit, sort) {
   const { where, params } = buildWhere(filters);
   const whereClause = `WHERE ${where.join(' AND ')}`;
-  const orderClause = SORT_OPTIONS[sort] || SORT_OPTIONS.newest;
+  const orderClause = SORT_OPTIONS[sort] || SORT_OPTIONS.recommended;
   const offset = (page - 1) * limit;
 
   const countResult = await pool.query(`SELECT COUNT(*) FROM properties ${whereClause}`, params);
@@ -212,11 +220,17 @@ async function searchProperties(filters, page, limit, sort) {
             listing_category, city, locality, latitude, longitude, area_sqft, carpet_area_sqft,
             bedrooms, bathrooms, amenities, furnishing, possession_status, facing, floor_number, total_floors,
             is_verified, badge, tags, rera_number, liquidity_band, properties.created_at,
+            verification_level, under_review,
             builder.full_name AS builder_name,
             (SELECT url FROM property_media pm WHERE pm.property_id = properties.id
              ORDER BY pm.is_primary DESC, pm.display_order ASC LIMIT 1) AS primary_image,
             (SELECT COALESCE(json_agg(pm.url ORDER BY pm.is_primary DESC, pm.display_order ASC), '[]'::json)
-             FROM property_media pm WHERE pm.property_id = properties.id) AS images
+             FROM property_media pm WHERE pm.property_id = properties.id) AS images,
+            -- Lister trust (no identity): score + live badge keys for the card.
+            (SELECT json_build_object('score', ts.score,
+                    'badges', (SELECT COALESCE(json_agg(ub.badge_key), '[]'::json) FROM user_badges ub
+                               WHERE ub.user_id = ts.user_id AND ub.status <> 'revoked'))
+             FROM trust_scores ts WHERE ts.user_id = COALESCE(properties.broker_id, properties.created_by)) AS lister_trust
      FROM properties
      LEFT JOIN users builder ON builder.id = properties.builder_id
      ${whereClause}
@@ -280,7 +294,7 @@ async function getPublicPropertyById(id) {
             p.listing_category, p.city, p.locality, p.latitude, p.longitude,
             p.area_sqft, p.carpet_area_sqft, p.bedrooms, p.bathrooms, p.amenities,
             p.annual_appreciation_percent, p.estimated_rent_monthly, p.locality_rating,
-            p.about_extended, p.facing, p.tags, p.badge, p.is_verified, p.rera_number,
+            p.about_extended, p.facing, p.tags, p.badge, p.is_verified, p.rera_number, p.verification_level, p.under_review,
             p.possession_status, p.floor_number, p.total_floors, p.furnishing, p.parking_spots,
             p.parking_type, p.age_of_property, p.gated_community, p.faqs,
             p.liquidity_score, p.liquidity_band, p.created_at,

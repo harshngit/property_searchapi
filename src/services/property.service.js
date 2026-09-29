@@ -6,6 +6,10 @@ const opportunityScoring = require('./opportunityScoring.service');
 const { assertCleanContent } = require('../utils/contentGuard');
 const { parsePriceToNumber } = require('../utils/price');
 
+// Lazily required - the matching engine / fraud service read properties themselves.
+const matchEngine = () => require('./matchEngine.service');
+const fraud = () => require('./fraud.service');
+
 function notFound(message = 'Property not found') {
   const err = new Error(message);
   err.statusCode = 404;
@@ -92,6 +96,10 @@ const OPPORTUNITY_FIELDS = {
   legalStatusNote: 'legal_status_note',
   estimatedMarketValue: 'estimated_market_value',
   isInstitutionalAsset: 'is_institutional_asset',
+  // Exclusive Mandate (+20 matching boost) and the private minimum price
+  // for the staff-only Price-Compatible flag (sec. 7).
+  mandateType: 'mandate_type',
+  minAcceptablePrice: 'min_acceptable_price',
 };
 const OPPORTUNITY_JSON_FIELDS = { situationTags: 'situation_tags', riskIndicators: 'risk_indicators' };
 
@@ -339,6 +347,9 @@ async function createProperty(data, user, { autoVerify = true } = {}) {
     await pool.query('UPDATE properties SET is_verified = true WHERE id = $1', [propertyId]);
     return approveProperty(propertyId, user);
   }
+  // Sec. 9: duplicate detection + fraud risk score; Green goes live at once,
+  // Yellow live with an Under Review banner, Red held, Critical rejected.
+  await fraud().assess(propertyId, { trigger: 'create' });
   return getPropertyById(propertyId);
 }
 
@@ -416,6 +427,8 @@ async function updateProperty(id, data) {
   );
 
   await opportunityScoring.refreshScores(id);
+  await fraud().assess(id, { trigger: 'update' });
+  matchEngine().safeRefreshProperty(id);
   return getPropertyById(id);
 }
 
@@ -438,6 +451,10 @@ async function addMedia(propertyId, mediaItems) {
       ]
     );
     inserted.push(result.rows[0]);
+    // Fingerprint / EXIF / contact scan for linked images, in the background.
+    if ((item.mediaType || 'image') === 'image') {
+      fraud().analyseRemoteMedia(result.rows[0].id, item.url).then(() => fraud().safeAssess(propertyId, 'media'));
+    }
   }
   return signUrls(inserted, 'url');
 }
@@ -447,6 +464,9 @@ async function addMedia(propertyId, mediaItems) {
 // private, so what's stored is a path, never a browsable URL).
 async function uploadMedia(propertyId, file, options = {}) {
   const mediaType = file.mimetype.startsWith('video/') ? 'video' : 'image';
+  // Sec. 11.2 image-level blocking: images with contact details / visiting
+  // cards are rejected before they are stored (422).
+  const analysis = mediaType === 'image' ? await fraud().screenUpload(file.buffer) : null;
   const folder = `properties/${propertyId}/${mediaType === 'video' ? 'videos' : 'images'}`;
   const objectPath = await uploadBuffer(file.buffer, folder, file.originalname, file.mimetype);
 
@@ -455,6 +475,11 @@ async function uploadMedia(propertyId, file, options = {}) {
      VALUES ($1, $2, $3, $4, $5) RETURNING *`,
     [propertyId, mediaType, objectPath, options.displayOrder || 0, options.isPrimary || false]
   );
+  if (analysis) {
+    await fraud().saveMediaAnalysis(result.rows[0].id, analysis);
+    // Re-assess (duplicate photos, geo mismatch, L1 image count).
+    fraud().safeAssess(propertyId, 'media');
+  }
   return signUrls(result.rows[0], 'url');
 }
 
@@ -506,6 +531,7 @@ async function updateAvailability(id, property, isAvailable) {
 
   const newStatus = isAvailable ? 'approved' : 'inactive';
   await pool.query('UPDATE properties SET status = $1 WHERE id = $2 RETURNING *', [newStatus, id]);
+  matchEngine().safeRefreshProperty(id);
   return getPropertyById(id);
 }
 
@@ -517,6 +543,7 @@ async function updatePricing(id, price) {
     [price, parsePriceToNumber(price), id]
   );
   await opportunityScoring.refreshScores(id);
+  matchEngine().safeRefreshProperty(id);
   return getPropertyById(id);
 }
 
@@ -533,11 +560,17 @@ async function approveProperty(id, adminUser) {
   // that's when matched investors get their alert (Engine 4). Required
   // lazily - opportunity.service itself reads properties.
   const property = await getPropertyById(id);
+  // Trust score: geo-validation + mandate bonus follow the lister's listings.
+  require('./trust.service').safeRecompute(property.broker_id || property.created_by, 'listing_approved');
   if (opportunityScoring.OPPORTUNITY_CATEGORIES.includes(property.listing_category)) {
     require('./opportunity.service').safeSendAlerts(id);
   } else {
-    // Hot Match / saved-search alerts to customers (best-effort, not awaited).
-    require('./portal.service').notifyNewListing(id);
+    // Matching engine (sec. 7): Hot Match alerts to buyers and brokers,
+    // then saved-search alerts (best-effort, not awaited).
+    matchEngine()
+      .refreshProperty(id)
+      .catch((err) => console.error(`[matching] refresh ${id} failed:`, err.message))
+      .finally(() => require('./portal.service').notifyNewListing(id));
   }
   return property;
 }
@@ -550,6 +583,7 @@ async function rejectProperty(id, reason, adminUser) {
     [reason, adminUser.id, id]
   );
   if (result.rows.length === 0) throw notFound();
+  matchEngine().safeRefreshProperty(id);
   return getPropertyById(id);
 }
 

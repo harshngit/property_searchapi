@@ -11,6 +11,13 @@ const liquidityService = require('./liquidity.service');
 //   yield     - stated yield, else estimated rent / asking price
 // Unknown inputs score a neutral fraction rather than zero, so a deal with
 // missing data isn't ranked below a deal with known-bad data.
+//
+// Learning from outcomes ("AI deal scoring refines deal scores based on
+// historical conversion data"): deals are grouped into segments (category x
+// discount band x liquidity band); each segment's interest -> closure rate,
+// smoothed towards the overall rate, nudges the score up or down by at most
+// opportunity.learning_max_adjustment points once enough history exists.
+// The adjustment and the data behind it are kept in score_breakdown.
 
 const DEFAULT_WEIGHTS = { discount: 40, liquidity: 25, risk: 20, yield: 15 };
 const LIQUIDITY_FRACTION = { high: 1, moderate: 0.6, low: 0.2 };
@@ -24,6 +31,49 @@ function clamp01(n) {
 function toNumber(v) {
   const n = v === null || v === undefined ? NaN : Number(v);
   return Number.isFinite(n) ? n : null;
+}
+
+function discountBand(discountPercent) {
+  if (discountPercent === null || discountPercent === undefined) return 'unknown';
+  if (discountPercent < 10) return 'under_10';
+  if (discountPercent < 25) return '10_to_25';
+  return 'over_25';
+}
+
+const BAND_SQL = `CASE WHEN p.discount_percent IS NULL THEN 'unknown' WHEN p.discount_percent < 10 THEN 'under_10'
+                       WHEN p.discount_percent < 25 THEN '10_to_25' ELSE 'over_25' END`;
+
+// Conversion history for a deal's segment vs all opportunity deals.
+async function conversionAdjustment(property, discountPercent, liquidityBand) {
+  const [maxPoints, minHistory, prior] = await Promise.all([
+    configService.getConfig('opportunity.learning_max_adjustment', 10),
+    configService.getConfig('opportunity.learning_min_interests', 20),
+    configService.getConfig('opportunity.learning_prior_weight', 10),
+  ]);
+  const segment = { category: property.listing_category, discountBand: discountBand(discountPercent), liquidityBand: liquidityBand || 'unknown' };
+  const result = await pool.query(
+    `SELECT COUNT(*)::int AS interests,
+            COUNT(*) FILTER (WHERE oi.stage = 'closure')::int AS closures,
+            COUNT(*) FILTER (WHERE p.listing_category = $1 AND ${BAND_SQL} = $2 AND COALESCE(p.liquidity_band, 'unknown') = $3)::int AS seg_interests,
+            COUNT(*) FILTER (WHERE p.listing_category = $1 AND ${BAND_SQL} = $2 AND COALESCE(p.liquidity_band, 'unknown') = $3 AND oi.stage = 'closure')::int AS seg_closures
+     FROM opportunity_interests oi JOIN properties p ON p.id = oi.property_id
+     WHERE p.id <> $4`,
+    [segment.category, segment.discountBand, segment.liquidityBand, property.id]
+  );
+  const r = result.rows[0];
+  const learning = { segment, interests: r.interests, closures: r.closures, segmentInterests: r.seg_interests, segmentClosures: r.seg_closures, adjustment: 0 };
+  if (r.interests < Number(minHistory) || r.closures === 0) {
+    learning.note = 'Not enough closed deals yet to learn from';
+    return learning;
+  }
+  const globalRate = r.closures / r.interests;
+  const k = Number(prior) || 10;
+  const segmentRate = (r.seg_closures + k * globalRate) / (r.seg_interests + k);
+  const max = Number(maxPoints) || 10;
+  learning.globalRate = Math.round(globalRate * 1000) / 1000;
+  learning.segmentRate = Math.round(segmentRate * 1000) / 1000;
+  learning.adjustment = Math.round(Math.max(-max, Math.min(max, (segmentRate / globalRate - 1) * max)) * 10) / 10;
+  return learning;
 }
 
 async function scoreOpportunity(property) {
@@ -61,7 +111,9 @@ async function scoreOpportunity(property) {
   const components = Object.fromEntries(
     Object.entries(fractions).map(([k, f]) => [k, Math.round(f * Number(weights[k] || 0) * (100 / totalWeight) * 10) / 10])
   );
-  const investmentScore = Math.round(Object.values(components).reduce((a, b) => a + b, 0));
+  const learning = await conversionAdjustment(property, discountPercent, liquidity.band);
+  const ruleScore = Object.values(components).reduce((a, b) => a + b, 0);
+  const investmentScore = Math.max(0, Math.min(100, Math.round(ruleScore + learning.adjustment)));
 
   return {
     discountPercent,
@@ -73,6 +125,8 @@ async function scoreOpportunity(property) {
       inputs: { askingPrice: asking, estimatedMarketValue: marketValue, discountPercent, yieldPercent, riskCount },
       liquidity: { score: liquidity.score, band: liquidity.band, scope: liquidity.scope },
       weights,
+      ruleScore: Math.round(ruleScore),
+      learning,
     },
   };
 }
@@ -114,4 +168,16 @@ async function refreshScores(propertyId) {
   }
 }
 
-module.exports = { scoreOpportunity, refreshScores, OPPORTUNITY_CATEGORIES };
+// Re-score every live opportunity (run daily so scores keep learning from
+// new closures).
+async function rescoreAll() {
+  const result = await pool.query(
+    `SELECT id FROM properties WHERE status = 'approved' AND listing_category::text = ANY($1::text[])`,
+    [OPPORTUNITY_CATEGORIES]
+  );
+  let n = 0;
+  for (const { id } of result.rows) if (await refreshScores(id)) n += 1;
+  return { rescored: n };
+}
+
+module.exports = { scoreOpportunity, refreshScores, rescoreAll, OPPORTUNITY_CATEGORIES };

@@ -11,7 +11,7 @@ const BODY_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 const ORGANIC_CODE = 'OG-00001';
 
 // Category prefix by portal role (customers) or login role (everyone else).
-const PORTAL_ROLE_PREFIX = { buyer: 'BU', seller: 'SE', owner: 'OW', tenant: 'TE' };
+const PORTAL_ROLE_PREFIX = { hni: 'HN', nri: 'NR', buyer: 'BU', seller: 'SE', owner: 'OW', tenant: 'TE' };
 const LOGIN_ROLE_PREFIX = {
   broker: 'BR',
   builder: 'BD',

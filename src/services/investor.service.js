@@ -26,8 +26,12 @@ const PROFILE_FIELDS = {
   investmentHorizonYears: 'investment_horizon_years',
   institutionalInterest: 'institutional_interest',
   alertsEnabled: 'alerts_enabled',
+  alertMode: 'alert_mode',
+  alertMaxPerDay: 'alert_max_per_day',
 };
 const PROFILE_JSON_FIELDS = {
+  propertyInterestTypes: 'property_interest_types',
+  alertChannels: 'alert_channels',
   assetClassPreferences: 'asset_class_preferences',
   preferredCities: 'preferred_cities',
   preferredPropertyTypes: 'preferred_property_types',
@@ -91,6 +95,45 @@ function assertHni(profile) {
 // PUT /investors/me - create or update the caller's own profile. Material
 // changes (becoming NRI/HNI, ticket size) send a verified profile back to
 // pending, since verification was granted against the old details.
+// Screen 2 "assigned manager introduction": a new NRI / HNI investor gets a
+// relationship manager straight away - the active internal sales user with
+// the fewest investors - and both sides are introduced by notification.
+// Admins can reassign any time (assignManager).
+async function introduceManager(profileId, investorName) {
+  const configService = require('./config.service');
+  if (!(await configService.getConfig('investor.auto_assign_manager', true))) return null;
+  const pick = await pool.query(
+    `SELECT u.id, u.full_name FROM users u JOIN roles r ON r.id = u.role_id
+     WHERE r.name = 'internal_sales' AND u.status = 'active'
+     ORDER BY (SELECT COUNT(*) FROM investor_profiles ip WHERE ip.assigned_manager_id = u.id) ASC, u.created_at ASC
+     LIMIT 1`
+  );
+  const manager = pick.rows[0];
+  if (!manager) return null;
+  const updated = await pool.query(
+    'UPDATE investor_profiles SET assigned_manager_id = $1 WHERE id = $2 AND assigned_manager_id IS NULL RETURNING user_id',
+    [manager.id, profileId]
+  );
+  if (!updated.rows[0]) return null;
+  await notificationService.createNotification({
+    userId: updated.rows[0].user_id,
+    type: 'investor_manager_assigned',
+    title: 'Meet your relationship manager',
+    message: `${manager.full_name} from A R Buildwel is your dedicated relationship manager and will be in touch shortly. You can reach them any time from your dashboard.`,
+    relatedEntityType: 'investor_profile',
+    relatedEntityId: profileId,
+  });
+  await notificationService.createNotification({
+    userId: manager.id,
+    type: 'investor_assigned',
+    title: 'New investor assigned to you',
+    message: `${investorName} has just created an investor profile - please introduce yourself.`,
+    relatedEntityType: 'investor_profile',
+    relatedEntityId: profileId,
+  });
+  return manager;
+}
+
 async function upsertMyProfile(data, user) {
   const existing = await getProfileByUserId(user.id);
 
@@ -121,6 +164,14 @@ async function upsertMyProfile(data, user) {
     const result = await pool.query(
       `INSERT INTO investor_profiles (${cols.join(', ')}) VALUES (${values.map((_, i) => `$${i + 1}`).join(', ')}) RETURNING id`,
       values
+    );
+    // Permanent referral code carries the investor category (NR- / HN-)
+    // when this is the person's first category.
+    await require('./referral.service')
+      .ensureReferralCode(user.id, user.role, [data.isHni ? 'hni' : 'nri'])
+      .catch((err) => console.error('[investor] referral code:', err.message));
+    await introduceManager(result.rows[0].id, me.rows[0].full_name).catch((err) =>
+      console.error('[investor] manager assignment failed:', err.message)
     );
     return getProfileById(result.rows[0].id);
   }

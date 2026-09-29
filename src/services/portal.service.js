@@ -3,6 +3,7 @@ const configService = require('./config.service');
 const customerService = require('./customer.service');
 const propertyService = require('./property.service');
 const referralService = require('./referral.service');
+const matchEngine = require('./matchEngine.service');
 const notificationService = require('./notification.service');
 const auditService = require('./audit.service');
 const { signUrls } = require('../utils/storage');
@@ -42,7 +43,6 @@ const DEAL_STAGE_LABELS = {
   on_hold: 'On hold',
 };
 
-const DEFAULT_MATCH_WEIGHTS = { location: 40, budget: 35, type: 15, dealType: 10 };
 
 // ------------------------------------------------------------------ helpers
 
@@ -77,27 +77,71 @@ const LISTING_CARD_COLUMNS = `p.id, p.title, p.property_type, p.transaction_type
 
 // ------------------------------------------------------------------ profile
 
-async function getProfile(user) {
-  const customer = await resolveCustomer(user);
-  const [account, preferences, closedDeals, referralCount] = await Promise.all([
-    pool.query('SELECT id, full_name, email, mobile, referral_code, created_at FROM users WHERE id = $1', [user.id]),
-    customerService.getPreferences(customer.id),
+// Sec. 13.2A Lite Dashboard vs Full CRM for a customer. Full CRM comes
+// from joining for exempt investor types (HNI), otherwise at the deal or
+// referral threshold; closed deals count both regular deals and investment
+// deals that reached Closure. Once reached it is permanent
+// (customers.full_crm_since), even if activity or the profile changes later.
+async function getCrmTier(user, customer) {
+  const [closedDeals, closedInvestments, referralCount, investorRow, dealThreshold, referralThreshold, exemptTypes] = await Promise.all([
     pool.query(`SELECT COUNT(*)::int AS n FROM deals WHERE customer_id = $1 AND stage = 'closed_won'`, [customer.id]),
+    pool.query(`SELECT COUNT(*)::int AS n FROM opportunity_interests WHERE user_id = $1 AND stage = 'closure'`, [user.id]),
     referralService.countReferrals(user.id),
-  ]);
-  const code =
-    account.rows[0].referral_code ||
-    (await referralService.ensureReferralCode(user.id, user.role, customer.portal_roles || []));
-  const [dealThreshold, referralThreshold] = await Promise.all([
+    pool.query(
+      `SELECT ip.id, ip.is_nri, ip.is_hni, ip.verification_status, m.full_name AS manager_name
+       FROM investor_profiles ip LEFT JOIN users m ON m.id = ip.assigned_manager_id WHERE ip.user_id = $1`,
+      [user.id]
+    ),
     configService.getConfig('full_crm_deal_threshold', 5),
     configService.getConfig('full_crm_referral_threshold', 15),
+    configService.getConfig('full_crm_exempt_investor_types', ['hni']),
   ]);
+  const investor = investorRow.rows[0] || null;
+  const investorTypes = investor ? [investor.is_hni && 'hni', investor.is_nri && 'nri'].filter(Boolean) : [];
+  const exempt = investorTypes.some((t) => (exemptTypes || []).includes(t));
+  const deals = closedDeals.rows[0].n + closedInvestments.rows[0].n;
+  const earned = exempt || deals >= Number(dealThreshold) || referralCount >= Number(referralThreshold);
+  let since = customer.full_crm_since || null;
+  if (earned && !since) {
+    const r = await pool.query('UPDATE customers SET full_crm_since = COALESCE(full_crm_since, now()) WHERE id = $1 RETURNING full_crm_since', [customer.id]);
+    since = r.rows[0]?.full_crm_since || new Date();
+  }
+  return {
+    investor,
+    investorTypes,
+    referralCount,
+    tier: {
+      current: earned || since ? 'full' : 'lite',
+      exempt,
+      fullSince: since,
+      closedDeals: deals,
+      dealThreshold: Number(dealThreshold),
+      referredUsers: referralCount,
+      referralThreshold: Number(referralThreshold),
+    },
+  };
+}
+
+async function getProfile(user) {
+  const customer = await resolveCustomer(user);
+  const [account, preferences, crm] = await Promise.all([
+    pool.query('SELECT id, full_name, email, mobile, referral_code, created_at FROM users WHERE id = $1', [user.id]),
+    customerService.getPreferences(customer.id),
+    getCrmTier(user, customer),
+  ]);
+  const { investor, investorTypes, referralCount } = crm;
+  const code =
+    account.rows[0].referral_code ||
+    (await referralService.ensureReferralCode(user.id, user.role, [...investorTypes, ...(customer.portal_roles || [])]));
 
   return {
     user: { ...account.rows[0], referral_code: code },
     customerId: customer.id,
     portalRoles: customer.portal_roles || [],
     onboardedAt: customer.onboarded_at,
+    investor: investor
+      ? { id: investor.id, isNri: investor.is_nri, isHni: investor.is_hni, verificationStatus: investor.verification_status, managerName: investor.manager_name }
+      : null,
     preferences: preferences || null,
     referral: {
       code,
@@ -105,13 +149,7 @@ async function getProfile(user) {
       referredUsers: referralCount,
     },
     // Lite Dashboard until the usage threshold (sec. 13.2A); shown as progress.
-    tier: {
-      current: closedDeals.rows[0].n >= Number(dealThreshold) || referralCount >= Number(referralThreshold) ? 'full' : 'lite',
-      closedDeals: closedDeals.rows[0].n,
-      dealThreshold: Number(dealThreshold),
-      referredUsers: referralCount,
-      referralThreshold: Number(referralThreshold),
-    },
+    tier: crm.tier,
   };
 }
 
@@ -121,7 +159,9 @@ async function saveProfile(user, { portalRoles, preferences }, meta = {}) {
   const customer = await resolveCustomer(user);
   if (portalRoles !== undefined) {
     const roles = [...new Set(portalRoles)].filter((r) => PORTAL_ROLES.includes(r));
-    if (!roles.length) throw badRequest('Pick at least one of buyer, tenant, seller or owner');
+    // An NRI / HNI investor can onboard with just the investor profile.
+    const isInvestor = (await pool.query('SELECT 1 FROM investor_profiles WHERE user_id = $1', [user.id])).rows.length > 0;
+    if (!roles.length && !isInvestor) throw badRequest('Pick at least one of buyer, tenant, seller or owner');
     await pool.query(
       'UPDATE customers SET portal_roles = $1, onboarded_at = COALESCE(onboarded_at, now()), updated_at = now() WHERE id = $2',
       [roles, customer.id]
@@ -215,6 +255,10 @@ async function getOverview(user) {
 
 // ------------------------------------------------------------- requirements
 
+async function requirementValidityDays() {
+  return Number(await configService.getConfig('requirement.validity_days', 60)) || 60;
+}
+
 async function temperatureFor(urgency) {
   const map = await configService.getConfig('requirement_temperature_by_urgency', {
     immediate: 'hot',
@@ -264,8 +308,10 @@ async function createRequirement(user, data, meta = {}) {
     );
     const inserted = await client.query(
       `INSERT INTO requirements (customer_id, created_by, purpose, property_type, city, localities, budget_min, budget_max,
-         area_min_sqft, area_max_sqft, bedrooms, urgency, temperature, notes, mandate_type, fee_consent_at, lead_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, now(), $16)
+         area_min_sqft, area_max_sqft, bedrooms, urgency, temperature, notes, mandate_type, fee_consent_at, lead_id,
+         amenities, latitude, longitude, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, now(), $16, $17, $18, $19,
+               now() + ($20 || ' days')::interval)
        RETURNING *`,
       [
         customer.id,
@@ -284,6 +330,10 @@ async function createRequirement(user, data, meta = {}) {
         data.notes || null,
         data.mandateType || 'standard',
         lead.rows[0].id,
+        JSON.stringify((data.amenities || []).map((a) => String(a).trim()).filter(Boolean)),
+        data.latitude ?? null,
+        data.longitude ?? null,
+        String(await requirementValidityDays()),
       ]
     );
     const requirement = inserted.rows[0];
@@ -303,6 +353,8 @@ async function createRequirement(user, data, meta = {}) {
         [data.purpose === 'rent' ? 'tenant' : 'buyer', customer.id]
       );
     }
+    // Reverse matching: Hot matches alert the buyer and the listing brokers.
+    matchEngine.safeRefreshRequirement(requirement.id);
     return requirement;
   } catch (err) {
     await client.query('ROLLBACK');
@@ -341,6 +393,16 @@ async function updateRequirement(user, id, data, meta = {}) {
     params.push(JSON.stringify(data.localities));
     set.push(`localities = $${params.length}`);
   }
+  if (data.amenities !== undefined) {
+    params.push(JSON.stringify(data.amenities));
+    set.push(`amenities = $${params.length}`);
+  }
+  for (const [key, col] of [['latitude', 'latitude'], ['longitude', 'longitude']]) {
+    if (data[key] !== undefined) {
+      params.push(data[key]);
+      set.push(`${col} = $${params.length}`);
+    }
+  }
   if (data.urgency !== undefined) {
     params.push(data.urgency);
     set.push(`urgency = $${params.length}::requirement_urgency`);
@@ -378,96 +440,32 @@ async function updateRequirement(user, id, data, meta = {}) {
     after: requirement,
     ...meta,
   });
+  matchEngine.safeRefreshRequirement(requirement.id);
   return requirement;
+}
+
+// Engine 5: an expired (or any) requirement is renewed for another
+// validity period and goes back to active.
+async function renewRequirement(user, id, meta = {}) {
+  const customer = await resolveCustomer(user);
+  const days = await requirementValidityDays();
+  const r = await pool.query(
+    `UPDATE requirements SET status = 'active', expires_at = now() + ($1 || ' days')::interval,
+            expiry_warned_at = NULL, expired_at = NULL, renewal_count = renewal_count + 1
+     WHERE id = $2 AND customer_id = $3 AND status IN ('active', 'paused') RETURNING *`,
+    [String(days), id, customer.id]
+  );
+  if (!r.rows[0]) throw notFound('Requirement not found or already closed');
+  await auditService.log({ actor: user, action: 'requirement.renewed', entityType: 'requirement', entityId: id, after: { expires_at: r.rows[0].expires_at }, ...meta });
+  matchEngine.safeRefreshRequirement(id);
+  return r.rows[0];
 }
 
 // ------------------------------------------------------------------ matching
 
-async function matchWeights() {
-  const configured = await configService.getConfig('requirement_match_weights', DEFAULT_MATCH_WEIGHTS);
-  return { ...DEFAULT_MATCH_WEIGHTS, ...(configured || {}) };
-}
-
-// 0-100 match of one listing against one requirement (Screen 6). Location
-// and budget matter most; the deal type is already guaranteed by the query.
-function scoreListing(listing, requirement, weights) {
-  const reasons = {};
-  let score = weights.dealType;
-
-  const localities = (requirement.localities || []).map((l) => l.toLowerCase());
-  const cityMatch = (listing.city || '').toLowerCase() === (requirement.city || '').toLowerCase();
-  const localityMatch = localities.length > 0 && localities.includes((listing.locality || '').toLowerCase());
-  if (cityMatch && (localities.length === 0 || localityMatch)) score += weights.location;
-  else if (cityMatch) score += Math.round(weights.location * 0.6);
-  reasons.location = localityMatch ? 'locality' : cityMatch ? 'city' : 'none';
-
-  const price = listing.price_value != null ? Number(listing.price_value) : parsePriceToNumber(listing.price);
-  const min = requirement.budget_min != null ? Number(requirement.budget_min) : null;
-  const max = requirement.budget_max != null ? Number(requirement.budget_max) : null;
-  if (min == null && max == null) {
-    score += weights.budget;
-    reasons.budget = 'any';
-  } else if (Number.isFinite(price) && price > 0) {
-    if ((min == null || price >= min) && (max == null || price <= max)) {
-      score += weights.budget;
-      reasons.budget = 'within';
-    } else {
-      const bound = max != null && price > max ? max : min;
-      if (bound != null && Math.abs(price - bound) <= bound * 0.2) {
-        score += Math.round(weights.budget * 0.45);
-        reasons.budget = 'near';
-      } else {
-        reasons.budget = 'outside';
-      }
-    }
-  } else {
-    reasons.budget = 'unknown';
-  }
-
-  if (!requirement.property_type || requirement.property_type === listing.property_type) {
-    score += weights.type;
-    reasons.type = true;
-  } else {
-    reasons.type = false;
-  }
-  if (requirement.bedrooms && listing.bedrooms != null && listing.bedrooms < requirement.bedrooms) {
-    score -= 10;
-    reasons.bedrooms = 'fewer';
-  }
-  return { score: Math.max(0, Math.min(100, score)), reasons };
-}
-
-async function findMatches(requirements, { excludeCreatedBy = null, limitPerRequirement = 12 } = {}) {
-  const weights = await matchWeights();
-  const hotThreshold = Number(await configService.getConfig('hot_match_threshold', 80)) || 80;
-  const out = [];
-  for (const requirement of requirements) {
-    const params = [PURPOSE_TRANSACTION_TYPES[requirement.purpose], requirement.city];
-    let excludeClause = '';
-    if (excludeCreatedBy) {
-      params.push(excludeCreatedBy);
-      excludeClause = `AND (p.created_by IS NULL OR p.created_by <> $${params.length})`;
-    }
-    const candidates = await pool.query(
-      `SELECT ${LISTING_CARD_COLUMNS}
-       FROM properties p
-       WHERE p.status = 'approved' AND p.listing_category = 'residential'
-         AND p.transaction_type::text = ANY($1) AND p.city ILIKE $2 ${excludeClause}
-       ORDER BY p.created_at DESC LIMIT 300`,
-      params
-    );
-    candidates.rows
-      .map((listing) => ({ listing, ...scoreListing(listing, requirement, weights) }))
-      .filter((m) => m.score >= 40)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, limitPerRequirement)
-      .forEach((m) =>
-        out.push({ requirementId: requirement.id, score: m.score, hotMatch: m.score >= hotThreshold, reasons: m.reasons, property: m.listing })
-      );
-  }
-  return out;
-}
-
+// Screen 6 / sec. 7: Hot + Warm matches (and Lukewarm ones a broker sent)
+// from the matching engine, one entry per property, best first, with the
+// parameter-wise breakdown behind every badge.
 async function getMatches(user, { requirementId } = {}) {
   const customer = await resolveCustomer(user);
   const params = [customer.id];
@@ -477,20 +475,14 @@ async function getMatches(user, { requirementId } = {}) {
     where += ` AND id = $2`;
   }
   const requirements = await pool.query(`SELECT * FROM requirements WHERE ${where}`, params);
-  const matches = await findMatches(requirements.rows, { excludeCreatedBy: user.id });
-
-  // One entry per property (its best requirement), best first.
-  const best = new Map();
-  for (const m of matches) {
-    const current = best.get(m.property.id);
-    if (!current || m.score > current.score) best.set(m.property.id, m);
-  }
-  const items = [...best.values()].sort((a, b) => b.score - a.score);
+  const items = await matchEngine.matchesForRequirements(requirements.rows, user);
   const favourites = await pool.query('SELECT property_id FROM property_favorites WHERE customer_id = $1', [customer.id]);
   const favSet = new Set(favourites.rows.map((r) => r.property_id));
   const properties = await signUrls(items.map((m) => ({ ...m.property, is_favourite: favSet.has(m.property.id) })), 'primary_image');
+  const s = await matchEngine.settings();
   return {
     requirements: requirements.rows.length,
+    thresholds: s.thresholds,
     items: items.map((m, i) => ({ ...m, property: properties[i] })),
   };
 }
@@ -504,29 +496,15 @@ async function notifyNewListing(propertyId) {
     const listing = listingResult.rows[0];
     if (!listing || listing.listing_category !== 'residential') return;
     const purpose = listing.transaction_type === 'rent' ? 'rent' : 'buy';
-    const weights = await matchWeights();
-    const hotThreshold = Number(await configService.getConfig('hot_match_threshold', 80)) || 80;
-    const notified = new Set();
-
-    const requirements = await pool.query(
-      `SELECT r.*, c.user_id FROM requirements r JOIN customers c ON c.id = r.customer_id
-       WHERE r.status = 'active' AND r.purpose = $1 AND r.city ILIKE $2 AND c.user_id IS NOT NULL`,
-      [purpose, listing.city]
+    // Requirement matches (Hot alerts to buyers + brokers) run in the
+    // matching engine; this covers saved-search alerts. Users with a Hot
+    // match on this listing are not alerted twice.
+    const hotUsers = await pool.query(
+      `SELECT DISTINCT c.user_id FROM requirement_matches m JOIN requirements r ON r.id = m.requirement_id
+       JOIN customers c ON c.id = r.customer_id WHERE m.property_id = $1 AND m.tier = 'hot'`,
+      [propertyId]
     );
-    for (const requirement of requirements.rows) {
-      if (requirement.user_id === listing.created_by || notified.has(requirement.user_id)) continue;
-      const { score } = scoreListing(listing, requirement, weights);
-      if (score < hotThreshold) continue;
-      notified.add(requirement.user_id);
-      await notificationService.createNotification({
-        userId: requirement.user_id,
-        type: 'match_alert',
-        title: `Hot Match: ${listing.title}`,
-        message: `A new listing in ${[listing.locality, listing.city].filter(Boolean).join(', ')} matches your requirement (${score}% match).`,
-        relatedEntityType: 'property',
-        relatedEntityId: listing.id,
-      });
-    }
+    const notified = new Set(hotUsers.rows.map((r) => r.user_id));
 
     const searches = await pool.query(
       `SELECT s.*, c.user_id FROM saved_searches s JOIN customers c ON c.id = s.customer_id
@@ -695,6 +673,7 @@ async function listListings(user) {
   const validityDays = await listingValidityDays();
   const result = await pool.query(
     `SELECT ${LISTING_CARD_COLUMNS}, p.status, p.rejection_reason, p.approved_at, p.listing_renewed_at, p.mandate_type,
+            p.verification_level, p.under_review, p.fraud_band, p.duplicate_status,
             (SELECT COUNT(*) FROM leads l WHERE l.property_id = p.id)::int AS enquiry_count,
             (SELECT COUNT(DISTINCT l.customer_id) FROM leads l WHERE l.property_id = p.id)::int AS interested_count,
             (SELECT COUNT(*) FROM property_favorites f WHERE f.property_id = p.id)::int AS favourite_count,
@@ -725,8 +704,21 @@ async function createListing(user, data, meta = {}) {
   if (!data.feeConsent) throw badRequest('Please accept the professional fee terms to post a property');
   const input = Object.fromEntries(LISTING_INPUT_FIELDS.filter((k) => data[k] !== undefined).map((k) => [k, data[k]]));
   if (data.pg) input.tags = ['PG'];
+  // Engine 4 deal sourcing from direct sellers: a sale tagged Urgent Sale /
+  // Financial Distress / Investor Exit / Time-Bound Sale is listed as a
+  // Special Situation Property (scored, shown only to verified investors
+  // and brokers once approved) instead of a regular residential listing.
+  const situationTags = data.transactionType === 'sell' ? [...new Set(data.situationTags || [])] : [];
+  const special = situationTags.length > 0
+    ? {
+        listingCategory: 'special_situation',
+        opportunitySourceType: 'direct_seller',
+        situationTags,
+        ...(data.estimatedMarketValue ? { estimatedMarketValue: Number(data.estimatedMarketValue) } : {}),
+      }
+    : { listingCategory: 'residential' };
   const property = await propertyService.createProperty(
-    { ...input, listingCategory: 'residential', verified: false },
+    { ...input, ...special, verified: false },
     { id: user.id, role: user.role, tenant_id: null },
     { autoVerify: false }
   );
@@ -742,7 +734,7 @@ async function createListing(user, data, meta = {}) {
     );
   }
   await auditService.log({ actor: user, action: 'listing.posted', entityType: 'property', entityId: property.id, ...meta });
-  return { ...property, mandate_type: data.mandateType || 'standard' };
+  return { ...property, mandate_type: data.mandateType || 'standard', listing_category: special.listingCategory };
 }
 
 async function getOwnListing(user, id) {
@@ -766,6 +758,8 @@ async function updateListing(user, id, data, meta = {}) {
   }
   if (listing.status === 'approved' || listing.status === 'rejected') {
     await pool.query(`UPDATE properties SET status = 'pending_approval', rejection_reason = NULL WHERE id = $1`, [id]);
+    // Sec. 9.5: the edited listing is re-checked - Green goes straight back live.
+    await require('./fraud.service').assess(id, { trigger: 'update' });
   }
   await auditService.log({ actor: user, action: 'listing.edited', entityType: 'property', entityId: id, before: listing, after: input, ...meta });
   return (await listListings(user)).find((l) => l.id === id);
@@ -897,6 +891,7 @@ async function getCustomerPortalSummary(customerId) {
 module.exports = {
   getCustomerPortalSummary,
   PORTAL_ROLES,
+  getCrmTier,
   resolveCustomer,
   getProfile,
   saveProfile,
@@ -906,6 +901,7 @@ module.exports = {
   updateRequirement,
   getMatches,
   notifyNewListing,
+  renewRequirement,
   listFavourites,
   listSavedSearches,
   createSavedSearch,

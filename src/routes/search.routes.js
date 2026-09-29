@@ -110,7 +110,7 @@ const TRANSACTION_TYPES = ['buy', 'sell', 'rent'];
  *         description: Comma-separated list of required amenities, e.g. "parking,gym"
  *       - in: query
  *         name: sort
- *         schema: { type: string, enum: [rate_asc, rate_desc, price_asc, price_desc, newest, verified], default: newest }
+ *         schema: { type: string, enum: [rate_asc, rate_desc, price_asc, price_desc, newest, verified, recommended], default: recommended }
  *       - in: query
  *         name: page
  *         schema: { type: integer, default: 1 }
@@ -142,7 +142,7 @@ router.get(
     query('maxBedrooms').optional().isInt({ min: 0 }),
     query('tag').optional().isString().isLength({ max: 50 }),
     query('verified').optional().isBoolean(),
-    query('sort').optional().isIn(['rate_asc', 'rate_desc', 'price_asc', 'price_desc', 'newest', 'verified']),
+    query('sort').optional().isIn(['rate_asc', 'rate_desc', 'price_asc', 'price_desc', 'newest', 'verified', 'recommended']),
     query('page').optional().isInt({ min: 1 }),
     query('limit').optional().isInt({ min: 1, max: 100 }),
   ],

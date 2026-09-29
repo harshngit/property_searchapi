@@ -7,7 +7,13 @@ const validate = require('../middlewares/validate');
 const { authenticate, authorize } = require('../middlewares/auth');
 const { uploadDocumentFile } = require('../middlewares/upload');
 
-const DOCUMENT_TYPES = ['kyc', 'agreement', 'payment_receipt', 'noc', 'other'];
+// Module 20 document types (sec. Engine 5) - matches the document_category enum.
+const DOCUMENT_TYPES = [
+  'kyc', 'agreement', 'payment_receipt', 'noc', 'other', 'sale_deed', 'agreement_to_sell', 'id_proof', 'tax_receipt',
+  'encumbrance_certificate', 'title_document', 'allotment_letter', 'occupancy_certificate', 'completion_certificate',
+  'approved_plan', 'mutation_record', 'society_noc', 'bank_noc', 'power_of_attorney', 'possession_letter',
+  'rent_agreement', 'utility_bill', 'rera_certificate',
+];
 const DOCUMENT_STATUSES = ['pending', 'approved', 'rejected'];
 const REVIEW_ROLES = ['admin', 'agency_admin', 'super_admin'];
 

@@ -25,6 +25,25 @@ module.exports = {
   updateRequirement: handler(async (req, res) =>
     success(res, 200, 'Requirement updated', await portalService.updateRequirement(req.user, req.params.id, req.body, meta(req)))
   ),
+  renewRequirement: handler(async (req, res) =>
+    success(res, 200, 'Requirement renewed', await portalService.renewRequirement(req.user, req.params.id, meta(req)))
+  ),
+  matchScores: handler(async (req, res) => {
+    const ids = String(req.query.ids || '').split(',').map((s) => s.trim()).filter(Boolean).slice(0, 100);
+    return success(res, 200, 'Match scores fetched', await require('../services/matchEngine.service').scoresForUser(req.user, ids));
+  }),
+  matchEvent: handler(async (req, res) => {
+    const n = await require('../services/matchEngine.service').recordEvent({
+      userId: req.user.id,
+      propertyId: req.body.propertyId,
+      requirementId: req.body.requirementId || null,
+      event: req.body.event,
+    });
+    return success(res, 201, 'Event recorded', { recorded: n });
+  }),
+  recommendations: handler(async (req, res) =>
+    success(res, 200, 'Recommendations fetched', await require('../services/matchEngine.service').recommendationsForUser(req.user))
+  ),
   matches: handler(async (req, res) =>
     success(res, 200, 'Matches fetched', await portalService.getMatches(req.user, { requirementId: req.query.requirementId }))
   ),

@@ -48,7 +48,7 @@ async function createNotification({ userId, tenantId, type, title, message, rela
     `INSERT INTO notifications (user_id, tenant_id, type, title, message, related_entity_type, related_entity_id)
      VALUES ($1, $2, $3, $4, $5, $6, $7)
      RETURNING *`,
-    [userId, tenantId || null, type, title, message || null, relatedEntityType || null, relatedEntityId || null]
+    [userId, tenantId || null, type, String(title || '').slice(0, 200), message || null, relatedEntityType || null, relatedEntityId || null]
   );
   return result.rows[0];
 }

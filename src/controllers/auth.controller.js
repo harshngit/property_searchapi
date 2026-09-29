@@ -12,6 +12,7 @@ async function register(req, res, next) {
       req.user // set by optionalAuthenticate - null if no/invalid bearer token was sent
     );
 
+    require('../services/fraud.service').recordIp(user.id, req.ip);
     return success(res, 201, 'Registration successful', user);
   } catch (err) {
     next(err);
@@ -43,6 +44,7 @@ async function login(req, res, next) {
 
     const decodedRefresh = require('jsonwebtoken').decode(refreshToken);
     await authService.storeRefreshToken(user.id, refreshToken, new Date(decodedRefresh.exp * 1000));
+    require('../services/fraud.service').recordIp(user.id, req.ip);
     await authService.updateLastLogin(user.id);
 
     return success(res, 200, 'Login successful', {
@@ -76,6 +78,7 @@ async function googleLogin(req, res, next) {
 
     const decodedRefresh = require('jsonwebtoken').decode(refreshToken);
     await authService.storeRefreshToken(user.id, refreshToken, new Date(decodedRefresh.exp * 1000));
+    require('../services/fraud.service').recordIp(user.id, req.ip);
     await authService.updateLastLogin(user.id);
 
     return success(res, 200, 'Google login successful', {
@@ -138,6 +141,7 @@ async function verifyOtp(req, res, next) {
       const refreshToken = generateRefreshToken(payload);
       const decodedRefresh = require('jsonwebtoken').decode(refreshToken);
       await authService.storeRefreshToken(user.id, refreshToken, new Date(decodedRefresh.exp * 1000));
+      require('../services/fraud.service').recordIp(user.id, req.ip);
       await authService.updateLastLogin(user.id);
 
       return success(res, 200, 'OTP verified, login successful', { accessToken, refreshToken });

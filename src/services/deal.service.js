@@ -199,7 +199,7 @@ async function updateDeal(id, data) {
     `UPDATE deals SET ${set.join(', ')} WHERE id = $${params.length} RETURNING *`,
     params
   );
-
+  if (result.rows[0]) require('./orchestration.service').safeEvaluate(id);
   return result.rows[0];
 }
 
@@ -207,7 +207,18 @@ async function updateDeal(id, data) {
 // deal_stage_history in the same transaction. Used directly by
 // PUT /:id/stage, and reused (via a fixed toStage) by /booking and /close
 // so every stage-affecting endpoint shares one guarded code path.
-async function changeStage(id, toStage, user, notes) {
+async function changeStage(id, toStage, user, notes, { orchestrated = false, override = false } = {}) {
+  const orchestration = require('./orchestration.service');
+  // Module 40 dependency enforcement: a forward move needs the target
+  // stage's requirements met (admins may override with a logged reason).
+  if (!orchestrated) {
+    const cur = await pool.query('SELECT stage FROM deals WHERE id = $1', [id]);
+    const from = cur.rows[0]?.stage;
+    const flow = orchestration.FLOW;
+    if (from && toStage !== from && flow.includes(toStage) && (from === 'on_hold' || flow.indexOf(toStage) > flow.indexOf(from))) {
+      await orchestration.assertCanEnter(id, toStage, user, { override, notes });
+    }
+  }
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -227,7 +238,8 @@ async function changeStage(id, toStage, user, notes) {
 
     const closesDeal = TERMINAL_STAGES.includes(toStage);
     const result = await client.query(
-      `UPDATE deals SET stage = $1, closed_at = ${closesDeal ? 'now()' : 'closed_at'} WHERE id = $2 RETURNING *`,
+      `UPDATE deals SET stage = $1, closed_at = ${closesDeal ? 'now()' : 'closed_at'}${toStage !== fromStage ? ', stage_entered_at = now(), sla_alerted_stage = NULL' : ''}
+       WHERE id = $2 RETURNING *`,
       [toStage, id]
     );
     const deal = result.rows[0];
@@ -235,6 +247,26 @@ async function changeStage(id, toStage, user, notes) {
     await logStageChange(client, id, fromStage, toStage, user.id, notes);
 
     await client.query('COMMIT');
+    if (!orchestrated && !closesDeal) orchestration.safeEvaluate(id);
+    // Matching engine learning (sec. 7.4): a closed deal is a conversion of
+    // the match that led to it.
+    if (toStage === 'closed_won' && deal.property_id && deal.customer_id) {
+      require('./matchEngine.service').recordEvent({ customerId: deal.customer_id, propertyId: deal.property_id, event: 'converted' });
+    }
+    // Trust score (sec. 8): a closed deal counts for the broker, the lister
+    // and the customer.
+    if (toStage === 'closed_won') {
+      const trust = require('./trust.service');
+      trust.safeRecompute(deal.broker_id, 'deal_closed');
+      const parties = await pool.query(
+        `SELECT p.created_by, c.user_id FROM deals d LEFT JOIN properties p ON p.id = d.property_id
+         LEFT JOIN customers c ON c.id = d.customer_id WHERE d.id = $1`,
+        [id]
+      );
+      const row = parties.rows[0] || {};
+      if (row.created_by && row.created_by !== deal.broker_id) trust.safeRecompute(row.created_by, 'deal_closed');
+      if (row.user_id) trust.safeRecompute(row.user_id, 'deal_closed');
+    }
     return deal;
   } catch (err) {
     await client.query('ROLLBACK');
@@ -290,6 +322,7 @@ async function scheduleSiteVisit(dealId, data, user) {
     [dealId, data.scheduledAt, data.notes || null, user.id]
   );
   await notifyCustomerOfVisit(dealId, result.rows[0], 'scheduled');
+  require('./orchestration.service').safeEvaluate(dealId);
   return result.rows[0];
 }
 
@@ -323,6 +356,13 @@ async function updateSiteVisit(dealId, visitId, data) {
   if (result.rows.length === 0) throw notFound('Site visit not found for this deal');
   const kind = data.status && data.status !== 'scheduled' ? data.status : data.scheduledAt ? 'rescheduled' : null;
   if (kind) await notifyCustomerOfVisit(dealId, result.rows[0], kind);
+  if (kind === 'completed') {
+    const d = await pool.query('SELECT property_id, customer_id FROM deals WHERE id = $1', [dealId]);
+    if (d.rows[0]?.property_id && d.rows[0]?.customer_id) {
+      require('./matchEngine.service').recordEvent({ customerId: d.rows[0].customer_id, propertyId: d.rows[0].property_id, event: 'visited' });
+    }
+  }
+  if (kind) require('./orchestration.service').safeEvaluate(dealId);
   return result.rows[0];
 }
 

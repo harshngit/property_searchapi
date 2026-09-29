@@ -115,9 +115,21 @@ async function createDocument(data, user) {
 // records it like any other document - the stored value is the object path,
 // signed per request on read.
 async function uploadDocument(file, data, user) {
+  // Module 21: classify + risk-scan the file before storing it.
+  const dd = require('./dueDiligence.service');
+  const analysis = await dd.analyse(file.buffer, file.mimetype, file.originalname).catch(() => null);
   const folder = `documents/${data.dealId || data.customerId || 'general'}`;
   const objectPath = await uploadBuffer(file.buffer, folder, file.originalname, file.mimetype);
-  return createDocument({ ...data, documentUrl: objectPath, fileName: data.fileName || file.originalname }, user);
+  const doc = await createDocument(
+    { ...data, documentType: data.documentType || analysis?.type || 'other', documentUrl: objectPath, fileName: data.fileName || file.originalname },
+    user
+  );
+  if (analysis) await dd.saveAnalysis(doc.id, analysis);
+  if (data.dealId) {
+    const deal = await pool.query('SELECT property_id FROM deals WHERE id = $1', [data.dealId]);
+    dd.safeRecompute(deal.rows[0]?.property_id);
+  }
+  return { ...doc, ai_type: analysis?.type || null, ai_flags: analysis?.flags || [] };
 }
 
 const UPDATABLE_DOCUMENT_FIELDS = {
@@ -184,6 +196,9 @@ async function reviewDocument(id, { status, reviewNotes }, reviewer) {
     [status, reviewer.id, reviewNotes || null, id]
   );
   if (result.rows.length === 0) throw notFound();
+  const orchestration = require('./orchestration.service');
+  if (result.rows[0].deal_id) orchestration.safeEvaluate(result.rows[0].deal_id);
+  if (result.rows[0].property_id) orchestration.evaluateForProperty(result.rows[0].property_id).catch(() => {});
   return signUrls(result.rows[0], 'document_url');
 }
 

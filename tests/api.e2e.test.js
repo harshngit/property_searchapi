@@ -725,7 +725,12 @@ test('customer portal: onboarding + referral code, listing with consent, require
   assert.equal(withPhone.status, 422);
   const listing = await api('POST', '/me/listings', { token: seller.token, body: { ...listingBody, feeConsent: true, mandateType: 'exclusive' } });
   assert.equal(listing.status, 201);
-  assert.equal(listing.data.status, 'pending_approval');
+  // Sec. 9.4 / 9.5: a new, unverified seller (+20) with an unverified mobile
+  // (+10) listing above Rs 1 Cr scores Yellow - live at once, with the
+  // Under Review banner and a 2-hour manual check.
+  assert.equal(listing.data.status, 'approved');
+  assert.equal(listing.data.fraud_band, 'yellow');
+  assert.equal(listing.data.under_review, true);
   assert.equal(listing.data.is_verified, false);
 
   const req = await api('POST', '/me/requirements', {
@@ -772,7 +777,9 @@ test('customer portal: onboarding + referral code, listing with consent, require
 
   assert.equal((await api('POST', `/me/listings/${listing.data.id}/renew`, { token: seller.token })).status, 200);
   const edited = await api('PUT', `/me/listings/${listing.data.id}`, { token: seller.token, body: { price: '1.45 Cr' } });
-  assert.equal(edited.data.status, 'pending_approval', 'edits go back through approval');
+  // Edits go back through the checks; a non-Red listing is re-published at once (sec. 9.5).
+  assert.equal(edited.data.status, 'approved', 'edits are re-checked and re-published');
+  assert.ok((await pool.query(`SELECT 1 FROM fraud_assessments WHERE property_id = $1 AND trigger = 'update'`, [listing.data.id])).rows.length);
   assert.equal(Number(edited.data.price_value), 14500000);
 
   await api('PUT', `/properties/${listing.data.id}/approve`, { token: A });
@@ -904,4 +911,967 @@ test('CRM: site visit notifies the customer, property enquiries, customer portal
   const meta = await api('GET', '/admin/master', { token: A });
   const cities = meta.data.find((e) => e.name === 'cities');
   assert.equal(cities.fields.find((f) => f.key === 'cityName').column, 'city_name');
+});
+
+// -------------------------------------------------------- deal room (M39)
+
+test('deal room: verified buyer + NDA + admin approval gate, append-only access log', async () => {
+  const A = ctx.admin.token;
+  const investor = await createUser('customer', 'roomer');
+  const deal = await pool.query(`SELECT id FROM properties WHERE listing_category = 'auction' AND status = 'approved' ORDER BY created_at DESC LIMIT 1`);
+  const P = deal.rows[0].id;
+
+  const before = await api('GET', `/deal-room/${P}`, { token: investor.token });
+  assert.equal(before.data.access.open, false);
+  assert.equal(before.data.documents.length, 0);
+  assert.equal((await api('POST', `/deal-room/${P}/nda`, { token: investor.token, body: { fullName: 'Room Tester', accept: true } })).status, 403, 'unverified cannot sign');
+
+  const profile = await api('PUT', '/investors/me', { token: investor.token, body: { isHni: true } });
+  await api('PUT', `/investors/${profile.data.id}/verify`, { token: A, body: { status: 'verified' } });
+  assert.equal((await api('POST', `/deal-room/${P}/nda`, { token: investor.token, body: { fullName: 'Room Tester', accept: false } })).status, 400);
+  const signed = await api('POST', `/deal-room/${P}/nda`, { token: investor.token, body: { fullName: 'Room Tester', accept: true } });
+  assert.equal(signed.data.access.status, 'pending_approval');
+  assert.equal(signed.data.access.open, false, 'NDA alone does not open the room');
+
+  const pending = await api('GET', '/deal-room/manage/requests?status=pending_approval', { token: A });
+  const request = pending.data.find((r) => r.email === investor.email);
+  assert.ok(request);
+  assert.equal((await api('PUT', `/deal-room/manage/access/${request.id}`, { token: ctx.sales.token, body: { action: 'approve' } })).status, 403, 'only admins approve');
+  assert.equal((await api('PUT', `/deal-room/manage/access/${request.id}`, { token: A, body: { action: 'reject' } })).status, 400, 'reject needs a reason');
+  await api('PUT', `/deal-room/manage/access/${request.id}`, { token: A, body: { action: 'approve' } });
+  assert.equal((await api('GET', `/deal-room/${P}`, { token: investor.token })).data.access.open, true);
+
+  await api('PUT', `/deal-room/manage/access/${request.id}`, { token: A, body: { action: 'revoke', reason: 'Deal closed' } });
+  const after = await api('GET', `/deal-room/${P}`, { token: investor.token });
+  assert.equal(after.data.access.open, false);
+  assert.equal(after.data.access.decisionReason, 'Deal closed');
+
+  const log = await api('GET', `/deal-room/${P}/access-log`, { token: A });
+  assert.ok(['nda_signed', 'access_approved', 'access_revoked'].every((a) => log.data.some((l) => l.action === a)));
+  await assert.rejects(pool.query('DELETE FROM deal_room_access_log WHERE property_id = $1', [P]), /append-only/);
+  assert.equal((await api('GET', `/deal-room/${P}/access-log`, { token: investor.token })).status, 403);
+});
+
+// ---------------------------------------------------- crawler pipeline (§23)
+
+test('crawler: legal approval gate, robots.txt, parse -> queue -> dedupe, legal-review gate on notices', async () => {
+  const http = require('http');
+  const port = 5000 + Math.floor(Math.random() * 400) + 5300;
+  const row = (i) => `<tr class="item"><td class="ref">E2E-${RUN}-${i}</td><td class="t">3 BHK flat ${RUN} ${i}</td><td class="city">${CITY}</td><td class="price">Rs. ${90 + i} Lakh</td><td class="date">2${i}-12-2027</td></tr>`;
+  const server = http
+    .createServer((req, res) => {
+      if (req.url === '/robots.txt') return res.end('User-agent: *\nDisallow: /private\n');
+      if (req.url === '/list') return res.end(`<table>${row(1)}${row(2)}</table>`);
+      if (req.url === '/notice.txt') return res.end('SALE NOTICE UNDER SARFAESI\nReserve Price: Rs. 1.2 Crore\nEMD: Rs. 12,00,000\nDate of e-Auction: 15-01-2028\nCall 9876543210');
+      res.statusCode = 404;
+      return res.end();
+    })
+    .listen(port);
+  try {
+    const A = ctx.admin.token;
+    const sources = await api('GET', '/crawlers/sources', { token: A });
+    assert.equal((await api('GET', '/crawlers/sources', { token: ctx.sales.token })).status, 403, 'admins only');
+    const src = sources.data.find((s) => s.source_key === 'mstc');
+    await api('PUT', `/crawlers/sources/${src.id}/legal-approval`, { token: A, body: { approved: false } }); // clean start on reruns
+    await api('POST', `/crawlers/sources/${src.id}/reset`, { token: A });
+    assert.equal((await api('PUT', `/crawlers/sources/${src.id}`, { token: A, body: { isEnabled: true } })).status, 400, 'needs legal approval to enable');
+
+    await api('PUT', `/crawlers/sources/${src.id}`, {
+      token: A,
+      body: {
+        listUrl: `http://localhost:${port}/list`,
+        adapter: 'html_list',
+        config: { itemSelector: 'tr.item', fields: { auction_reference_id: 'td.ref', title: 'td.t', city: 'td.city', reserve_price: 'td.price', auction_date: 'td.date' }, constants: { source_bank: 'MSTC e2e' } },
+      },
+    });
+    const test = await api('POST', `/crawlers/sources/${src.id}/run?mode=test`, { token: A });
+    assert.equal(test.data.found, 2);
+    assert.equal((await api('POST', `/crawlers/sources/${src.id}/run`, { token: A })).status, 400, 'real run needs legal approval');
+
+    await api('PUT', `/crawlers/sources/${src.id}/legal-approval`, { token: A, body: { approved: true, notes: 'e2e' } });
+    const run = await api('POST', `/crawlers/sources/${src.id}/run`, { token: A });
+    assert.equal(run.data.summary.received, 2);
+    const again = await api('POST', `/crawlers/sources/${src.id}/run`, { token: A });
+    assert.equal(again.data.summary.skipped_existing, 2, 'already-seen records are skipped');
+
+    await api('PUT', `/crawlers/sources/${src.id}`, { token: A, body: { listUrl: `http://localhost:${port}/private/list` } });
+    const blocked = await api('POST', `/crawlers/sources/${src.id}/run`, { token: A });
+    assert.equal(blocked.status, 400);
+    assert.match(blocked.body.message, /robots\.txt/);
+
+    // Notice parsed from text, held for legal review.
+    const fd = new FormData();
+    fd.append('file', new Blob(['SALE NOTICE UNDER SARFAESI\nFlat in ' + CITY + '\nReserve Price: Rs. 1.2 Crore\nEMD: Rs. 12,00,000\nDate of e-Auction: 15-01-2028\nCall 9876543210'], { type: 'text/plain' }), 'notice.txt');
+    fd.append('legalReview', 'true');
+    fd.append('sourceName', `E2E notice ${RUN}`);
+    const parsed = await fetch(`${BASE}/crawlers/parse-notice`, { method: 'POST', headers: { authorization: `Bearer ${A}` }, body: fd }).then((r) => r.json());
+    assert.equal(parsed.data.parsed.reserve_price, 12000000);
+    assert.equal(parsed.data.parsed.emd_amount, 1200000);
+    const itemId = parsed.data.summary.items[0].id;
+    const item = await api('GET', `/opportunities/ingest/${itemId}`, { token: A });
+    assert.equal(item.data.requires_legal_review, true);
+    assert.ok(!JSON.stringify(item.data.normalised).includes('9876543210'), 'contact numbers never stored');
+    const early = await api('POST', `/opportunities/ingest/${itemId}/publish`, { token: A, body: { normalised: { title: `Notice flat ${RUN}`, property_type: 'apartment', city: CITY } } });
+    assert.equal(early.status, 400);
+    assert.match(early.body.message, /legal review/);
+    await api('POST', `/opportunities/ingest/${itemId}/legal-review`, { token: A, body: { notes: 'panel ok' } });
+    const published = await api('POST', `/opportunities/ingest/${itemId}/publish`, { token: A, body: { normalised: { title: `Notice flat ${RUN}`, property_type: 'apartment', city: CITY } } });
+    assert.equal(published.status, 201);
+
+    const health = await api('GET', '/crawlers/health', { token: A });
+    assert.ok(health.data.approved >= 1);
+    await api('PUT', `/crawlers/sources/${src.id}/legal-approval`, { token: A, body: { approved: false } });
+  } finally {
+    server.close();
+  }
+});
+
+// ------------------------------------ IRM, AI matching, deal advisory (Engine 3, Module 38)
+
+test('IRM: deal advisory, AI investor-deal matching both ways, tiers, curated ranking, rescore', async () => {
+  const A = ctx.admin.token;
+  const investor = await createUser('customer', 'irm');
+  const deal = (await pool.query(`SELECT id, city, listing_category FROM properties WHERE listing_category = 'auction' AND status = 'approved' ORDER BY created_at DESC LIMIT 1`)).rows[0];
+  const profile = await api('PUT', '/investors/me', {
+    token: investor.token,
+    body: { isHni: true, preferredCities: [deal.city], assetClassPreferences: ['auction'] },
+  });
+  await api('PUT', `/investors/${profile.data.id}/verify`, { token: A, body: { status: 'verified' } });
+
+  const detail = await api('GET', `/opportunities/${deal.id}`, { token: investor.token });
+  assert.ok(['value', 'balanced', 'higher_risk'].includes(detail.data.advisory.profile));
+  assert.ok(detail.data.advisory.structure.length > 0 && detail.data.advisory.checks.length > 0);
+  assert.ok(detail.data.my_match.score > 0 && detail.data.my_match.reasons.length > 0);
+  const teaser = await api('GET', `/opportunities/${deal.id}`);
+  assert.equal(teaser.data.advisory, undefined, 'advisory is for full-access users only');
+
+  const curated = await api('GET', '/hni/deals', { token: investor.token });
+  const scores = curated.data.items.map((d) => d.match_score);
+  assert.ok(scores.length > 0 && scores.every((s) => typeof s === 'number'));
+  assert.deepEqual(scores, [...scores].sort((a, b) => b - a), 'curated deals ranked by match');
+
+  const matched = await api('GET', `/opportunities/${deal.id}/matched-investors`, { token: ctx.sales.token });
+  assert.ok(matched.data.some((m) => m.investorProfileId === profile.data.id));
+  assert.equal((await api('GET', `/opportunities/${deal.id}/matched-investors`, { token: investor.token })).status, 403);
+
+  const irm = await api('GET', `/investors/${profile.data.id}/irm`, { token: ctx.sales.token });
+  assert.ok(['new', 'engaged', 'repeat', 'vip'].includes(irm.data.tier));
+  assert.ok(Array.isArray(irm.data.aiMatches));
+  const segments = await api('GET', '/investors/irm/segments', { token: ctx.sales.token });
+  assert.ok(segments.data.total >= 1 && segments.data.byTier);
+
+  assert.equal((await api('POST', '/opportunities/rescore-all', { token: ctx.sales.token })).status, 403);
+  const rescored = await api('POST', '/opportunities/rescore-all', { token: A });
+  assert.ok(rescored.data.rescored >= 1);
+});
+
+// ------------------------------------------- NRI / HNI onboarding (Screen 2), sec. 33 exemptions
+
+test('investor onboarding: RM introduced, HN code, HNI full CRM, investor-only onboarding, seller special situation', async () => {
+  const hni = await createUser('customer', 'onbhni');
+  const created = await api('PUT', '/investors/me', {
+    token: hni.token,
+    body: { isHni: true, countryOfResidence: 'India', propertyInterestTypes: ['invest', 'buy'] },
+  });
+  assert.equal(created.status, 200);
+  assert.deepEqual(created.data.property_interest_types, ['invest', 'buy']);
+  assert.ok(created.data.assigned_manager_id, 'relationship manager auto-assigned');
+  const notes = await pool.query(`SELECT type FROM notifications WHERE user_id = $1`, [hni.id]);
+  assert.ok(notes.rows.some((n) => n.type === 'investor_manager_assigned'));
+
+  const onboard = await api('PUT', '/me/profile', { token: hni.token, body: { portalRoles: [] } });
+  assert.equal(onboard.status, 200, 'investor can onboard without a buyer/seller role');
+  assert.ok(onboard.data.onboardedAt);
+  assert.equal(onboard.data.tier.current, 'full', 'HNI gets Full CRM from joining');
+  assert.equal(onboard.data.tier.exempt, true);
+  assert.match(onboard.data.referral.code, /^HN-/);
+  assert.equal(onboard.data.investor.isHni, true);
+
+  const plain = await createUser('customer', 'onbplain');
+  assert.equal((await api('PUT', '/me/profile', { token: plain.token, body: { portalRoles: [] } })).status, 400);
+
+  const listing = await api('POST', '/me/listings', {
+    token: plain.token,
+    body: {
+      title: `Urgent sale 3 BHK ${RUN}`, propertyType: 'apartment', transactionType: 'sell', price: '9000000',
+      city: CITY, locality: 'Sector 1', feeConsent: true, situationTags: ['urgent_sale', 'investor_exit'], estimatedMarketValue: 11000000,
+    },
+  });
+  assert.equal(listing.status, 201);
+  const row = (await pool.query('SELECT listing_category, opportunity_source_type, situation_tags, discount_percent FROM properties WHERE id = $1', [listing.data.id])).rows[0];
+  assert.equal(row.listing_category, 'special_situation');
+  assert.equal(row.opportunity_source_type, 'direct_seller');
+  assert.deepEqual(row.situation_tags, ['urgent_sale', 'investor_exit']);
+  assert.ok(Number(row.discount_percent) > 0);
+  assert.equal((await api('POST', '/me/listings', { token: plain.token, body: { title: 'Bad tag listing', propertyType: 'apartment', transactionType: 'sell', price: '100', city: CITY, locality: 'X', feeConsent: true, situationTags: ['distressed'] } })).status, 422);
+});
+
+// ------------------------------------------- Investor CRM workspace (sec. 13.2 / 13.2A)
+
+test('investor workspace: HNI gets Full CRM, lite customer locked, pipeline with SLA, activity, permanent upgrade', async () => {
+  const hni = await createUser('customer', 'wshni');
+  const profile = await api('PUT', '/investors/me', { token: hni.token, body: { isHni: true } });
+  await api('PUT', `/investors/${profile.data.id}/verify`, { token: ctx.admin.token, body: { status: 'verified' } });
+
+  const access = await api('GET', '/workspace/access', { token: hni.token });
+  assert.equal(access.data.eligible, true);
+  assert.equal(access.data.tier.exempt, true);
+  assert.ok(access.data.tier.fullSince);
+
+  const lite = await createUser('customer', 'wslite');
+  assert.equal((await api('GET', '/workspace/access', { token: lite.token })).data.eligible, false);
+  assert.equal((await api('GET', '/workspace/summary', { token: lite.token })).status, 403);
+  assert.equal((await api('GET', '/workspace/access', { token: ctx.sales.token })).data.eligible, false, 'staff use the main CRM');
+
+  const deal = (await pool.query(`SELECT id FROM properties WHERE listing_category = 'auction' AND status = 'approved' ORDER BY created_at DESC LIMIT 1`)).rows[0];
+  const interest = await api('POST', `/opportunities/${deal.id}/interest`, { token: hni.token, body: { intendedBidAmount: 12000000 } });
+  assert.ok([200, 201].includes(interest.status));
+  await api('PUT', `/opportunities/interests/${interest.data.id}/stage`, { token: ctx.admin.token, body: { stage: 'deal_interest', notes: 'Called investor' } });
+
+  const pipeline = await api('GET', '/workspace/pipeline', { token: hni.token });
+  const col = pipeline.data.columns.find((c) => c.stage === 'deal_interest');
+  const card = col.items.find((i) => i.id === interest.data.id);
+  assert.ok(card, 'deal is in the Deal Interest column');
+  assert.equal(card.sla.status, 'on_track');
+  assert.equal(card.sla.limitDays, 5);
+  assert.ok(card.history.some((h) => h.to_stage === 'deal_interest'));
+
+  const activity = await api('GET', '/workspace/activity', { token: hni.token });
+  assert.ok(activity.data.some((a) => a.kind === 'stage_change' && a.detail === 'lead>deal_interest'));
+  assert.ok(activity.data.some((a) => a.kind === 'deal_action' && a.detail === 'interest_expressed'));
+
+  const summary = await api('GET', '/workspace/summary', { token: hni.token });
+  assert.equal(summary.data.pipeline.byStage.deal_interest.count, 1);
+  assert.equal(summary.data.pipeline.active, 1);
+
+  // Downgrade never applies (sec. 13.2A).
+  await api('PUT', '/investors/me', { token: hni.token, body: { isHni: false, isNri: true } });
+  assert.equal((await api('GET', '/workspace/access', { token: hni.token })).data.eligible, true);
+});
+
+// ------------------------------------------ Matching engine + Requirement Marketplace (sec. 7, Engine 5)
+
+test('matching engine: binding weights, tiers, reverse matching, marketplace, send/share, digest, expiry, learning, A/B', async () => {
+  const A = ctx.admin.token;
+  const B = ctx.broker.token;
+  const MCITY = `Match City ${RUN}`;
+  const mk = async (over) => {
+    const r = await api('POST', '/properties', {
+      token: B,
+      body: { ...baseListing(), city: MCITY, locality: 'Beta Nagar', latitude: undefined, longitude: undefined, amenities: ['Gym', 'Pool'], ...over },
+    });
+    assert.equal(r.status, 201, JSON.stringify(r.body));
+    assert.equal((await api('PUT', `/properties/${r.data.id}/approve`, { token: A })).status, 200);
+    return r.data.id;
+  };
+  const hotId = await mk({ title: `Hot flat ${RUN}`, price: '1 Cr', areaSqft: 1500 });
+  // villa ~ apartment? no - villa is "similar" only to houses; use independent_house requirement below.
+  const warmId = await mk({ title: `Warm villa ${RUN}`, propertyType: 'villa', price: '1.38 Cr', areaSqft: 1500 });
+  const lukeId = await mk({ title: `Luke plot ${RUN}`, propertyType: 'plot', price: '1.38 Cr', areaSqft: 1500, amenities: ['Gym'] });
+  await new Promise((r) => setTimeout(r, 400));
+
+  const buyer = await createUser('customer', 'matchbuyer');
+  const req = await api('POST', '/me/requirements', {
+    token: buyer.token,
+    body: {
+      purpose: 'buy', propertyType: 'independent_house', city: MCITY, budgetMin: 8000000, budgetMax: 12000000,
+      areaMinSqft: 1200, areaMaxSqft: 1800, amenities: ['gym', 'pool'], urgency: 'immediate', feeConsent: true,
+    },
+  });
+  assert.equal(req.status, 201);
+  assert.ok(new Date(req.data.expires_at) > new Date(Date.now() + 59 * 86400000), '60-day validity');
+  // The hot listing is an apartment - make it the requested type so it is an exact 100.
+  await pool.query(`UPDATE properties SET property_type = 'independent_house' WHERE id = $1`, [hotId]);
+  await api('PUT', `/me/requirements/${req.data.id}`, { token: buyer.token, body: { urgency: 'immediate' } });
+  await new Promise((r) => setTimeout(r, 800));
+
+  const matches = await api('GET', '/me/matches', { token: buyer.token });
+  const byId = Object.fromEntries(matches.data.items.map((m) => [m.property.id, m]));
+  assert.equal(byId[hotId].score, 100);
+  assert.equal(byId[hotId].tier, 'hot');
+  assert.equal(byId[hotId].breakdown.location.weight, 30);
+  assert.equal(byId[hotId].breakdown.budget.weight, 25);
+  // villa: similar type 70%, 15% over budget -> 50%: 30 + 12.5 + 14 + 15 + 10 = 81.5
+  assert.equal(byId[warmId].tier, 'warm');
+  assert.equal(byId[warmId].breakdown.type.score, 70);
+  assert.equal(byId[warmId].breakdown.budget.score, 50);
+  assert.equal(byId[lukeId], undefined, 'Lukewarm is not shown unless sent');
+  assert.equal(matches.data.thresholds.hot, 90);
+
+  const buyerAlert = await pool.query(`SELECT 1 FROM notifications WHERE user_id = $1 AND type = 'match_alert' AND related_entity_id = $2`, [buyer.id, hotId]);
+  assert.equal(buyerAlert.rows.length, 1, 'buyer gets one instant Hot alert');
+  const brokerAlert = await pool.query(`SELECT 1 FROM notifications WHERE user_id = $1 AND type = 'match_alert_broker' AND related_entity_id = $2`, [ctx.broker.id, req.data.id]);
+  assert.equal(brokerAlert.rows.length, 1, 'reverse matching: listing broker alerted once');
+
+  // Marketplace - masked, best match vs the broker's listings.
+  const market = await api('GET', `/matching/marketplace?city=${encodeURIComponent(MCITY)}`, { token: B });
+  const row = market.data.find((r) => r.id === req.data.id);
+  assert.ok(row && row.hot && row.bestMatchWithMyListings.score === 100);
+  assert.equal(row.customer_id, undefined);
+  assert.equal((await api('GET', '/matching/marketplace', { token: buyer.token })).status, 403);
+
+  // Broker sends the Lukewarm plot; below-threshold listing refused.
+  const sent = await api('POST', `/matching/requirements/${req.data.id}/send`, { token: B, body: { propertyId: lukeId } });
+  assert.equal(sent.data.tier, 'lukewarm');
+  const farId = await mk({ title: `Far plot ${RUN}`, propertyType: 'plot', city: `Elsewhere ${RUN}`, price: '9 Cr', amenities: [] });
+  assert.equal((await api('POST', `/matching/requirements/${req.data.id}/send`, { token: B, body: { propertyId: farId } })).status, 400);
+  const after = await api('GET', '/me/matches', { token: buyer.token });
+  assert.ok(after.data.items.find((m) => m.property.id === lukeId)?.sentByRepresentative);
+
+  // Lead view + matched buyers for a listing.
+  const leadMatches = await api('GET', `/matching/leads/${req.data.lead_id}`, { token: B });
+  assert.equal(leadMatches.data.items[0].property.id, hotId);
+  const buyers = await api('GET', `/matching/listings/${hotId}/buyers`, { token: B });
+  assert.ok(buyers.data.some((b) => b.requirement.id === req.data.id && b.priceCompatible === undefined), 'price-compatible flag hidden from brokers');
+  assert.ok((await api('GET', `/matching/listings/${hotId}/buyers`, { token: A })).data.some((b) => b.priceCompatible === false));
+
+  // Mandate-verification routing.
+  const partner = await createUser('broker', 'partner');
+  const share = await api('POST', `/matching/requirements/${req.data.id}/share`, { token: B, body: { brokerId: partner.id } });
+  assert.equal(share.data.status, 'pending');
+  assert.equal((await api('PUT', `/matching/shares/${share.data.id}`, { token: partner.token, body: { action: 'accept' } })).data.status, 'accepted');
+  const shared = await api('GET', '/matching/marketplace?sharedOnly=true', { token: partner.token });
+  assert.ok(shared.data.some((r) => r.id === req.data.id && r.sharedWithMe === 'accepted'));
+
+  // Card badges + click event.
+  const scores = await api('GET', `/me/match-scores?ids=${hotId},${warmId}`, { token: buyer.token });
+  assert.equal(scores.data[hotId].score, 100);
+  assert.equal((await api('POST', '/me/match-events', { token: buyer.token, body: { propertyId: hotId, event: 'clicked' } })).data.recorded, 1);
+
+  // Daily Warm digest.
+  await api('POST', '/matching/jobs/digest', { token: A });
+  const digest = await pool.query(`SELECT message FROM notifications WHERE user_id = $1 AND type = 'match_digest'`, [buyer.id]);
+  assert.ok(digest.rows.length === 1 && digest.rows[0].message.includes('Warm villa'));
+
+  // Expiry: warning, then expiry (paused, non-sent matches dropped), then renewal.
+  await pool.query(`UPDATE requirements SET expires_at = now() + interval '1 day' WHERE id = $1`, [req.data.id]);
+  await api('POST', '/matching/jobs/expiry', { token: A });
+  assert.equal((await pool.query(`SELECT 1 FROM notifications WHERE user_id = $1 AND type = 'requirement_expiring'`, [buyer.id])).rows.length, 1);
+  await pool.query(`UPDATE requirements SET expires_at = now() - interval '1 minute' WHERE id = $1`, [req.data.id]);
+  await api('POST', '/matching/jobs/expiry', { token: A });
+  const expired = (await pool.query('SELECT status, expired_at FROM requirements WHERE id = $1', [req.data.id])).rows[0];
+  assert.equal(expired.status, 'paused');
+  assert.ok(expired.expired_at);
+  const left = await pool.query('SELECT property_id FROM requirement_matches WHERE requirement_id = $1', [req.data.id]);
+  assert.deepEqual(left.rows.map((r) => r.property_id), [lukeId], 'only the broker-sent match survives expiry');
+  const renewed = await api('POST', `/me/requirements/${req.data.id}/renew`, { token: buyer.token });
+  assert.equal(renewed.data.status, 'active');
+  assert.equal(renewed.data.renewal_count, 1);
+
+  // AI learning: not enough data -> no change; with data -> bounded, normalised weights.
+  const before = await api('POST', '/matching/jobs/learn', { token: A });
+  if (!before.data.learned) assert.match(before.data.reason, /Need/);
+  const bd = (loc, bud) => JSON.stringify({ location: { score: loc }, budget: { score: bud }, type: { score: 100 }, area: { score: 100 }, amenities: { score: 100 } });
+  for (let i = 0; i < 60; i += 1) {
+    await pool.query(`INSERT INTO match_events (requirement_id, property_id, event, variant, breakdown, event_date) VALUES ($1, $2, 'shown', 'A', $3, CURRENT_DATE - $4::int)`, [req.data.id, hotId, bd(50, 100), i + 1]);
+    await pool.query(`INSERT INTO match_events (requirement_id, property_id, event, variant, breakdown) VALUES ($1, $2, 'enquired', 'A', $3)`, [req.data.id, hotId, bd(100, 100)]);
+  }
+  const learned = await api('POST', '/matching/jobs/learn', { token: A });
+  assert.equal(learned.data.learned, true);
+  const w = learned.data.weights;
+  assert.ok(Math.abs(Object.values(w).reduce((a, b) => a + b, 0) - 100) < 0.5, 'weights sum to 100');
+  assert.ok(w.location > 30 && w.location <= 30 * 1.3 + 3, 'location gains weight, within the bound');
+  const overview = await api('GET', '/matching/overview', { token: A });
+  assert.ok(overview.data.learned);
+  const ab = await api('GET', '/matching/ab-report', { token: A });
+  assert.ok(ab.data.variants.A.shown >= 60 && ab.data.variants.B);
+  // Leave the engine on its binding weights for other tests / runs.
+  await pool.query(`UPDATE app_config SET value = 'null' WHERE config_key = 'matching.learned_weights'`);
+  await pool.query(`UPDATE app_config SET value = '{}' WHERE config_key = 'matching.pattern_boosts'`);
+  await pool.query('DELETE FROM match_events WHERE requirement_id = $1', [req.data.id]);
+});
+
+// ------------------------------------------------ Trust & Reputation (sec. 8, Engine 5)
+
+test('trust: verifications, score components, badges + warning/revocation, reviews with fraud filter, mandate bonus, awards', async () => {
+  const A = ctx.admin.token;
+  const S = ctx.sales.token;
+  const broker = await createUser('broker', 'trustbroker');
+  const TCITY = `Trust City ${RUN}`;
+
+  const fresh = await api('GET', '/trust/me', { token: broker.token });
+  assert.deepEqual(fresh.data.weights, { verification: 20, deals: 30, response: 20, ratings: 25, geo: 5 });
+  assert.ok(fresh.data.nextSteps.some((s) => /KYC/.test(s)));
+
+  // Verifications.
+  assert.equal((await api('POST', '/trust/verifications', { token: broker.token, body: { kind: 'gst', reference: 'NOTAGST' } })).status, 400);
+  const kyc = await api('POST', '/trust/verifications', { token: broker.token, body: { kind: 'kyc', reference: 'ABCDE1234F' } });
+  assert.equal(kyc.status, 201);
+  assert.equal(kyc.data.reference, '••••234F', 'only the last 4 characters of an ID are stored');
+  const rera = await api('POST', '/trust/verifications', { token: broker.token, body: { kind: 'rera', reference: `RERA-${RUN}` } });
+  const gst = await api('POST', '/trust/verifications', { token: broker.token, body: { kind: 'gst', reference: '29abcde1234f1z5' } });
+  assert.equal(gst.data.reference, '29ABCDE1234F1Z5');
+  assert.equal((await api('PUT', `/trust/verifications/${kyc.data.id}`, { token: broker.token, body: { action: 'verify' } })).status, 403);
+  assert.equal((await api('PUT', `/trust/verifications/${kyc.data.id}`, { token: S, body: { action: 'reject' } })).status, 400, 'reason required');
+  for (const v of [kyc, rera, gst]) await api('PUT', `/trust/verifications/${v.data.id}`, { token: S, body: { action: 'verify' } });
+  await pool.query(`UPDATE users SET mobile_verified = true, profile_picture_url = 'x.jpg' WHERE id = $1`, [broker.id]);
+
+  // Two closed deals + a live geo-located listing in a region.
+  const custUser = await createUser('customer', 'trustbuyer');
+  await api('GET', '/me/profile', { token: custUser.token });
+  const cust = (await pool.query('SELECT id FROM customers WHERE user_id = $1', [custUser.id])).rows[0].id;
+  const listing = await api('POST', '/properties', { token: broker.token, body: { ...baseListing(), title: `Trust flat ${RUN}`, city: TCITY } });
+  await api('PUT', `/properties/${listing.data.id}/approve`, { token: A });
+  const lastQuarter = new Date(new Date().getFullYear(), Math.floor(new Date().getMonth() / 3) * 3 - 1, 15);
+  const d1 = (await pool.query(`INSERT INTO deals (customer_id, broker_id, property_id, stage, deal_value, closed_at) VALUES ($1, $2, $3, 'closed_won', 20000000, $4) RETURNING id`, [cust, broker.id, listing.data.id, lastQuarter])).rows[0].id;
+  await pool.query(`INSERT INTO deals (customer_id, broker_id, stage, deal_value, closed_at) VALUES ($1, $2, 'closed_won', 9000000, $3)`, [cust, broker.id, lastQuarter]);
+
+  const t = await api('GET', '/trust/me?refresh=true', { token: broker.token });
+  assert.equal(t.data.components.verification.score, 100);
+  assert.equal(t.data.components.geo.score, 100);
+  assert.equal(t.data.inputs.deals, 2);
+  const keys = t.data.badges.map((b) => b.badge_key);
+  assert.ok(keys.includes('verified_user') && keys.includes('verified_broker'), JSON.stringify(keys));
+  const earned = await pool.query(`SELECT 1 FROM notifications WHERE user_id = $1 AND type = 'trust_badge' AND title LIKE '%Verified Broker%'`, [broker.id]);
+  assert.equal(earned.rows.length, 1);
+
+  // Reviews: only after a verified interaction; contact details blocked.
+  const stranger = await createUser('customer', 'trustnobody');
+  assert.equal((await api('POST', '/trust/reviews', { token: stranger.token, body: { dealId: d1, subject: 'broker', rating: 5 } })).status, 403);
+  const eligible = await api('GET', '/trust/reviews/eligible', { token: custUser.token });
+  const item = eligible.data.find((e) => e.dealId === d1 && e.subject === 'broker');
+  assert.ok(item && !item.userId, 'subject identity not exposed');
+  assert.equal((await api('POST', '/trust/reviews', { token: custUser.token, body: { dealId: d1, subject: 'broker', rating: 5, body: 'Call me on 9876543210' } })).status, 422);
+  const text = `Very smooth purchase, the representative handled paperwork and negotiation well ${RUN}`;
+  const review = await api('POST', '/trust/reviews', { token: custUser.token, body: { dealId: d1, subject: 'broker', rating: 5, title: 'Great', body: text } });
+  assert.equal(review.status, 201);
+  assert.equal(review.data.status, 'published');
+  assert.equal((await api('POST', '/trust/reviews', { token: custUser.token, body: { dealId: d1, subject: 'broker', rating: 4 } })).status, 400, 'one review per interaction');
+
+  // Copy-paste review from a brand-new account -> moderation.
+  const cust2User = await createUser('customer', 'trustcopy');
+  await api('GET', '/me/profile', { token: cust2User.token });
+  const cust2 = (await pool.query('SELECT id FROM customers WHERE user_id = $1', [cust2User.id])).rows[0].id;
+  const d3 = (await pool.query(`INSERT INTO deals (customer_id, broker_id, stage, closed_at) VALUES ($1, $2, 'closed_won', now()) RETURNING id`, [cust2, broker.id])).rows[0].id;
+  const copied = await api('POST', '/trust/reviews', { token: cust2User.token, body: { dealId: d3, subject: 'broker', rating: 5, body: text } });
+  assert.equal(copied.data.status, 'pending_moderation');
+  const queue = await api('GET', '/trust/reviews/moderation', { token: S });
+  const q = queue.data.find((r) => r.id === copied.data.id);
+  assert.ok(q.fraudScore >= 40 && q.fraudReasons.some((r) => /Same text/.test(r)));
+  assert.equal((await api('PUT', `/trust/reviews/${copied.data.id}/moderate`, { token: S, body: { action: 'reject' } })).status, 403, 'admins moderate');
+  await api('PUT', `/trust/reviews/${copied.data.id}/moderate`, { token: A, body: { action: 'reject', note: 'Duplicate text' } });
+
+  // Reply once; report goes to the queue.
+  assert.equal((await api('POST', `/trust/reviews/${review.data.id}/reply`, { token: broker.token, body: { reply: 'Thank you!' } })).data.reply, 'Thank you!');
+  assert.equal((await api('POST', `/trust/reviews/${review.data.id}/reply`, { token: broker.token, body: { reply: 'Again' } })).status, 404);
+  await api('POST', `/trust/reviews/${review.data.id}/report`, { token: broker.token, body: { reason: 'testing the report flow' } });
+  assert.ok((await api('GET', '/trust/reviews/moderation', { token: S })).data.some((r) => r.id === review.data.id));
+  await api('PUT', `/trust/reviews/${review.data.id}/moderate`, { token: A, body: { action: 'approve' } });
+
+  const withReview = await api('GET', '/trust/me?refresh=true', { token: broker.token });
+  assert.equal(withReview.data.inputs.reviews, 1);
+  assert.ok(withReview.data.components.ratings.score > 62, 'a 5-star review lifts the Bayesian rating');
+
+  // Public trust card - no identity.
+  const card = await api('GET', `/trust/public/listings/${listing.data.id}`);
+  assert.equal(card.data.listerType, 'broker');
+  assert.ok(card.data.badges.some((b) => b.key === 'verified_broker'));
+  assert.equal(card.data.reviews[0].reply, 'Thank you!');
+  assert.equal(JSON.stringify(card.data).includes(broker.email), false);
+  const search = await api('GET', `/search/properties?city=${encodeURIComponent(TCITY)}`);
+  assert.ok(search.data.items[0].lister_trust.badges.includes('verified_broker'));
+
+  // Exclusive Mandate: badge + one-time +5 bonus; badge goes at once when the mandate ends, bonus stays.
+  await api('PUT', `/properties/${listing.data.id}`, { token: A, body: { mandateType: 'exclusive' } });
+  const mandated = await api('GET', '/trust/me?refresh=true', { token: broker.token });
+  assert.ok(mandated.data.badges.some((b) => b.badge_key === 'exclusive_mandate'));
+  assert.equal(mandated.data.inputs.mandateBonus, 5);
+  await api('PUT', `/properties/${listing.data.id}`, { token: A, body: { mandateType: 'standard' } });
+  const ended = await api('GET', '/trust/me?refresh=true', { token: broker.token });
+  assert.ok(!ended.data.badges.some((b) => b.badge_key === 'exclusive_mandate'));
+  assert.equal(ended.data.inputs.mandateBonus, 5);
+
+  // Criteria lapse -> warning -> revoked after 7 days.
+  await api('PUT', `/trust/verifications/${rera.data.id}`, { token: S, body: { action: 'reject', notes: 'Registration expired' } });
+  const warned = await api('GET', '/trust/me?refresh=true', { token: broker.token });
+  assert.equal(warned.data.badges.find((b) => b.badge_key === 'verified_broker').status, 'warning');
+  await pool.query(`UPDATE user_badges SET warning_at = now() - interval '8 days' WHERE user_id = $1 AND badge_key = 'verified_broker'`, [broker.id]);
+  const revoked = await api('GET', '/trust/me?refresh=true', { token: broker.token });
+  assert.ok(!revoked.data.badges.some((b) => b.badge_key === 'verified_broker'));
+
+  // Best Broker for last quarter in the broker's region + shareable image.
+  const best = await api('POST', '/trust/jobs/best_quarter', { token: A });
+  assert.ok(best.data.awarded >= 1);
+  const trophy = (await pool.query(`SELECT id, region, meta FROM user_badges WHERE user_id = $1 AND badge_key = 'best_broker'`, [broker.id])).rows[0];
+  assert.equal(trophy.region, TCITY);
+  assert.equal(trophy.meta.deals, 2);
+  const img = await fetch(`${BASE}/trust/badges/${trophy.id}/image.svg`);
+  assert.equal(img.headers.get('content-type'), 'image/svg+xml; charset=utf-8');
+  assert.match(await img.text(), /Best Broker/);
+  assert.equal((await api('POST', '/trust/jobs/featured', { token: A })).status, 200);
+
+  const board = await api('GET', `/trust/leaderboard?region=${encodeURIComponent(TCITY)}`, { token: S });
+  assert.equal(board.data[0].user_id, broker.id);
+});
+
+// ------------------------------------ Verification, duplicates & fraud scoring (sec. 9, Module 19)
+
+test('fraud: L1-L4 verification, 4-layer duplicates + resolution/routing, risk bands + actions, appeal, suspension, image scan', async () => {
+  const A = ctx.admin.token;
+  const S = ctx.sales.token;
+  const FCITY = `Fraud City ${RUN}`;
+  const mk = (over) => ({
+    title: `Sunny flat ${RUN} ${Math.random().toString(36).slice(2, 7)}`,
+    description: `Well kept home near the park, ${Math.random().toString(36).slice(2)} ${Math.random().toString(36).slice(2)} good light and ventilation`,
+    propertyType: 'apartment', transactionType: 'sell', price: '60 Lakh', city: FCITY, locality: 'Gamma Nagar',
+    address: `Tower ${Math.floor(Math.random() * 900)}, Street ${Math.floor(Math.random() * 900)}`,
+    latitude: 17.5 + Math.random() / 10, longitude: 78.4 + Math.random() / 10, areaSqft: 1200, bedrooms: 2, ...over,
+  });
+  const brokerA = await createUser('broker', 'fraudA');
+  const brokerB = await createUser('broker', 'fraudB');
+  const brokerC = await createUser('broker', 'fraudC');
+  await pool.query(`UPDATE users SET mobile_verified = true WHERE id = ANY($1::uuid[])`, [[brokerA.id, brokerB.id]]);
+
+  // Green -> live instantly; L1 needs 3 images.
+  const green = await api('POST', '/properties', { token: brokerA.token, body: mk({ title: `Green home ${RUN}`, address: `Plot 12, Sector 9, ${RUN}`, latitude: 17.44, longitude: 78.35, bedrooms: 3 }) });
+  assert.equal(green.status, 201, JSON.stringify(green.body));
+  assert.equal(green.data.status, 'approved');
+  assert.equal(green.data.fraud_band, 'green');
+  assert.equal(green.data.verification_level, 0, 'L1 needs 3 photos');
+  for (let i = 0; i < 3; i += 1) {
+    // Random 64-bit fingerprints - unrelated to any other listing's photos.
+    const fp = BigInt.asIntN(64, BigInt(`0x${crypto.randomBytes(8).toString('hex')}`)).toString();
+    await pool.query(`INSERT INTO property_media (property_id, url, phash, scan_status) VALUES ($1, $2, $3, 'clean')`, [green.data.id, `https://img.example/${RUN}-${i}.jpg`, fp]);
+  }
+  const l1 = await api('POST', `/fraud/listings/${green.data.id}/assess`, { token: S });
+  assert.equal(l1.data.verificationLevel, 1);
+  assert.ok(Object.values(l1.data.systemChecks).every(Boolean));
+
+  // Duplicate, same lister, same address -> blocked; update existing merges + closes it.
+  const dupSame = await api('POST', '/properties', { token: brokerA.token, body: mk({ title: `Green home again ${RUN}`, address: `Plot 12, Sector 9, ${RUN}`, latitude: 17.44001, longitude: 78.35001, bedrooms: 3, price: '58 Lakh' }) });
+  assert.equal(dupSame.data.status, 'pending_approval');
+  assert.equal(dupSame.data.duplicate_status, 'blocked');
+  assert.equal(dupSame.data.duplicate_of, green.data.id, 'first valid timestamp wins');
+  assert.ok((await pool.query(`SELECT 1 FROM notifications WHERE user_id = $1 AND type = 'duplicate_listing'`, [brokerA.id])).rows.length);
+  const merged = await api('POST', `/fraud/listings/${dupSame.data.id}/duplicate-resolution`, { token: brokerA.token, body: { action: 'update_existing' } });
+  assert.equal(merged.data.merged, true);
+  const orig = (await pool.query('SELECT status, price_value FROM properties WHERE id = $1', [green.data.id])).rows[0];
+  assert.equal(orig.status, 'approved');
+  assert.equal(Number(orig.price_value), 5800000, 'newer info merged into the original');
+
+  // Different lister, identical text -> blocked; routing request -> accepted -> partners 50/50.
+  const g = (await pool.query('SELECT title, description FROM properties WHERE id = $1', [green.data.id])).rows[0];
+  const copy = await api('POST', '/properties', { token: brokerB.token, body: mk({ title: g.title, description: g.description, city: FCITY }) });
+  assert.equal(copy.data.duplicate_status, 'blocked');
+  assert.equal((await api('POST', `/fraud/listings/${copy.data.id}/duplicate-resolution`, { token: brokerA.token, body: { action: 'cancel' } })).status, 403, 'only the lister resolves');
+  await api('POST', `/fraud/listings/${copy.data.id}/duplicate-resolution`, { token: brokerB.token, body: { action: 'request_routing', note: 'I also hold this mandate' } });
+  const routing = await api('GET', '/fraud/routing', { token: brokerA.token });
+  const rr = routing.data.find((r) => r.property_id === copy.data.id);
+  assert.equal((await api('PUT', `/fraud/routing/${rr.id}`, { token: brokerB.token, body: { action: 'accept' } })).status, 403);
+  await api('PUT', `/fraud/routing/${rr.id}`, { token: brokerA.token, body: { action: 'accept' } });
+  const partners = await pool.query('SELECT partner_user_id, split_percent FROM property_partners WHERE property_id = $1 ORDER BY split_percent', [green.data.id]);
+  assert.equal(partners.rows.length, 2);
+  assert.equal((await pool.query('SELECT status FROM properties WHERE id = $1', [copy.data.id])).rows[0].status, 'inactive');
+
+  // Different lister, same spot + similar price, different text -> flagged, live under review.
+  const flagged = await api('POST', '/properties', { token: brokerB.token, body: mk({ address: `Plot 12, Sector 9, ${RUN}`, latitude: 17.44002, longitude: 78.35002, bedrooms: 3, price: '59 Lakh' }) });
+  assert.equal(flagged.data.status, 'approved');
+  assert.equal(flagged.data.duplicate_status, 'flagged');
+  assert.equal(flagged.data.under_review, true);
+  assert.ok(flagged.data.fraud_factors.some((f) => f.key === 'behaviour_anomaly'));
+
+  // Red: suspicious payment (+40) + unverified mobile (+10) -> held + lister told.
+  const red = await api('POST', '/properties', { token: brokerC.token, body: mk({ description: `Nice home. Pay advance via crypto to reserve ${RUN} today only` }) });
+  assert.equal(red.data.fraud_band, 'red');
+  assert.equal(red.data.status, 'pending_approval');
+  assert.ok(red.data.fraud_factors.some((f) => f.key === 'suspicious_payment'));
+  assert.ok((await pool.query(`SELECT 1 FROM notifications WHERE user_id = $1 AND type = 'listing_held'`, [brokerC.id])).rows.length);
+  const queue = await api('GET', '/fraud/queue', { token: S });
+  assert.ok(queue.data.listings.some((l) => l.id === red.data.id && l.review_due_at));
+  assert.equal((await api('GET', '/fraud/queue', { token: brokerA.token })).status, 403);
+  const lister = await api('GET', `/fraud/listings/${red.data.id}`, { token: brokerC.token });
+  assert.equal(lister.data.fraud.score, undefined, 'score + factors are staff-only');
+
+  // Critical: stolen photos (+20 duplicate, +50 stolen) on top -> auto-rejected, flagged, admins told; appeal -> uphold.
+  const phash = (await pool.query('SELECT phash FROM property_media WHERE property_id = $1 LIMIT 1', [green.data.id])).rows[0].phash;
+  await pool.query(`INSERT INTO property_media (property_id, url, phash, scan_status) VALUES ($1, 'https://img.example/stolen.jpg', $2, 'clean')`, [red.data.id, phash]);
+  const crit = await api('POST', `/fraud/listings/${red.data.id}/assess`, { token: S });
+  assert.equal(crit.data.band, 'critical');
+  assert.equal(crit.data.action, 'auto_rejected');
+  assert.ok(crit.data.factors.some((f) => f.key === 'stolen_content'));
+  assert.ok((await pool.query(`SELECT 1 FROM user_flags WHERE user_id = $1 AND reason = 'critical_listing'`, [brokerC.id])).rows.length);
+  assert.ok((await pool.query(`SELECT 1 FROM notifications WHERE user_id = $1 AND type = 'fraud_alert'`, [ctx.admin.id])).rows.length);
+  const appeal = await api('POST', `/fraud/listings/${red.data.id}/appeal`, { token: brokerC.token, body: { reason: 'These are my own photos; I shot them at the site.' } });
+  assert.equal(appeal.status, 201);
+  assert.equal((await api('PUT', `/fraud/appeals/${appeal.data.id}`, { token: S, body: { decision: 'uphold' } })).status, 403, 'admins decide appeals');
+  await api('PUT', `/fraud/appeals/${appeal.data.id}`, { token: A, body: { decision: 'uphold', note: 'Photos verified' } });
+  assert.equal((await pool.query('SELECT status FROM properties WHERE id = $1', [red.data.id])).rows[0].status, 'approved');
+
+  // Repeat critical rejections -> suspension.
+  await pool.query(`INSERT INTO user_flags (user_id, reason) VALUES ($1, 'critical_listing'), ($1, 'critical_listing')`, [brokerC.id]);
+  const again = await api('POST', '/properties', { token: brokerC.token, body: mk({ description: `Pay advance via crypto now ${RUN} ${Math.random()}` }) });
+  await pool.query(`INSERT INTO property_media (property_id, url, phash, scan_status) VALUES ($1, 'https://img.example/stolen2.jpg', $2, 'clean')`, [again.data.id, phash]);
+  const suspended = await api('POST', `/fraud/listings/${again.data.id}/assess`, { token: S });
+  assert.equal(suspended.data.action, 'auto_rejected_and_suspended');
+  assert.equal((await pool.query('SELECT status FROM users WHERE id = $1', [brokerC.id])).rows[0].status, 'suspended');
+  await pool.query(`UPDATE users SET status = 'active' WHERE id = $1`, [brokerC.id]);
+
+  // Staff clears a flagged listing.
+  await api('PUT', `/fraud/listings/${flagged.data.id}/review`, { token: S, body: { action: 'clear' } });
+  assert.equal((await pool.query('SELECT under_review FROM properties WHERE id = $1', [flagged.data.id])).rows[0].under_review, false);
+  assert.equal((await api('PUT', `/fraud/listings/${flagged.data.id}/review`, { token: S, body: { action: 'reject' } })).status, 400, 'reason required');
+
+  // L2 Seller Verified: all checks required; L3 auto-requested above Rs 1 Cr.
+  await api('POST', `/fraud/listings/${green.data.id}/verifications`, { token: brokerA.token, body: { level: 2, note: 'Sale deed uploaded' } });
+  const partial = await api('PUT', `/fraud/listings/${green.data.id}/verifications/2`, { token: S, body: { status: 'verified', checks: { ownership_proof: true } } });
+  assert.equal(partial.status, 400);
+  const l2 = await api('PUT', `/fraud/listings/${green.data.id}/verifications/2`, {
+    token: S,
+    body: { status: 'verified', checks: { ownership_proof: true, id_verified: true, callback_done: true, photos_recent: true } },
+  });
+  assert.equal(l2.data.verificationLevel, 2);
+  const g2 = (await pool.query('SELECT verification_level, is_verified FROM properties WHERE id = $1', [green.data.id])).rows[0];
+  assert.deepEqual(g2, { verification_level: 2, is_verified: true });
+  const pricey = await api('POST', '/properties', { token: brokerA.token, body: mk({ price: '2.4 Cr' }) });
+  const l3 = await pool.query(`SELECT status, auto_requested FROM property_verifications WHERE property_id = $1 AND level = 3`, [pricey.data.id]);
+  assert.deepEqual(l3.rows[0], { status: 'requested', auto_requested: true });
+  const search = await api('GET', `/search/properties?city=${encodeURIComponent(FCITY)}`);
+  assert.equal(search.data.items[0].verification_level, 2, 'Seller Verified ranks first (+15 boost)');
+
+  // Image scan: visiting-card shape flagged (heuristic without AI), photo fingerprinted.
+  const { Jimp } = require('jimp');
+  const scan = async (w, h) => {
+    const buf = await new Jimp({ width: w, height: h, color: 0x3366ccff }).getBuffer('image/jpeg');
+    const form = new FormData();
+    form.append('file', new Blob([buf], { type: 'image/jpeg' }), 'x.jpg');
+    const res = await fetch(`${BASE}/fraud/scan-image`, { method: 'POST', headers: { Authorization: `Bearer ${S}` }, body: form });
+    return (await res.json()).data;
+  };
+  const card = await scan(900, 520);
+  assert.equal(card.width, 900);
+  assert.match(card.phash, /^-?\d+$/);
+  if (!card.scan.ai) assert.equal(card.scan.status, 'flagged');
+  assert.equal((await scan(800, 800)).scan.status === 'blocked', false);
+});
+
+// ---------------------------- Due diligence, document repository, disputes & lead conflicts (Engine 5, sec. 9.6)
+
+test('due diligence + disputes: checklist, AI/rule classification, title chain, encumbrance, visibility, NRI, cases, lead conflicts', async () => {
+  const A = ctx.admin.token;
+  const S = ctx.sales.token;
+  const DCITY = `DD City ${RUN}`;
+  const brokerA = await createUser('broker', 'ddA');
+  const brokerB = await createUser('broker', 'ddB');
+  await pool.query(`UPDATE users SET mobile_verified = true WHERE id = ANY($1::uuid[])`, [[brokerA.id, brokerB.id]]);
+  const listing = await api('POST', '/properties', {
+    token: brokerA.token,
+    body: { ...baseListing(), title: `DD flat ${RUN}`, description: `Resale home for due diligence ${RUN}`, city: DCITY, price: '80 Lakh', possessionStatus: 'Ready to move' },
+  });
+  const P = listing.data.id;
+
+  // Empty report -> checklist with missing required documents.
+  const empty = await api('GET', `/due-diligence/properties/${P}`, { token: brokerA.token });
+  assert.equal(empty.data.status, 'not_started');
+  const types = empty.data.checklist.map((c) => c.type);
+  assert.ok(['sale_deed', 'encumbrance_certificate', 'occupancy_certificate', 'id_proof'].every((t) => types.includes(t)));
+  assert.ok(empty.data.missing.length >= 5);
+  assert.equal((await api('GET', `/due-diligence/properties/${P}`, { token: brokerB.token })).status, 403, 'no relationship, no access');
+
+  // Classifier on a generated PDF (rules without an AI key).
+  // Minimal uncompressed PDF (the shape scanners / Word exports produce).
+  const makePdf = (lines) => {
+    const stream = `BT /F1 11 Tf 40 780 Td 14 TL ${lines.map((l) => `(${l}) '`).join(' ')} ET`;
+    const objs = [
+      '<< /Type /Catalog /Pages 2 0 R >>',
+      '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+      '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 842] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>',
+      `<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`,
+      '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+    ];
+    let out = '%PDF-1.4\n';
+    const offsets = [];
+    objs.forEach((o, i) => {
+      offsets.push(out.length);
+      out += `${i + 1} 0 obj\n${o}\nendobj\n`;
+    });
+    const xref = out.length;
+    out += `xref\n0 ${objs.length + 1}\n0000000000 65535 f \n${offsets.map((o) => `${String(o).padStart(10, '0')} 00000 n \n`).join('')}`;
+    out += `trailer\n<< /Size ${objs.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`;
+    return Buffer.from(out, 'latin1');
+  };
+  const deedPdf = makePdf(['SALE DEED', 'This deed of sale is executed on 12-03-2001 between the vendor and the purchaser.', 'The property is subject to an equitable mortgage with the bank.', 'Signature of executant and witness.']);
+  const form = new FormData();
+  form.append('file', new Blob([deedPdf], { type: 'application/pdf' }), 'deed.pdf');
+  const analysed = await (await fetch(`${BASE}/due-diligence/analyse`, { method: 'POST', headers: { Authorization: `Bearer ${S}` }, body: form })).json();
+  assert.equal(analysed.data.type, 'sale_deed');
+  assert.ok(analysed.data.extracted.dates.includes('2001-03-12'));
+  assert.ok(analysed.data.flags.some((f) => f.category === 'encumbrance'));
+
+  // Documents with role visibility; EC showing a charge and no bank NOC -> issues.
+  const add = (body, token = brokerA.token) => api('POST', `/due-diligence/properties/${P}/documents`, { token, body });
+  await add({ documentType: 'sale_deed', documentUrl: `documents/properties/${P}/deed.pdf`, visibleTo: ['owner', 'broker', 'buyer'] });
+  const ec = await add({ documentType: 'encumbrance_certificate', documentUrl: `documents/properties/${P}/ec.pdf` });
+  await pool.query(`UPDATE documents SET ai_flags = $1 WHERE id = $2`, [JSON.stringify([{ category: 'encumbrance', severity: 'medium', detail: 'Mortgage to bank shown' }]), ec.data.id]);
+  assert.equal((await add({ documentType: 'tax_receipt', documentUrl: 'x' }, brokerB.token)).status, 403);
+  const withDocs = await api('GET', `/due-diligence/properties/${P}`, { token: brokerA.token });
+  assert.equal(withDocs.data.encumbrance.status, 'charged');
+  assert.ok(withDocs.data.checklist.some((c) => c.type === 'bank_noc' && c.required && !c.present), 'loan needs a bank NOC');
+  assert.equal(withDocs.data.status, 'issues');
+  assert.ok(withDocs.data.riskFlags.some((f) => /bank NOC/.test(f.detail)));
+
+  // Title chain from staff-entered links: 30+ years with a break.
+  await api('POST', `/due-diligence/properties/${P}/title-links`, { token: S, body: { date: '1994-01-10', from: 'Anil Sharma', to: 'Bina Verma' } });
+  const chained = await api('POST', `/due-diligence/properties/${P}/title-links`, { token: S, body: { date: '2010-05-20', from: 'Chetan Gupta', to: 'Current Owner' } });
+  assert.ok(chained.data.titleChain.years >= 30);
+  assert.equal(chained.data.titleChain.gaps.length, 1);
+  assert.equal((await api('POST', `/due-diligence/properties/${P}/title-links`, { token: brokerA.token, body: { date: '2000-01-01' } })).status, 403);
+
+  // Buyer at negotiation sees only buyer-visible documents.
+  const buyerUser = await createUser('customer', 'ddbuyer');
+  await api('GET', '/me/profile', { token: buyerUser.token });
+  const buyerCust = (await pool.query('SELECT id FROM customers WHERE user_id = $1', [buyerUser.id])).rows[0].id;
+  await pool.query(`INSERT INTO deals (customer_id, broker_id, property_id, stage) VALUES ($1, $2, $3, 'negotiation')`, [buyerCust, brokerA.id, P]);
+  const buyerDocs = await api('GET', `/due-diligence/properties/${P}/documents`, { token: buyerUser.token });
+  assert.deepEqual(buyerDocs.data.roles, ['buyer']);
+  assert.deepEqual(buyerDocs.data.documents.map((d) => d.document_type), ['sale_deed']);
+  await api('PUT', `/due-diligence/documents/${ec.data.id}/review`, { token: S, body: { status: 'rejected', notes: 'Illegible' } });
+  const afterReject = await api('GET', `/due-diligence/properties/${P}`, { token: S });
+  assert.ok(afterReject.data.checklist.find((c) => c.type === 'encumbrance_certificate').present === false, 'rejected documents do not count');
+
+  // NRI seller -> considerations + power-of-attorney item.
+  const nriSeller = await createUser('customer', 'ddnri');
+  await api('PUT', '/investors/me', { token: nriSeller.token, body: { isNri: true, countryOfResidence: 'United Arab Emirates' } });
+  const nriListing = await api('POST', '/me/listings', {
+    token: nriSeller.token,
+    body: { title: `NRI owned flat ${RUN}`, propertyType: 'apartment', transactionType: 'sell', price: '95 Lakh', city: DCITY, locality: 'Delta', feeConsent: true },
+  });
+  const nriReport = await api('GET', `/due-diligence/properties/${nriListing.data.id}`, { token: nriSeller.token });
+  assert.equal(nriReport.data.nri.seller, true);
+  assert.ok(nriReport.data.nri.points.some((p) => /Section 195/.test(p)));
+  assert.ok(nriReport.data.checklist.some((c) => c.type === 'power_of_attorney'));
+
+  // Disputes: open, respond, internal note hidden, awaiting info, reconstruct, resolve; timeline append-only.
+  const dispute = await api('POST', '/disputes', {
+    token: brokerA.token,
+    body: { type: 'broker_dispute', title: `Commission claim ${RUN}`, description: 'Broker B claims my client after I did the site visit.', againstUserId: brokerB.id, propertyId: P },
+  });
+  assert.equal(dispute.status, 201);
+  assert.match(dispute.data.case_number, /^DSP-\d{4}-\d{5}$/);
+  const due = (new Date(dispute.data.sla_due_at) - Date.now()) / 3600000;
+  assert.ok(due > 47 && due <= 48, '48-hour SLA');
+  const D = dispute.data.id;
+  assert.ok((await pool.query(`SELECT 1 FROM notifications WHERE user_id = $1 AND type = 'dispute'`, [brokerB.id])).rows.length);
+  assert.equal((await api('GET', `/disputes/${D}`, { token: (await createUser('broker', 'ddC')).token })).status, 403);
+  await api('POST', `/disputes/${D}/comments`, { token: brokerB.token, body: { body: 'I introduced the buyer first.' } });
+  await api('POST', `/disputes/${D}/comments`, { token: S, body: { body: 'Check call logs', internal: true } });
+  assert.ok(!(await api('GET', `/disputes/${D}`, { token: brokerA.token })).data.timeline.some((e) => e.visibility === 'internal'));
+  assert.ok((await api('GET', `/disputes/${D}`, { token: S })).data.timeline.some((e) => e.visibility === 'internal'));
+  await api('PUT', `/disputes/${D}`, { token: S, body: { status: 'awaiting_info', note: 'Share visit proof' } });
+  await api('POST', `/disputes/${D}/comments`, { token: brokerA.token, body: { body: 'Visit was on the 5th.' } });
+  assert.equal((await api('GET', `/disputes/${D}`, { token: S })).data.status, 'under_review');
+  const trail = await api('GET', `/disputes/${D}/reconstruction`, { token: S });
+  assert.ok(trail.data.events.some((e) => e.source === 'audit') && trail.data.events.some((e) => e.source === 'case'));
+  assert.equal((await api('POST', `/disputes/${D}/resolve`, { token: S, body: { decision: 'resolve', resolution: 'x' } })).status, 403);
+  const closed = await api('POST', `/disputes/${D}/resolve`, { token: A, body: { decision: 'resolve', resolution: 'Broker A did the visit; 60/40 split.', inFavourOf: brokerA.id, outcome: { split: { A: 60, B: 40 } } } });
+  assert.equal(closed.data.status, 'resolved');
+  await assert.rejects(pool.query('DELETE FROM dispute_events WHERE dispute_id = $1', [D]), /append-only/);
+  const trustB = await api('GET', '/trust/me?refresh=true', { token: brokerB.token });
+  assert.equal(trustB.data.inputs.disputes.total, 1);
+
+  // Overdue escalation.
+  const late = await api('POST', '/disputes', { token: brokerB.token, body: { type: 'fake_claim', title: `Fake claim ${RUN}`, description: 'This listing claims amenities that do not exist.', propertyId: P } });
+  await pool.query(`UPDATE disputes SET sla_due_at = now() - interval '1 hour' WHERE id = $1`, [late.data.id]);
+  const esc = await require('../src/services/dispute.service').escalateOverdue();
+  assert.ok(esc.escalated >= 1);
+  assert.equal((await api('GET', `/disputes/${late.data.id}`, { token: S })).data.priority, 'high');
+
+  // Lead conflicts: same phone in two brokers' CRMs.
+  const mobile = `9${String(parseInt(RUN, 16) % 1e9).padStart(9, '0')}`;
+  const mkCustomer = async (name) => (await pool.query(`INSERT INTO customers (full_name, mobile) VALUES ($1, $2) RETURNING id`, [name, mobile])).rows[0].id;
+  const leadA = await api('POST', '/leads', { token: brokerA.token, body: { customerId: await mkCustomer(`Ravi Kumar ${RUN}`), source: 'manual', propertyId: P, assignedTo: brokerA.id } });
+  assert.equal(leadA.status, 201, JSON.stringify(leadA.body));
+  await pool.query(`INSERT INTO lead_notes (lead_id, user_id, note) VALUES ($1, $2, 'Called the buyer')`, [leadA.data.id, brokerA.id]);
+  await new Promise((r) => setTimeout(r, 20));
+  const leadB = await api('POST', '/leads', { token: brokerB.token, body: { customerId: await mkCustomer(`Ravi K ${RUN}`), source: 'manual', assignedTo: brokerB.id } });
+  const conflicts = await api('GET', '/disputes/lead-conflicts', { token: brokerB.token });
+  const lc = conflicts.data.find((c) => c.later_lead_id === leadB.data.id);
+  assert.ok(lc && lc.i_am_later && lc.first_broker_id === brokerA.id);
+  assert.equal(lc.customer_name, 'Ravi', 'brokers see only the first name');
+  assert.ok((await pool.query(`SELECT 1 FROM notifications WHERE user_id = $1 AND type = 'lead_conflict'`, [brokerA.id])).rows.length);
+  assert.equal((await api('PUT', `/disputes/lead-conflicts/${lc.id}`, { token: brokerB.token, body: { action: 'different_property', propertyId: P } })).status, 400, 'first broker already works that property');
+  const attribution = await api('GET', `/disputes/lead-conflicts/${lc.id}/attribution`, { token: brokerB.token });
+  assert.equal(attribution.data.steps[0].by.startsWith('ddA'), true, 'first contact credited to the first broker');
+  await api('PUT', `/disputes/lead-conflicts/${lc.id}`, { token: brokerB.token, body: { action: 'request_routing' } });
+  assert.equal((await api('PUT', `/disputes/lead-conflicts/${lc.id}`, { token: brokerB.token, body: { action: 'accept_routing' } })).status, 403);
+  const routed = await api('PUT', `/disputes/lead-conflicts/${lc.id}`, { token: brokerA.token, body: { action: 'accept_routing' } });
+  assert.equal(routed.data.resolution, 'mandate_routing');
+
+  // A third broker transfers; a fourth escalates -> dispute -> admin decides.
+  const brokerC = await createUser('broker', 'ddLateC');
+  const leadC = await api('POST', '/leads', { token: brokerC.token, body: { customerId: await mkCustomer(`Ravi ${RUN}`), source: 'manual', assignedTo: brokerC.id } });
+  const lcC = (await api('GET', '/disputes/lead-conflicts', { token: brokerC.token })).data.find((c) => c.later_lead_id === leadC.data.id);
+  await api('PUT', `/disputes/lead-conflicts/${lcC.id}`, { token: brokerC.token, body: { action: 'transfer' } });
+  assert.equal((await pool.query('SELECT assigned_to FROM leads WHERE id = $1', [leadC.data.id])).rows[0].assigned_to, brokerA.id);
+  const brokerE = await createUser('broker', 'ddLateE');
+  const leadE = await api('POST', '/leads', { token: brokerE.token, body: { customerId: await mkCustomer(`R Kumar ${RUN}`), source: 'manual', assignedTo: brokerE.id } });
+  const lcE = (await api('GET', '/disputes/lead-conflicts', { token: brokerE.token })).data.find((c) => c.later_lead_id === leadE.data.id);
+  const escalated = await api('POST', `/disputes/lead-conflicts/${lcE.id}/escalate`, { token: brokerE.token, body: { reason: 'I met the buyer first offline.' } });
+  assert.equal(escalated.data.type, 'lead_conflict');
+  await api('POST', `/disputes/${escalated.data.id}/resolve`, { token: A, body: { decision: 'resolve', resolution: 'First broker keeps the buyer per the activity log.', inFavourOf: brokerA.id } });
+  const lcEAfter = (await pool.query('SELECT status, resolution FROM lead_conflicts WHERE id = $1', [lcE.id])).rows[0];
+  assert.deepEqual(lcEAfter, { status: 'resolved', resolution: 'admin_decided' });
+});
+
+test('orchestration + invoices + intelligence + reputation: gating, auto-advance, SLA, health, Instalment 1/2, GST/IGST, network score', async () => {
+  const A = ctx.admin.token;
+  const S = ctx.sales.token;
+  const OCITY = `Orch City ${RUN}`;
+  const broker = await createUser('broker', 'orchB');
+  await pool.query(`UPDATE users SET mobile_verified = true WHERE id = $1`, [broker.id]);
+  const listing = await api('POST', '/properties', { token: broker.token, body: { ...baseListing(), title: `Orch flat ${RUN}`, city: OCITY, price: '1 Cr' } });
+  const P = listing.data.id;
+  const buyer = await createUser('customer', 'orchbuyer');
+  await api('GET', '/me/profile', { token: buyer.token });
+  const buyerCust = (await pool.query('SELECT id FROM customers WHERE user_id = $1', [buyer.id])).rows[0].id;
+  const deal = await api('POST', '/deals', { token: S, body: { customerId: buyerCust, propertyId: P, brokerId: broker.id } });
+  assert.equal(deal.status, 201, JSON.stringify(deal.body));
+  const D = deal.data.id;
+  const view = () => api('GET', `/orchestration/deals/${D}`, { token: broker.token });
+  const evaluate = () => api('POST', `/orchestration/deals/${D}/evaluate`, { token: S });
+
+  // Dependency enforcement: no visit, no site_visit stage; broker cannot override.
+  const blocked = await api('PUT', `/deals/${D}/stage`, { token: broker.token, body: { stage: 'site_visit' } });
+  assert.equal(blocked.status, 400);
+  assert.match(blocked.body.message, /site visit/i);
+  assert.equal((await api('PUT', `/deals/${D}/stage`, { token: broker.token, body: { stage: 'site_visit', override: true, notes: 'x' } })).status, 403);
+  const v0 = await view();
+  assert.equal(v0.data.next, 'site_visit');
+  assert.equal(v0.data.nextRequirements[0].met, false);
+
+  // Auto-advance: visit scheduled -> site_visit; completed -> negotiation; value -> booking.
+  const visit = await api('POST', `/deals/${D}/site-visit`, { token: broker.token, body: { scheduledAt: new Date(Date.now() + 86400000).toISOString() } });
+  assert.equal((await evaluate()).data.stage, 'site_visit');
+  await api('PUT', `/deals/${D}/site-visit/${visit.data.id}`, { token: broker.token, body: { status: 'completed', actualVisitAt: new Date().toISOString() } });
+  assert.equal((await evaluate()).data.stage, 'negotiation');
+  await api('PUT', `/deals/${D}`, { token: broker.token, body: { dealValue: 10000000 } });
+  const booked = await evaluate();
+  assert.equal(booked.data.stage, 'booking');
+  assert.equal(booked.data.next, 'documentation');
+
+  // Execution dates: no Sale Deed before ATS, no future dates.
+  const today = new Date().toISOString().slice(0, 10);
+  assert.equal((await api('PUT', `/orchestration/deals/${D}/dates`, { token: broker.token, body: { saleDeedExecutionDate: today } })).status, 400);
+  assert.equal((await api('PUT', `/orchestration/deals/${D}/dates`, { token: broker.token, body: { atsExecutionDate: '2999-01-01' } })).status, 400);
+  const ats = await api('PUT', `/orchestration/deals/${D}/dates`, { token: broker.token, body: { atsExecutionDate: today } });
+  assert.equal(ats.status, 200, JSON.stringify(ats.body));
+  assert.equal(ats.data.stage, 'documentation');
+  let invoices = (await api('GET', `/orchestration/invoices?dealId=${D}`, { token: S })).data;
+  const inv1 = invoices.find((i) => i.kind === 'instalment_1');
+  assert.ok(inv1, 'Instalment 1 raised on ATS execution');
+  assert.equal(Number(inv1.fee_amount), 50000, '50% of 1% of 1 Cr');
+  assert.equal(inv1.gst_type, 'cgst_sgst');
+  assert.equal(Number(inv1.cgst_amount), 4500);
+  assert.equal(Number(inv1.sgst_amount), 4500);
+  assert.equal(Number(inv1.total_amount), 59000);
+  assert.equal(inv1.gstin, '07DERPR1574G2ZY');
+  assert.match(inv1.invoice_number, /^ARB\/\d{4}-\d{2}\/\d{6}$/);
+  assert.equal(Math.round((new Date(inv1.due_date) - new Date(today)) / 86400000), 7, 'net 7');
+  assert.ok((await pool.query(`SELECT 1 FROM notifications WHERE user_id = $1 AND type = 'invoice'`, [buyer.id])).rows.length, 'buyer notified');
+
+  // Signed agreement approved -> payment.
+  const doc = (await pool.query(`INSERT INTO documents (deal_id, customer_id, document_type, document_url, uploaded_by) VALUES ($1, $2, 'agreement_to_sell', 'documents/x/ats.pdf', $3) RETURNING id`, [D, buyerCust, broker.id])).rows[0];
+  await api('PUT', `/due-diligence/documents/${doc.id}/review`, { token: S, body: { status: 'approved' } });
+  assert.equal((await evaluate()).data.stage, 'payment');
+
+  // Sale Deed -> Instalment 2; closing waits for both instalments to be paid.
+  await api('PUT', `/orchestration/deals/${D}/dates`, { token: broker.token, body: { saleDeedExecutionDate: today } });
+  invoices = (await api('GET', `/orchestration/invoices?dealId=${D}`, { token: S })).data;
+  const inv2 = invoices.find((i) => i.kind === 'instalment_2');
+  assert.ok(inv2 && /Sub-Registrar/.test(inv2.note));
+  assert.equal((await view()).data.stage, 'payment');
+  assert.equal((await api('PUT', `/deals/${D}/close`, { token: broker.token, body: { outcome: 'won' } })).status, 400, 'cannot close with fees unpaid');
+  assert.equal((await api('POST', `/orchestration/invoices/${inv1.id}/payment`, { token: broker.token, body: { reference: 'UTR1' } })).status, 403);
+  await api('POST', `/orchestration/invoices/${inv1.id}/payment`, { token: S, body: { reference: 'UTR1' } });
+  assert.equal((await view()).data.stage, 'payment');
+  const paid = await api('POST', `/orchestration/invoices/${inv2.id}/payment`, { token: S, body: { reference: 'UTR2' } });
+  assert.equal(paid.data.stage, 'closed_won', 'auto-closed once everything is paid');
+  const events = (await pool.query(`SELECT kind FROM orchestration_events WHERE deal_id = $1`, [D])).rows.map((r) => r.kind);
+  assert.ok(events.filter((k) => k === 'auto_advance').length >= 6);
+  await assert.rejects(pool.query('DELETE FROM orchestration_events WHERE deal_id = $1', [D]), /append-only/);
+
+  // PDF + visibility: buyer sees own invoices and my-deals; another broker cannot.
+  const pdf = await fetch(`${BASE}/orchestration/invoices/${inv1.id}/pdf`, { headers: { authorization: `Bearer ${buyer.token}` } });
+  assert.equal(pdf.headers.get('content-type'), 'application/pdf');
+  assert.equal(Buffer.from(await pdf.arrayBuffer()).subarray(0, 4).toString(), '%PDF');
+  const other = await createUser('broker', 'orchOther');
+  assert.equal((await api('GET', `/orchestration/invoices/${inv1.id}/pdf`, { token: other.token })).status, 404);
+  assert.equal((await api('GET', `/orchestration/deals/${D}`, { token: other.token })).status, 403);
+  const myDeals = await api('GET', '/orchestration/my-deals', { token: buyer.token });
+  assert.equal(myDeals.data[0].stage, 'closed_won');
+  assert.equal(myDeals.data[0].invoices.length, 2);
+
+  // NRI buyer -> IGST 18%; admin override with a logged reason.
+  const nri = await createUser('customer', 'orchnri');
+  await api('PUT', '/investors/me', { token: nri.token, body: { isNri: true, countryOfResidence: 'Singapore' } });
+  await api('GET', '/me/profile', { token: nri.token });
+  const nriCust = (await pool.query('SELECT id FROM customers WHERE user_id = $1', [nri.id])).rows[0].id;
+  const D2 = (await api('POST', '/deals', { token: S, body: { customerId: nriCust, propertyId: P, brokerId: broker.id, dealValue: 20000000 } })).data.id;
+  assert.equal((await api('PUT', `/deals/${D2}/stage`, { token: A, body: { stage: 'site_visit', override: true } })).status, 400, 'override needs a reason');
+  const over = await api('PUT', `/deals/${D2}/stage`, { token: A, body: { stage: 'site_visit', override: true, notes: 'Visit done offline, proof on file' } });
+  assert.equal(over.status, 200);
+  assert.ok((await pool.query(`SELECT 1 FROM orchestration_events WHERE deal_id = $1 AND kind = 'override'`, [D2])).rows.length);
+  await api('PUT', `/orchestration/deals/${D2}/dates`, { token: S, body: { atsExecutionDate: today } });
+  const nriInv = (await api('GET', `/orchestration/invoices?dealId=${D2}`, { token: S })).data[0];
+  assert.equal(nriInv.gst_type, 'igst');
+  assert.equal(Number(nriInv.igst_amount), 18000);
+  assert.equal(Number(nriInv.cgst_amount), 0);
+
+  // SLA delay alert (once per stage), overdue invoice, health score.
+  const orch = require('../src/services/orchestration.service');
+  await pool.query(`UPDATE deals SET stage_entered_at = now() - interval '40 days' WHERE id = $1`, [D2]);
+  await pool.query(`UPDATE invoices SET due_date = CURRENT_DATE - 2 WHERE id = $1`, [nriInv.id]);
+  assert.ok((await orch.slaSweep()).alerted >= 1);
+  assert.ok((await pool.query(`SELECT 1 FROM notifications WHERE user_id = $1 AND type = 'deal_sla' AND related_entity_id = $2`, [broker.id, D2])).rows.length);
+  const again = await orch.slaSweep();
+  assert.equal((await pool.query(`SELECT COUNT(*)::int AS n FROM orchestration_events WHERE deal_id = $1 AND kind = 'sla_alert'`, [D2])).rows[0].n, 1, `alert once (${again.alerted})`);
+  assert.ok((await orch.invoiceSweep()).overdue >= 1);
+  assert.equal((await pool.query('SELECT status FROM invoices WHERE id = $1', [nriInv.id])).rows[0].status, 'overdue');
+  assert.ok((await pool.query(`SELECT 1 FROM notifications WHERE user_id = $1 AND type = 'invoice_overdue'`, [nri.id])).rows.length);
+  const health = (await api('GET', `/orchestration/deals/${D2}`, { token: S })).data.health;
+  assert.ok(health.score < 70 && ['at_risk', 'critical'].includes(health.band), JSON.stringify(health));
+  assert.ok(health.factors.some((f) => /SLA/.test(f.label)) && health.factors.some((f) => /invoice/i.test(f.label)));
+
+  // Deal intelligence.
+  const intel = await api('GET', '/orchestration/intelligence', { token: S });
+  assert.equal(intel.data.scope, 'all');
+  assert.ok(intel.data.funnel.find((f) => f.stage === 'closed_won').reached >= 1);
+  assert.ok(intel.data.conversion.byCity.some((c) => c.key === OCITY && c.won >= 1));
+  assert.ok(intel.data.atRisk.some((d) => d.id === D2));
+  assert.ok(intel.data.recommendations.some((r) => r.dealId === D2));
+  const mine = await api('GET', '/orchestration/intelligence', { token: broker.token });
+  assert.equal(mine.data.scope, 'mine');
+  assert.equal(mine.data.conversion.byBroker.length, 0);
+  assert.equal((await api('GET', '/orchestration/intelligence', { token: buyer.token })).status, 403);
+
+  // Reputation graph: vouch + co-listing lift R1 by a bounded amount; shared-IP pair excluded.
+  const [r1, r2, r3, r4] = [await createUser('broker', 'rep1'), await createUser('broker', 'rep2'), await createUser('broker', 'rep3'), await createUser('broker', 'rep4')];
+  await pool.query(`UPDATE users SET created_at = now() - interval '90 days' WHERE id = ANY($1::uuid[])`, [[r1.id, r2.id, r3.id, r4.id]]);
+  for (const u of [r2, r3, r4]) {
+    await pool.query(`INSERT INTO trust_scores (user_id, score) VALUES ($1, 90) ON CONFLICT (user_id) DO UPDATE SET score = 90`, [u.id]);
+  }
+  assert.equal((await api('POST', '/reputation/vouch', { token: r1.token, body: { userId: r1.id } })).status, 400, 'no self vouch');
+  assert.equal((await api('POST', '/reputation/vouch', { token: r1.token, body: { userId: r2.id } })).status, 403, 'low-trust brokers cannot vouch');
+  const vouch = await api('POST', '/reputation/vouch', { token: r2.token, body: { userId: r1.id, note: 'Closed deals with them' } });
+  assert.equal(vouch.status, 201);
+  assert.equal((await api('POST', '/reputation/vouch', { token: r2.token, body: { userId: r1.id } })).status, 400, 'one live vouch per pair');
+  const r3Prop = (await pool.query(`INSERT INTO properties (created_by, title, property_type, transaction_type, city, price) VALUES ($1, $2, 'apartment', 'sell', $3, '50 Lakh') RETURNING id`, [r3.id, `Rep co-listing ${RUN}`, OCITY])).rows[0].id;
+  await pool.query(`INSERT INTO property_partners (property_id, partner_user_id, split_percent) VALUES ($1, $2, 50)`, [r3Prop, r1.id]);
+  const r4Prop = (await pool.query(`INSERT INTO properties (created_by, title, property_type, transaction_type, city, price) VALUES ($1, $2, 'apartment', 'sell', $3, '50 Lakh') RETURNING id`, [r4.id, `Rep sock ${RUN}`, OCITY])).rows[0].id;
+  await pool.query(`INSERT INTO property_partners (property_id, partner_user_id, split_percent) VALUES ($1, $2, 50)`, [r4Prop, r1.id]);
+  await pool.query(`INSERT INTO user_ips (user_id, ip) VALUES ($1, '203.0.113.77'), ($2, '203.0.113.77')`, [r1.id, r4.id]);
+  const rec = await api('POST', '/reputation/recompute', { token: A });
+  assert.equal(rec.status, 200, JSON.stringify(rec.body));
+  const rep = await api('GET', '/reputation/me', { token: r1.token });
+  assert.equal(rep.data.neighbours, 2, 'r2 (vouch) + r3 (co-listing); r4 excluded');
+  assert.ok(rep.data.adjustment > 0 && rep.data.adjustment <= 5, JSON.stringify(rep.data));
+  assert.ok(rep.data.excluded.some((e) => e.with === r4.id && e.reason === 'shared_ip'));
+  assert.equal(rep.data.received.length, 1);
+  const trust = await api('GET', '/trust/me?refresh=true', { token: r1.token });
+  assert.equal(trust.data.inputs.networkAdjustment, rep.data.adjustment);
+  const graph = await api('GET', '/reputation/graph', { token: r1.token });
+  assert.ok(graph.data.nodes.some((n) => n.id === r2.id) && graph.data.edges.length >= 2);
+  assert.ok(!graph.data.nodes.some((n) => n.id === r4.id));
+  assert.equal((await api('GET', '/reputation/graph?scope=global', { token: S })).status, 200);
+  assert.equal((await api('DELETE', `/reputation/vouch/${vouch.data.id}`, { token: r1.token })).status, 404, 'only the voucher revokes');
+  assert.equal((await api('DELETE', `/reputation/vouch/${vouch.data.id}`, { token: r2.token })).status, 200);
 });

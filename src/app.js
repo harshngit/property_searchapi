@@ -31,6 +31,15 @@ const bdLeadRoutes = require('./routes/bdLead.routes');
 const opportunityRoutes = require('./routes/opportunity.routes');
 const { investorRouter, nriRouter, hniRouter, toolsRouter } = require('./routes/investor.routes');
 const portalRoutes = require('./routes/portal.routes');
+const dealRoomRoutes = require('./routes/dealRoom.routes');
+const crawlerRoutes = require('./routes/crawler.routes');
+const workspaceRoutes = require('./routes/workspace.routes');
+const trustRoutes = require('./routes/trust.routes');
+const fraudRoutes = require('./routes/fraud.routes');
+const dueDiligenceRoutes = require('./routes/dueDiligence.routes');
+const disputeRoutes = require('./routes/dispute.routes');
+const orchestrationRoutes = require('./routes/orchestration.routes');
+const reputationRoutes = require('./routes/reputation.routes');
 const { notFoundHandler, errorHandler } = require('./middlewares/errorHandler');
 
 const app = express();
@@ -106,6 +115,15 @@ app.use('/api/nri', nriRouter);
 app.use('/api/hni', hniRouter);
 app.use('/api/tools', toolsRouter);
 app.use('/api/me', portalRoutes);
+app.use('/api/deal-room', dealRoomRoutes);
+app.use('/api/crawlers', crawlerRoutes);
+app.use('/api/workspace', workspaceRoutes);
+app.use('/api/trust', trustRoutes);
+app.use('/api/fraud', fraudRoutes);
+app.use('/api/due-diligence', dueDiligenceRoutes);
+app.use('/api/disputes', disputeRoutes);
+app.use('/api/orchestration', orchestrationRoutes);
+app.use('/api/reputation', reputationRoutes);
 
 // 404 + error handler (must be last)
 app.use(notFoundHandler);

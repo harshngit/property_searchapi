@@ -131,6 +131,8 @@ async function createLead(data, user) {
 
     await client.query('COMMIT');
     await sendAcknowledgement(lead.id, user);
+    // Sec. 9.6: same buyer already in another broker's CRM?
+    await require('./dispute.service').detectLeadConflict(lead.id);
     return getLeadById(lead.id);
   } catch (err) {
     await client.query('ROLLBACK');
@@ -190,6 +192,7 @@ async function createPublicInquiry(data) {
 
     await client.query('COMMIT');
     await sendAcknowledgement(lead.id, null);
+    if (propertyId) require('./matchEngine.service').recordEvent({ customerId: customer.id, propertyId, event: 'enquired' });
     return getLeadById(lead.id);
   } catch (err) {
     await client.query('ROLLBACK');
@@ -258,6 +261,7 @@ async function assignLead(id, assigneeId, user) {
     });
 
     await client.query('COMMIT');
+    await require('./dispute.service').detectLeadConflict(id);
     return getLeadById(id);
   } catch (err) {
     await client.query('ROLLBACK');

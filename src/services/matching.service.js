@@ -8,62 +8,11 @@ function notFound(message = 'Not found') {
 
 const TOP_N = 20;
 
-// Weighted relevance score (0-100): location match matters most, then
-// budget fit, then property/transaction type. Simple and tunable - not a
-// learned model, matches the brief's "simple relevance score" ask.
-function scoreProperty(property, preferences) {
-  const reasons = {};
-  let score = 0;
-
-  const locations = (preferences.preferred_locations || []).map((l) => l.toLowerCase());
-  const locationMatch =
-    locations.length > 0 &&
-    (locations.includes((property.city || '').toLowerCase()) ||
-      locations.includes((property.locality || '').toLowerCase()));
-  if (locationMatch) score += 40;
-  reasons.locationMatch = locationMatch;
-
-  // `property.price` is free text (e.g. "2.1 Cr", "Price on Request"), not
-  // guaranteed to parse as a number - skip budget scoring rather than
-  // silently comparing against NaN (which would always fail every check
-  // below and wrongly report every such listing as 'out_of_range').
-  const price = Number(property.price);
-  const budgetMin = preferences.budget_min != null ? Number(preferences.budget_min) : null;
-  const budgetMax = preferences.budget_max != null ? Number(preferences.budget_max) : null;
-  let budgetFit = 'unknown';
-  if (Number.isFinite(price) && (budgetMin != null || budgetMax != null)) {
-    const withinRange = (budgetMin == null || price >= budgetMin) && (budgetMax == null || price <= budgetMax);
-    if (withinRange) {
-      budgetFit = 'within_range';
-      score += 35;
-    } else {
-      // Partial credit for being close (within 20% of the nearer bound)
-      const nearBound = budgetMax != null && price > budgetMax ? budgetMax : budgetMin;
-      const withinTolerance = nearBound != null && Math.abs(price - nearBound) <= nearBound * 0.2;
-      if (withinTolerance) {
-        budgetFit = 'near_range';
-        score += 15;
-      } else {
-        budgetFit = 'out_of_range';
-      }
-    }
-  }
-  reasons.budgetFit = budgetFit;
-
-  const typeMatch = !preferences.property_type || preferences.property_type === property.property_type;
-  if (preferences.property_type) {
-    if (typeMatch) score += 15;
-    reasons.typeMatch = typeMatch;
-  }
-
-  const transactionMatch = !preferences.transaction_type || preferences.transaction_type === property.transaction_type;
-  if (preferences.transaction_type) {
-    if (transactionMatch) score += 10;
-    reasons.transactionMatch = transactionMatch;
-  }
-
-  return { score: Math.min(score, 100), reasons };
-}
+// Scoring is the platform Matching Engine (sec. 7 binding weights:
+// location 30, budget 25, type 20, area 15, amenities 10) applied to the
+// customer's saved preferences - the same engine behind the website's
+// requirement matches, so the CRM and the buyer see the same %.
+const matchEngine = require('./matchEngine.service');
 
 // Core matching run, shared by GET /properties/:customerId, POST /rerun,
 // and GET /recommendations/:leadId. `leadId` is null for the plain
@@ -102,9 +51,23 @@ async function runMatchingForCustomer(customerId, leadId = null) {
     params
   );
 
+  const settings = await matchEngine.settings();
+  const requirement = matchEngine.preferencesToRequirement(preferences, customerId);
+  if (!requirement.city) requirement.city = '';
+  const wantedTx = preferences.transaction_type === 'rent' ? ['rent'] : preferences.transaction_type ? ['sell', 'buy'] : null;
   const ranked = propertiesResult.rows
-    .map((property) => ({ property, ...scoreProperty(property, preferences) }))
-    .sort((a, b) => b.score - a.score)
+    .filter((property) => !wantedTx || wantedTx.includes(property.transaction_type))
+    .map((property) => {
+      const m = matchEngine.scoreOne(property, requirement, settings);
+      // No preferred city: location is neutral rather than a zero.
+      if (!requirement.city) {
+        m.breakdown.location = { score: 100, weight: m.breakdown.location.weight, detail: 'No preferred location' };
+        m.score = Math.round(Object.values(m.breakdown).reduce((sum, c) => sum + c.score * (c.weight / 100), 0));
+        m.rankScore = m.score + Object.values(m.boosts).reduce((a, b) => a + b, 0);
+      }
+      return { property, score: m.score, rankScore: m.rankScore, tier: m.tier, reasons: { tier: m.tier, breakdown: m.breakdown } };
+    })
+    .sort((a, b) => b.rankScore - a.rankScore)
     .slice(0, TOP_N);
 
   const client = await pool.connect();
@@ -125,7 +88,7 @@ async function runMatchingForCustomer(customerId, leadId = null) {
          VALUES ($1, $2, $3, $4, $5) RETURNING *`,
         [leadId, customerId, entry.property.id, entry.score, JSON.stringify(entry.reasons)]
       );
-      saved.push({ ...result.rows[0], property: entry.property });
+      saved.push({ ...result.rows[0], tier: entry.tier, property: entry.property });
     }
 
     await client.query('COMMIT');

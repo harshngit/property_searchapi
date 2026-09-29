@@ -69,21 +69,39 @@ async function getCuratedDeals(user, query) {
 
   const whereClause = `WHERE ${where.join(' AND ')}`;
   const count = await pool.query(`SELECT COUNT(*) FROM properties p ${whereClause}`, params);
-  params.push(limit, offset);
   const fullColumns = access.full
     ? `, p.source_bank, p.auction_reference_id, p.emd_amount, p.estimated_market_value, p.liquidity_score, p.score_breakdown`
     : '';
+  // With a profile, candidates are ranked by the AI investor-deal match
+  // (stated preferences + behaviour + deal quality) rather than raw score,
+  // so the page is sliced after ranking.
+  const rankByMatch = !!profile;
+  params.push(profile?.user_id || user.id);
+  const userParam = params.length;
+  if (rankByMatch) params.push(300, 0);
+  else params.push(limit, offset);
   const result = await pool.query(
     `SELECT ${opportunityService.TEASER_COLUMNS}, p.annual_appreciation_percent ${fullColumns},
-            (SELECT action FROM investor_deal_interactions i WHERE i.property_id = p.id AND i.user_id = $${params.length + 1}
+            (SELECT action FROM investor_deal_interactions i WHERE i.property_id = p.id AND i.user_id = $${userParam}
              AND i.action IN ('shortlisted', 'unshortlisted') ORDER BY i.created_at DESC LIMIT 1) = 'shortlisted' AS is_shortlisted
      FROM properties p ${whereClause}
      ORDER BY p.investment_score DESC NULLS LAST, p.created_at DESC
      LIMIT $${params.length - 1} OFFSET $${params.length}`,
-    [...params, profile?.user_id || user.id]
+    params
   );
 
-  const items = result.rows.map((row) => {
+  let rows = result.rows;
+  if (rankByMatch) {
+    const irm = require('./irm.service');
+    const behaviour = await irm.behaviourSummary(profile.user_id);
+    const w = await irm.weights();
+    rows = rows
+      .map((row) => ({ ...row, _match: irm.scoreMatch(profile, behaviour, row, w) }))
+      .sort((a, b) => b._match.score - a._match.score)
+      .slice(offset, offset + limit);
+  }
+
+  const items = rows.map((row) => {
     const teaser = opportunityService.toTeaser(row);
     const ask = Number(row.reserve_price ?? row.price_value) || null;
     const indicativeYield = row.yield_percent != null
@@ -94,6 +112,8 @@ async function getCuratedDeals(user, query) {
       title: teaser.title, // institutional names stay masked until NDA
       indicative_yield_percent: indicativeYield,
       is_shortlisted: !!row.is_shortlisted,
+      match_score: row._match ? row._match.score : null,
+      match_reasons: row._match ? row._match.reasons : [],
     };
   });
 

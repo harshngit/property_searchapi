@@ -55,6 +55,8 @@ const profileValidators = [
   body('investorCategory').optional().isIn(['individual', 'family_office', 'trust', 'pe_fund', 'corporate', 'education_group']),
   body('assetClassPreferences').optional().isArray(),
   body('assetClassPreferences.*').optional().isIn(ASSET_CLASSES),
+  body('propertyInterestTypes').optional().isArray(),
+  body('propertyInterestTypes.*').optional().isIn(['buy', 'sell', 'rent_out', 'manage', 'invest']),
   body('preferredCities').optional().isArray(),
   body('preferredPropertyTypes').optional().isArray(),
   body('ticketSizeMin').optional({ nullable: true }).isFloat({ min: 0 }),
@@ -63,6 +65,12 @@ const profileValidators = [
   body('investmentHorizonYears').optional().isInt({ min: 1, max: 50 }),
   body('institutionalInterest').optional().isBoolean(),
   body('alertsEnabled').optional().isBoolean(),
+  body('alertChannels').optional().isArray(),
+  body('alertChannels.*').optional().isIn(['in_app', 'whatsapp']),
+  body('alertMode').optional().isIn(['window', 'instant']),
+  body('alertMaxPerDay').optional({ nullable: true }).isInt({ min: 1, max: 50 }),
+  body('timeZone').optional().isString().isLength({ max: 50 }),
+  body('preferredContactWindow').optional().isString().isLength({ max: 50 }),
 ];
 
 /**
@@ -92,9 +100,13 @@ const profileValidators = [
  *               cityOfResidence: { type: string }
  *               timeZone: { type: string, example: Asia/Dubai }
  *               preferredContactWindow: { type: string }
+ *               alertChannels: { type: array, items: { type: string, enum: [in_app, whatsapp] }, description: Deal alert channels (in-app always on) }
+ *               alertMode: { type: string, enum: [window, instant], description: "window = non-priority alerts arrive in the daily 9:30-10:30 window in timeZone; priority alerts are always instant" }
+ *               alertMaxPerDay: { type: integer, description: Cap on non-priority deal alerts per day (fatigue control) }
  *               investorCategory: { type: string, enum: [individual, family_office, trust, pe_fund, corporate, education_group] }
  *               assetClassPreferences: { type: array, items: { type: string, enum: [residential, commercial, institutional, land, special_situation, auction, hospitality, other] } }
  *               preferredCities: { type: array, items: { type: string } }
+ *               propertyInterestTypes: { type: array, items: { type: string, enum: [buy, sell, rent_out, manage, invest] } }
  *               preferredPropertyTypes: { type: array, items: { type: string } }
  *               ticketSizeMin: { type: number }
  *               ticketSizeMax: { type: number }
@@ -129,6 +141,45 @@ investorRouter.get(
   [query('type').optional().isIn(['nri', 'hni']), query('verificationStatus').optional().isIn(['pending', 'verified', 'rejected']), query('managerId').optional().isUUID()],
   validate,
   investors.list
+);
+
+/**
+ * @swagger
+ * /investors/irm/segments:
+ *   get:
+ *     summary: "[Staff] IRM segmentation - investors by tier (new / engaged / repeat / vip), asset class, category, NRI / HNI"
+ *     tags: [Investors]
+ *     security: [{ bearerAuth: [] }]
+ *     responses: { 200: { description: "{ total, byTier, byAssetClass, byCategory, nri, hni, institutional, verified, tiers }" } }
+ */
+investorRouter.get(
+  '/irm/segments',
+  authenticate,
+  authorize(...STAFF_ROLES),
+  require('../utils/asyncHandler')(async (req, res) =>
+    require('../utils/response').success(res, 200, 'Investor segments fetched', await require('../services/irm.service').getSegments())
+  )
+);
+
+/**
+ * @swagger
+ * /investors/{id}/irm:
+ *   get:
+ *     summary: "[Staff] Investor relationship view - tier / repeat-investor status, stated vs engaged ticket size, deal history, deal rooms, alerts, portfolio and AI deal matches"
+ *     tags: [Investors]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters: [{ in: path, name: id, required: true, schema: { type: string, format: uuid } }]
+ *     responses: { 200: { description: IRM profile } }
+ */
+investorRouter.get(
+  '/:id/irm',
+  authenticate,
+  authorize(...STAFF_ROLES),
+  idParam,
+  validate,
+  require('../utils/asyncHandler')(async (req, res) =>
+    require('../utils/response').success(res, 200, 'Investor relationship profile fetched', await require('../services/irm.service').getIrmProfile(req.params.id))
+  )
 );
 
 /**

@@ -42,6 +42,10 @@ const listFilters = [
   query('minScore').optional().isInt({ min: 0, max: 100 }),
   query('minDiscount').optional().isFloat(),
   query('liquidityBand').optional().isIn(['high', 'moderate', 'low']),
+  query('situationTag').optional().isIn(['urgent_sale', 'financial_distress', 'investor_exit', 'time_bound_sale']),
+  query('possessionType').optional().isIn(['physical', 'symbolic', 'vacant', 'occupied', 'unknown']),
+  query('sourceType').optional().isString().isLength({ max: 40 }),
+  query('propertyType').optional().isString().isLength({ max: 40 }),
   query('page').optional().isInt({ min: 1 }),
   query('limit').optional().isInt({ min: 1, max: 100 }),
 ];
@@ -82,6 +86,7 @@ const listFilters = [
  *       - { in: query, name: minDiscount, schema: { type: number } }
  *       - { in: query, name: liquidityBand, schema: { type: string, enum: [high, moderate, low] } }
  *       - { in: query, name: situationTag, schema: { type: string, enum: [urgent_sale, financial_distress, investor_exit, time_bound_sale] } }
+ *       - { in: query, name: possessionType, schema: { type: string, enum: [physical, symbolic, vacant, occupied, unknown] } }
  *       - { in: query, name: includePast, schema: { type: boolean } }
  *       - { in: query, name: sort, schema: { type: string, enum: [score, discount, auction_date, price_asc, price_desc, newest] } }
  *     responses:
@@ -357,6 +362,118 @@ router.post(
  *       200: { description: Rejected }
  */
 router.post('/ingest/:id/reject', authenticate, authorize(...ADMIN_ROLES), [param('id').isUUID()], validate, opportunityController.reject);
+
+/**
+ * @swagger
+ * /opportunities/alerts:
+ *   get:
+ *     summary: Investor deal-alert queue and history - pending (waiting for the investor's window), sent, suppressed (daily cap / repeatedly dismissed) (staff)
+ *     tags: [Opportunities]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters:
+ *       - { in: query, name: status, schema: { type: string, enum: [pending, sent, suppressed] } }
+ *       - { in: query, name: propertyId, schema: { type: string, format: uuid } }
+ *     responses: { 200: { description: "{ items, last30Days }" } }
+ */
+router.get(
+  '/alerts',
+  authenticate,
+  authorize('internal_sales', ...ADMIN_ROLES),
+  [query('status').optional().isIn(['pending', 'sent', 'suppressed']), query('propertyId').optional().isUUID()],
+  validate,
+  require('../utils/asyncHandler')(async (req, res) =>
+    require('../utils/response').success(res, 200, 'Alerts fetched', await require('../services/investorAlert.service').listAlerts(req.query))
+  )
+);
+
+/**
+ * @swagger
+ * /opportunities/alerts/dispatch:
+ *   post:
+ *     summary: Deliver every pending alert that is due now (normally done by the background dispatcher every 5 minutes) (admin)
+ *     tags: [Opportunities]
+ *     security: [{ bearerAuth: [] }]
+ *     responses: { 200: { description: "{ due, sent, capped }" } }
+ */
+router.post(
+  '/alerts/dispatch',
+  authenticate,
+  authorize(...ADMIN_ROLES),
+  require('../utils/asyncHandler')(async (req, res) =>
+    require('../utils/response').success(res, 200, 'Due alerts dispatched', await require('../services/investorAlert.service').dispatchDue())
+  )
+);
+
+/**
+ * @swagger
+ * /opportunities/rescore-all:
+ *   post:
+ *     summary: Re-score every live deal (picks up the conversion-history learning adjustment; also runs daily) (admin)
+ *     tags: [Opportunities]
+ *     security: [{ bearerAuth: [] }]
+ *     responses: { 200: { description: "{ rescored }" } }
+ */
+router.post(
+  '/rescore-all',
+  authenticate,
+  authorize(...ADMIN_ROLES),
+  require('../utils/asyncHandler')(async (req, res) =>
+    require('../utils/response').success(res, 200, 'Deals rescored', await require('../services/opportunityScoring.service').rescoreAll())
+  )
+);
+
+/**
+ * @swagger
+ * /opportunities/{id}/matched-investors:
+ *   get:
+ *     summary: "[Staff] AI investor-deal matching - verified investors ranked by fit for this deal, with reasons"
+ *     tags: [Opportunities]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters:
+ *       - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+ *       - { in: query, name: limit, schema: { type: integer, default: 20 } }
+ *     responses: { 200: { description: Ranked investors } }
+ */
+router.get(
+  '/:id/matched-investors',
+  authenticate,
+  authorize(...STAFF_ROLES),
+  [param('id').isUUID(), query('limit').optional().isInt({ min: 1, max: 100 })],
+  validate,
+  require('../utils/asyncHandler')(async (req, res) =>
+    require('../utils/response').success(
+      res,
+      200,
+      'Matched investors fetched',
+      await require('../services/irm.service').matchInvestorsForDeal(req.params.id, { limit: Number(req.query.limit) || 20 })
+    )
+  )
+);
+
+/**
+ * @swagger
+ * /opportunities/ingest/{id}/legal-review:
+ *   post:
+ *     summary: Lawyer-panel sign-off for an item from a legal / newspaper notice (required before it can be published)
+ *     tags: [Opportunities]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters: [{ in: path, name: id, required: true, schema: { type: string, format: uuid } }]
+ *     requestBody:
+ *       content:
+ *         application/json:
+ *           schema: { type: object, properties: { notes: { type: string } } }
+ *     responses: { 200: { description: Queue item } }
+ */
+router.post(
+  '/ingest/:id/legal-review',
+  authenticate,
+  authorize(...ADMIN_ROLES),
+  [param('id').isUUID(), body('notes').optional().isString().isLength({ max: 1000 })],
+  validate,
+  require('../utils/asyncHandler')(async (req, res) =>
+    require('../utils/response').success(res, 200, 'Legal review recorded', await require('../services/opportunity.service').markLegalReviewed(req.params.id, req.body.notes, req.user))
+  )
+);
 
 /**
  * @swagger
