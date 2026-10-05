@@ -84,7 +84,17 @@ async function scoreOpportunity(property) {
   ]);
 
   const asking = toNumber(property.reserve_price) ?? toNumber(property.price_value);
-  const marketValue = toNumber(property.estimated_market_value);
+  // Staff-entered market value first; otherwise the crawled price benchmark
+  // for the area x the listing's area (Engine 6 base data).
+  let marketValue = toNumber(property.estimated_market_value);
+  let marketValueSource = marketValue ? 'entered' : null;
+  if (!marketValue) {
+    const est = await require('./market.service').estimateValue(property).catch(() => null);
+    if (est) {
+      marketValue = est.value;
+      marketValueSource = `market_benchmark_${est.scope}`;
+    }
+  }
   const discountPercent =
     asking !== null && marketValue ? Math.round(((marketValue - asking) / marketValue) * 10000) / 100 : null;
 
@@ -122,7 +132,7 @@ async function scoreOpportunity(property) {
     liquidityBand: liquidity.band,
     breakdown: {
       components,
-      inputs: { askingPrice: asking, estimatedMarketValue: marketValue, discountPercent, yieldPercent, riskCount },
+      inputs: { askingPrice: asking, estimatedMarketValue: marketValue, marketValueSource, discountPercent, yieldPercent, riskCount },
       liquidity: { score: liquidity.score, band: liquidity.band, scope: liquidity.scope },
       weights,
       ruleScore: Math.round(ruleScore),

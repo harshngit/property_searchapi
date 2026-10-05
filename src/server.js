@@ -32,4 +32,12 @@ app.listen(PORT, () => {
     require('./services/orchestration.service').startScheduler();
     require('./services/reputation.service').startScheduler();
   }
+  // Module 46: mandate expiry reminders (30 / 7 / 1 days) and expiry.
+  if (process.env.MANDATE_JOBS_DISABLED !== 'true') require('./services/mandate.service').startScheduler();
+  // Sec. 34: assignment cascade - missed windows, departed reps, response SLA.
+  if (process.env.ASSIGNMENT_JOBS_DISABLED !== 'true') require('./services/assignment.service').startScheduler();
+  // Engine 2: pull reconciliation for every push+pull / pull lead source.
+  if (process.env.INGESTION_JOBS_DISABLED !== 'true') require('./services/ingestion/ingestion.service').startScheduler();
+  // Module 48/49: event partitions, WARM digest / NURTURE summary, score recency.
+  if (process.env.EVENTS_JOBS_DISABLED !== 'true') require('./services/events.service').startScheduler();
 });

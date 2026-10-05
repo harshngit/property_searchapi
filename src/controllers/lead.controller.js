@@ -3,7 +3,7 @@ const { success } = require('../utils/response');
 const { assertOwnerOrAdmin, assertTenantVisible } = require('../utils/ownership');
 const { bulkDelete } = require('../utils/bulkDelete');
 
-const LEAD_OWNER_FIELDS = ['created_by', 'assigned_to'];
+const LEAD_OWNER_FIELDS = ['created_by', 'assigned_to', 'arb_rep_id'];
 
 async function deleteOneLead(id, actingUser) {
   const existing = await leadService.getLeadById(id);

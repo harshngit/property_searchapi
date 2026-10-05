@@ -231,10 +231,14 @@ function scoreOne(listing, req, s, weights = s.weights) {
   };
   const score = Math.round(COMPONENTS.reduce((sum, k) => sum + parts[k].value * (weights[k] / 100), 0));
   const breakdown = Object.fromEntries(COMPONENTS.map((k) => [k, { score: parts[k].value, weight: weights[k], detail: parts[k].detail }]));
+  // Module 46 Price-Compatible: buyer's confidential max budget >= seller's
+  // confidential minimum, both from active Exclusive Mandates (decrypted
+  // values ride on non-enumerable props - never serialised).
+  const sellerMin = num(listing._sellerMin);
+  const buyerMax = num(req._buyerMax);
   const priceCompatible =
     listing.mandate_type === 'exclusive' && req.mandate_type === 'exclusive' &&
-    num(listing.min_acceptable_price) != null && num(req.budget_max) != null &&
-    num(req.budget_max) >= num(listing.min_acceptable_price);
+    sellerMin != null && buyerMax != null && buyerMax >= sellerMin;
   const boosts = {
     mandate: listing.mandate_type === 'exclusive' ? s.mandateBoost : 0,
     priceCompatible: priceCompatible ? s.priceBoost : 0,
@@ -257,11 +261,15 @@ function scoreOne(listing, req, s, weights = s.weights) {
 
 const LISTING_COLUMNS = `p.id, p.title, p.property_type, p.transaction_type, p.listing_category, p.price, p.price_value,
   p.city, p.locality, p.latitude, p.longitude, p.area_sqft, p.carpet_area_sqft, p.bedrooms, p.bathrooms, p.amenities,
-  p.furnishing, p.is_verified, p.badge, p.tags, p.created_at, p.created_by, p.broker_id, p.mandate_type, p.min_acceptable_price,
+  p.furnishing, p.is_verified, p.badge, p.tags, p.created_at, p.created_by, p.broker_id, p.mandate_type,
+  (SELECT mm.seller_min_price_enc FROM mandates mm WHERE mm.listing_id = p.id AND mm.mandate_type = 'seller_exclusive' AND mm.status = 'active' ORDER BY mm.created_at DESC LIMIT 1) AS seller_min_enc,
   COALESCE((SELECT ts.search_boost + CASE WHEN ts.lead_priority THEN 5 ELSE 0 END FROM trust_scores ts
    WHERE ts.user_id = COALESCE(p.broker_id, p.created_by)), 0)
    + COALESCE((SELECT (ac.value->>(p.verification_level::text))::numeric FROM app_config ac WHERE ac.config_key = 'verification.search_boost'), 0) / 5 AS rank_boost,
   (SELECT url FROM property_media pm WHERE pm.property_id = p.id ORDER BY pm.is_primary DESC, pm.display_order ASC LIMIT 1) AS primary_image`;
+
+// Listing rows: swap the encrypted seller minimum for a hidden value.
+const hideSellerMin = (rows) => rows.map((r) => require('./mandate.service').hidePrice(r, 'seller_min_enc', '_sellerMin'));
 
 // Live residential listings a requirement could match: same deal type, in
 // the city or within radius + 50 km of the buyer's centre.
@@ -289,7 +297,7 @@ async function candidatesFor(req, s, { excludeCreatedBy = null, limit = 500 } = 
      ORDER BY p.created_at DESC LIMIT $${params.length}`,
     params
   );
-  return result.rows;
+  return hideSellerMin(result.rows);
 }
 
 async function requirementOwner(req) {
@@ -384,6 +392,7 @@ async function notifyHot(req, listing, row) {
 async function refreshRequirement(reqOrId, { notify = true } = {}) {
   const req = typeof reqOrId === 'object' ? reqOrId : (await pool.query('SELECT * FROM requirements WHERE id = $1', [reqOrId])).rows[0];
   if (!req) return { matched: 0 };
+  await require('./mandate.service').attachBuyerMax(req);
   if (req.status !== 'active') {
     await pool.query('DELETE FROM requirement_matches WHERE requirement_id = $1 AND sent_at IS NULL', [req.id]);
     return { matched: 0 };
@@ -415,7 +424,7 @@ async function refreshRequirement(reqOrId, { notify = true } = {}) {
 // Re-match one listing against all active requirements (reverse matching).
 async function refreshProperty(propertyId, { notify = true } = {}) {
   const r = await pool.query(`SELECT ${LISTING_COLUMNS}, p.status FROM properties p WHERE p.id = $1`, [propertyId]);
-  const listing = r.rows[0];
+  const listing = hideSellerMin(r.rows)[0];
   if (!listing || listing.status !== 'approved' || listing.listing_category !== 'residential') {
     await pool.query('DELETE FROM requirement_matches WHERE property_id = $1', [propertyId]);
     return { matched: 0 };
@@ -429,6 +438,7 @@ async function refreshProperty(propertyId, { notify = true } = {}) {
   );
   let matched = 0;
   let hot = 0;
+  await require('./mandate.service').attachBuyerMax(reqs.rows);
   for (const req of reqs.rows) {
     if (req.owner_id && req.owner_id === listing.created_by) continue;
     const variant = variantFor(s, req.owner_id);
@@ -485,7 +495,7 @@ async function matchesForRequirements(requirements, user, { refresh = true } = {
     [requirements.map((r) => r.id), s.thresholds.warm]
   );
   const best = new Map();
-  for (const row of rows.rows) {
+  for (const row of hideSellerMin(rows.rows)) {
     const current = best.get(row.property_id);
     if (!current || Number(row.rank_score) > Number(current.rank_score)) best.set(row.property_id, row);
   }
@@ -520,7 +530,7 @@ async function scoresForUser(user, propertyIds) {
   const s = await settings();
   const weights = weightsFor(s, variantFor(s, user.id));
   const out = {};
-  for (const listing of listings.rows) {
+  for (const listing of hideSellerMin(listings.rows)) {
     for (const req of reqs.rows) {
       if (PURPOSE_TRANSACTION_TYPES[req.purpose] && !PURPOSE_TRANSACTION_TYPES[req.purpose].includes(listing.transaction_type)) continue;
       const m = scoreOne(listing, req, s, weights);
@@ -601,7 +611,7 @@ async function myListings(user) {
      WHERE p.status = 'approved' AND p.listing_category = 'residential' AND (p.broker_id = $1 OR p.created_by = $1)`,
     [user.id]
   );
-  return r.rows;
+  return hideSellerMin(r.rows);
 }
 
 // Requirement Marketplace (buyer-first): active requirements, buyer identity
@@ -655,6 +665,7 @@ async function leadMatches(leadId, user) {
     if (p) reqs = [preferencesToRequirement(p, lead.customer_id)];
   }
   if (!reqs.length) return { requirement: null, items: [] };
+  await require('./mandate.service').attachBuyerMax(reqs);
   const s = await settings();
   const listings = STAFF.includes(user.role) ? await candidatesFor(reqs[0], s, { limit: 300 }) : await myListings(user);
   const items = [];
@@ -709,7 +720,8 @@ async function buyersForListing(propertyId, user) {
 async function sendToBuyer(requirementId, propertyId, user) {
   const req = (await pool.query('SELECT * FROM requirements WHERE id = $1', [requirementId])).rows[0];
   if (!req || req.status !== 'active') throw Object.assign(new Error('Requirement not active'), { statusCode: 404 });
-  const listing = (await pool.query(`SELECT ${LISTING_COLUMNS}, p.status FROM properties p WHERE p.id = $1`, [propertyId])).rows[0];
+  await require('./mandate.service').attachBuyerMax(req);
+  const listing = hideSellerMin((await pool.query(`SELECT ${LISTING_COLUMNS}, p.status FROM properties p WHERE p.id = $1`, [propertyId])).rows)[0];
   if (!listing || listing.status !== 'approved') throw Object.assign(new Error('Listing is not live'), { statusCode: 404 });
   if (!STAFF.includes(user.role) && listing.created_by !== user.id && listing.broker_id !== user.id) {
     throw Object.assign(new Error('You can only send your own listings'), { statusCode: 403 });

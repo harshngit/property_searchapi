@@ -7,15 +7,7 @@ const pool = require('../config/db');
 // their own deals; A R staff see everything (plus the broker league).
 
 const STAFF = ['internal_sales', 'admin', 'super_admin'];
-const FLOW = ['inquiry', 'site_visit', 'negotiation', 'booking', 'documentation', 'payment', 'closed_won'];
-const NEXT_ACTION = {
-  site_visit: 'Schedule a site visit',
-  negotiation: 'Complete the site visit and mark it done',
-  booking: 'Record the agreed deal value',
-  documentation: 'Record the Agreement to Sell / lease execution date',
-  payment: 'Get the signed agreement uploaded and approved',
-  closed_won: 'Record the Sale Deed date and collect all payments and invoices',
-};
+const { FLOW, NEXT_ACTION } = require('./dealStages');
 
 function scope(user, alias = 'd') {
   if (STAFF.includes(user.role)) return { sql: 'TRUE', params: [] };

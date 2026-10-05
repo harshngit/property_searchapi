@@ -40,6 +40,14 @@ const dueDiligenceRoutes = require('./routes/dueDiligence.routes');
 const disputeRoutes = require('./routes/dispute.routes');
 const orchestrationRoutes = require('./routes/orchestration.routes');
 const reputationRoutes = require('./routes/reputation.routes');
+const guestRoutes = require('./routes/guest.routes');
+const marketRoutes = require('./routes/market.routes');
+const mandateRoutes = require('./routes/mandate.routes');
+const representativeRoutes = require('./routes/representative.routes');
+const ingestRoutes = require('./routes/ingest.routes');
+const leadSourceRoutes = require('./routes/leadSource.routes');
+const telegramRoutes = require('./routes/telegram.routes');
+const eventsRoutes = require('./routes/events.routes');
 const { notFoundHandler, errorHandler } = require('./middlewares/errorHandler');
 
 const app = express();
@@ -91,6 +99,8 @@ app.use('/api/properties', propertyRoutes);
 app.use('/api/search', searchRoutes);
 app.use('/api/projects', projectRouter);
 app.use('/api/units', unitRouter);
+// Public ingestion webhooks first - they authenticate by source credential, not user.
+app.use('/api/leads/ingest', ingestRoutes);
 app.use('/api/leads', leadRoutes);
 app.use('/api/customers', customerRoutes);
 app.use('/api/tasks', taskRouter);
@@ -124,6 +134,13 @@ app.use('/api/due-diligence', dueDiligenceRoutes);
 app.use('/api/disputes', disputeRoutes);
 app.use('/api/orchestration', orchestrationRoutes);
 app.use('/api/reputation', reputationRoutes);
+app.use('/api/guest', guestRoutes);
+app.use('/api/market', marketRoutes);
+app.use('/api/mandates', mandateRoutes);
+app.use('/api/representatives', representativeRoutes);
+app.use('/api/lead-sources', leadSourceRoutes);
+app.use('/api/telegram', telegramRoutes);
+app.use('/api', eventsRoutes);
 
 // 404 + error handler (must be last)
 app.use(notFoundHandler);

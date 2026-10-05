@@ -50,6 +50,8 @@ async function createNotification({ userId, tenantId, type, title, message, rela
      RETURNING *`,
     [userId, tenantId || null, type, String(title || '').slice(0, 200), message || null, relatedEntityType || null, relatedEntityId || null]
   );
+  // PWA: the same notification as a browser push (no-op without VAPID keys).
+  require('./push.service').notifyUser(userId, { type, title, message });
   return result.rows[0];
 }
 

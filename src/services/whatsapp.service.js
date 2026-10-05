@@ -430,6 +430,8 @@ async function captureLead(data) {
     );
 
     await client.query('COMMIT');
+    // Sec. 34: WhatsApp inquiries enter the same assignment cascade.
+    if (isNewLead) await require('./assignment.service').safeAssign(leadId);
     return { leadId, customerId: customer.id, isNewLead };
   } catch (err) {
     await client.query('ROLLBACK');

@@ -51,8 +51,6 @@ const DISPLAY_FIELD_VALIDATORS = [
   body('faqs').optional().isArray(),
   // Exclusive Mandate (matching +20 boost) and the seller's private minimum
   // price used for the staff-only Price-Compatible flag (sec. 7).
-  body('mandateType').optional().isIn(['standard', 'exclusive']),
-  body('minAcceptablePrice').optional({ nullable: true }).isFloat({ min: 0 }),
 ];
 
 // Engine 4 opportunity fields (auction / special situation) - also shared

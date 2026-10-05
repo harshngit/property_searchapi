@@ -162,7 +162,10 @@ async function getBrokersReport(user, { from, to } = {}, forcedBrokerId) {
   return Array.from(byBroker.values());
 }
 
-const FUNNEL_STAGES = ['site_visit', 'negotiation', 'booking', 'closed_won'];
+const FUNNEL_STAGES = ['site_visit', 'negotiation', 'legal_coordination', 'closed_won'];
+// Deals that passed the retired 'booking' / 'documentation' stages count as
+// having reached Legal Coordination.
+const FUNNEL_ALIASES = { legal_coordination: ['legal_coordination', 'booking', 'documentation'] };
 
 async function getConversionFunnel(user, { from, to } = {}) {
   const leadsWhere = [];
@@ -176,8 +179,8 @@ async function getConversionFunnel(user, { from, to } = {}) {
 
   const stageCounts = { leads: leadsCount };
   for (const stage of FUNNEL_STAGES) {
-    const where = ['dsh.to_stage = $1'];
-    const params = [stage];
+    const where = ['dsh.to_stage::text = ANY($1)'];
+    const params = [FUNNEL_ALIASES[stage] || [stage]];
     tenantClause(user, 'd.', where, params);
     dateRangeClause('dsh.created_at', from, to, where, params);
 

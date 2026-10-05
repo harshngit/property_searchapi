@@ -24,20 +24,23 @@ const LEAD_SELECT = `
          cp.budget_min AS customer_budget_min, cp.budget_max AS customer_budget_max,
          p.title AS property_title, p.price AS property_price,
          assignee.full_name AS assigned_to_name,
+         rep.full_name AS arb_rep_name,
          creator.full_name AS created_by_name
   FROM leads l
   JOIN customers c ON c.id = l.customer_id
   LEFT JOIN customer_preferences cp ON cp.customer_id = c.id
   LEFT JOIN properties p ON p.id = l.property_id
   LEFT JOIN users assignee ON assignee.id = l.assigned_to
+  LEFT JOIN users rep ON rep.id = l.arb_rep_id
   LEFT JOIN users creator ON creator.id = l.created_by
 `;
 
 function applyTenantScope(user, where, params) {
   if (isAdmin(user.role)) return;
   params.push(user.tenant_id || null, user.id, user.id);
+  // A R representatives also see the inquiries they hold (sec. 34).
   where.push(
-    `(l.tenant_id = $${params.length - 2} OR l.created_by = $${params.length - 1} OR l.assigned_to = $${params.length})`
+    `(l.tenant_id = $${params.length - 2} OR l.created_by = $${params.length - 1} OR l.assigned_to = $${params.length} OR l.arb_rep_id = $${params.length})`
   );
 }
 
@@ -130,6 +133,9 @@ async function createLead(data, user) {
     });
 
     await client.query('COMMIT');
+    // Sec. 34: an A R representative is assigned at once (cascade).
+    await require('./assignment.service').safeAssign(lead.id);
+    require('./events.service').emit('lead_created', { leadId: lead.id, orgId: lead.tenant_id, properties: { source: lead.source } });
     await sendAcknowledgement(lead.id, user);
     // Sec. 9.6: same buyer already in another broker's CRM?
     await require('./dispute.service').detectLeadConflict(lead.id);
@@ -191,9 +197,19 @@ async function createPublicInquiry(data) {
     }
 
     await client.query('COMMIT');
+    // Sec. 10 / 34: rep assigned within the request; the enquirer sees only
+    // the rep's name and platform number.
+    const assignment = require('./assignment.service');
+    const placed = await assignment.safeAssign(lead.id);
+    const events = require('./events.service');
+    events.emit('lead_created', { leadId: lead.id, customerId: customer.id, properties: { source: lead.source } });
+    if (propertyId) events.emit('property_enquiry', { leadId: lead.id, customerId: customer.id, properties: { propertyId } });
+    if (data.anonymousId) events.identify({ anonymousId: data.anonymousId, customerId: customer.id }).catch(() => {});
     await sendAcknowledgement(lead.id, null);
     if (propertyId) require('./matchEngine.service').recordEvent({ customerId: customer.id, propertyId, event: 'enquired' });
-    return getLeadById(lead.id);
+    const out = await getLeadById(lead.id);
+    out.representative = placed ? await assignment.repCard(placed.userId) : null;
+    return out;
   } catch (err) {
     await client.query('ROLLBACK');
     throw err;
@@ -261,6 +277,15 @@ async function assignLead(id, assigneeId, user) {
     });
 
     await client.query('COMMIT');
+    // Reassigning to another A R representative = manual cascade override (logged, sticky).
+    const isRep = (await pool.query('SELECT 1 FROM arb_representatives WHERE user_id = $1', [assigneeId])).rows.length > 0;
+    if (isRep) {
+      const prevRep = (await pool.query('SELECT arb_rep_id FROM leads WHERE id = $1', [id])).rows[0]?.arb_rep_id || null;
+      if (prevRep !== assigneeId) {
+        await pool.query('UPDATE leads SET arb_rep_id = $1 WHERE id = $2', [assigneeId, id]);
+        await require('./assignment.service').recordManual(id, prevRep, assigneeId, user);
+      }
+    }
     await require('./dispute.service').detectLeadConflict(id);
     return getLeadById(id);
   } catch (err) {
@@ -276,9 +301,10 @@ async function updateStatus(id, status, user) {
   try {
     await client.query('BEGIN');
 
-    const current = await client.query('SELECT status FROM leads WHERE id = $1 FOR UPDATE', [id]);
+    const current = await client.query('SELECT status, arb_rep_id FROM leads WHERE id = $1 FOR UPDATE', [id]);
     if (current.rows.length === 0) throw notFound();
     const previousStatus = current.rows[0].status;
+    const repLoggedContact = previousStatus === 'new' && status !== 'new' && current.rows[0].arb_rep_id === user.id;
 
     await client.query(
       'UPDATE leads SET status = $1 WHERE id = $2 RETURNING *',
@@ -291,6 +317,9 @@ async function updateStatus(id, status, user) {
     });
 
     await client.query('COMMIT');
+    // Sec. 34: the representative moving it off New = first contact logged.
+    if (repLoggedContact) await require('./assignment.service').markContacted(id, user, 'status_change');
+    require('./events.service').emit('lead_status_changed', { leadId: id, userId: null, properties: { from: previousStatus, to: status, changed_by: user.id } });
     return getLeadById(id);
   } catch (err) {
     await client.query('ROLLBACK');

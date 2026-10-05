@@ -226,13 +226,31 @@ async function rss(source, { onPage }) {
   return { items, raw: [{ url: source.list_url, bytes: xml.length }] };
 }
 
-async function pdfText(buffer) {
-  try {
-    const parsed = await pdfParse(buffer);
-    return parsed.text || '';
-  } catch (err) {
-    throw new CrawlerError('parse_error', `Could not read PDF: ${err.message}`);
+// Text of a notice file. PDFs with a text layer are read directly; scanned
+// PDFs and images go through OCR (Tesseract, then AI vision if needed).
+// Returns { text, method: 'text' | 'tesseract' | 'ai_vision' | 'none', ocrPages }.
+async function readNotice(buffer, mimetype = 'application/pdf') {
+  const isPdf = mimetype === 'application/pdf' || buffer.subarray(0, 5).toString('latin1') === '%PDF-';
+  let parseError = null;
+  if (isPdf) {
+    try {
+      const parsed = await pdfParse(buffer);
+      // A few stray characters (page numbers, a stamp) are not a text layer.
+      if ((parsed.text || '').replace(/\s+/g, '').length >= 40) return { text: parsed.text, method: 'text', ocrPages: 0 };
+    } catch (err) {
+      parseError = err;
+    }
+  } else if (/^text\//.test(mimetype)) {
+    return { text: buffer.toString('utf8'), method: 'text', ocrPages: 0 };
   }
+  const ocr = await require('../ocr.service').recognise(buffer, isPdf ? 'application/pdf' : mimetype);
+  if (ocr.text) return { text: ocr.text, method: ocr.method, ocrPages: ocr.pages || 1, confidence: ocr.confidence };
+  if (parseError) throw new CrawlerError('parse_error', `Could not read PDF: ${parseError.message}`);
+  return { text: '', method: 'none', ocrPages: 0 };
+}
+
+async function pdfText(buffer) {
+  return (await readNotice(buffer)).text;
 }
 
 async function pdfLinks(source, { onPage }) {
@@ -245,14 +263,16 @@ async function pdfLinks(source, { onPage }) {
     .filter(Boolean)
     .slice(0, Number(cfg.maxPdfs) || 10);
   const items = [];
+  let ocr = 0;
   for (const link of links) {
     const buffer = await politeFetch(link, { as: 'buffer' });
     onPage();
-    const text = await pdfText(buffer);
-    if (!text.trim()) continue; // scanned image PDF - needs OCR / AI with vision; left for manual upload
-    items.push({ ...cfg.constants, ...extractFromText(text), auction_portal_url: link, auction_reference_id: link, _text: text });
+    const { text, method, ocrPages } = await readNotice(buffer);
+    ocr += ocrPages;
+    if (!text.trim()) continue; // unreadable even with OCR
+    items.push({ ...cfg.constants, ...extractFromText(text), auction_portal_url: link, auction_reference_id: link, _text: text, _method: method });
   }
-  return { items, raw: [{ url: source.list_url, pdfs: links }] };
+  return { items, raw: [{ url: source.list_url, pdfs: links }], ocrPages: ocr };
 }
 
 const ADAPTERS = { html_list: htmlList, json_api: jsonApi, rss, pdf_links: pdfLinks };
@@ -262,17 +282,20 @@ async function parseSource(source) {
   const adapter = ADAPTERS[source.adapter];
   if (!adapter) throw new CrawlerError('not_configured', `Unknown adapter ${source.adapter}`);
   let pages = 0;
-  const { items, raw } = await adapter(source, { maxPages: source.max_pages || 5, onPage: () => (pages += 1) });
+  const { items, raw, ocrPages = 0 } = await adapter(source, { maxPages: source.max_pages || 5, onPage: () => (pages += 1) });
+  // Reference-data sources (RERA registry, price indices, market stats) are
+  // mapped by referenceData.js - the auction extractors do not apply.
+  if ((source.output || 'opportunity') !== 'opportunity') return { items, raw, pages, ocrPages };
   const enriched = [];
   for (const item of items) {
-    const { _text, ...rest } = item;
+    const { _text, _method, ...rest } = item;
     // Table rows often hold the key facts in free text too - let the regex
     // extractor fill any gaps before the (optional) AI parser.
     const fromText = _text ? extractFromText(_text) : {};
     const merged = { ...Object.fromEntries(Object.entries(fromText).filter(([k]) => k !== 'description' && k !== 'title')), ...Object.fromEntries(Object.entries(rest).filter(([, v]) => v != null)) };
     enriched.push(await enrichWithAi(merged, _text, source.use_ai_parser));
   }
-  return { items: enriched, raw, pages };
+  return { items: enriched, raw, pages, ocrPages };
 }
 
-module.exports = { parseSource, extractFromText, aiExtract, pdfText, enrichWithAi };
+module.exports = { parseSource, extractFromText, aiExtract, pdfText, readNotice, enrichWithAi };

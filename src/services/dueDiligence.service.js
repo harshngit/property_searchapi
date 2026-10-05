@@ -105,12 +105,16 @@ async function extractText(buffer, mimetype) {
       // fall through to the raw reader
     }
     try {
-      return rawPdfText(buffer);
+      const raw = rawPdfText(buffer);
+      if (raw.trim()) return raw;
     } catch {
-      return '';
+      // fall through to OCR
     }
+    // Scanned title documents: local OCR (the AI classifier reads the file itself).
+    return (await require('./ocr.service').recognise(buffer, 'application/pdf', { allowAi: false })).text;
   }
   if (/^text\//.test(mimetype || '')) return buffer.toString('utf8');
+  if (/^image\//.test(mimetype || '')) return (await require('./ocr.service').recognise(buffer, mimetype, { allowAi: false })).text;
   return '';
 }
 
@@ -251,7 +255,7 @@ async function rolesFor(user, propertyId) {
   // A buyer on an active deal for this listing that has reached negotiation.
   const buyer = await pool.query(
     `SELECT 1 FROM deals d JOIN customers c ON c.id = d.customer_id
-     WHERE d.property_id = $1 AND c.user_id = $2 AND d.stage IN ('negotiation', 'booking', 'documentation', 'payment', 'closed_won')`,
+     WHERE d.property_id = $1 AND c.user_id = $2 AND d.stage::text = ANY(ARRAY['negotiation', 'legal_coordination', 'loan_referral', 'insurance_referral', 'payment', 'closed_won', 'booking', 'documentation'])`,
     [propertyId, user.id]
   );
   if (buyer.rows.length) roles.push('buyer');
@@ -416,6 +420,9 @@ async function recompute(propertyId) {
     }
   }
 
+  // State RERA registry (crawler_rera.js): delayed / lapsed projects and complaints.
+  const rera = await require('./market.service').reraCheck(p.rera_number).catch(() => ({ provided: !!p.rera_number, found: false, flags: [] }));
+  riskFlags.push(...rera.flags);
   const high = riskFlags.some((f) => f.severity === 'high');
   const status = !docs.length ? 'not_started' : high || docs.some((d) => d.status === 'rejected') ? 'issues' : missing.length ? 'in_progress' : 'complete';
   const r = await pool.query(
@@ -444,7 +451,8 @@ async function report(user, propertyId) {
   if (!roles.length) throw forbidden('No access to this listing');
   const dd = await recompute(propertyId);
   const disclaimers = await disclaimerService.getDisclaimers(['due_diligence', 'tax_legal']);
-  const p = (await pool.query('SELECT id, title, city, locality, property_type, transaction_type, price_value FROM properties WHERE id = $1', [propertyId])).rows[0];
+  const p0 = (await pool.query('SELECT id, title, city, locality, property_type, transaction_type, price_value, rera_number FROM properties WHERE id = $1', [propertyId])).rows[0];
+  const { rera_number: _rera, ...p } = p0;
   const view = {
     property: p,
     status: dd.status,
@@ -455,6 +463,7 @@ async function report(user, propertyId) {
     possession: { risk: dd.possession_risk, reasons: dd.possession_reasons },
     riskFlags: dd.risk_flags,
     nri: dd.nri,
+    rera: await require('./market.service').reraCheck(p0.rera_number).then((r) => ({ provided: r.provided, found: r.found, registryLoaded: r.registryLoaded, project: r.project || null })).catch(() => null),
     staffNotes: staff ? dd.staff_notes : undefined,
     reviewedAt: dd.reviewed_at,
     computedAt: dd.computed_at,

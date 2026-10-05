@@ -111,6 +111,30 @@ async function aiContactScan(image) {
   }
 }
 
+// OCR contact scan (Tesseract) - used when the AI vision check is not
+// configured, so image-level blocking is live either way (sec. 11.2).
+const OCR_PATTERNS = [
+  ['phone', /(?<!\d)(?:\+?91[\s-]?)?[6-9]\d{4}[\s-]?\d{5}(?!\d)/],
+  ['email', /[a-z0-9._%+-]{2,}@[a-z0-9-]{2,}\.[a-z]{2,}/i],
+  ['url', /\b(?:https?:\/\/|www\.)[a-z0-9-]+\.[a-z]{2,}/i],
+  ['whatsapp', /\bwhats\s?app\b/i],
+];
+async function ocrContactScan(image) {
+  if (!(await configService.getConfig('fraud.image_ocr_scan', true))) return null;
+  try {
+    const small = image.bitmap.width > 1600 ? image.clone().resize({ w: 1600 }) : image;
+    const png = await small.getBuffer('image/png');
+    const ocr = await require('./ocr.service').recognise(png, 'image/png', { allowAi: false });
+    if (!ocr.text) return { kinds: [], confidence: 0, textHeavy: false };
+    const kinds = OCR_PATTERNS.filter(([, re]) => re.test(ocr.text)).map(([k]) => k);
+    const words = ocr.text.split(/\s+/).filter((w) => /[a-z]{3,}/i.test(w)).length;
+    return { kinds, confidence: ocr.confidence || 0, textHeavy: words >= 25 && (ocr.confidence || 0) >= 60 };
+  } catch (err) {
+    console.error('[imageScan] OCR scan failed:', err.message);
+    return null;
+  }
+}
+
 // Analyse an uploaded image buffer. Returns metadata + a scan verdict:
 // 'blocked' (reject the upload), 'flagged' (keep, send to review) or 'clean'.
 async function analyse(buffer, { scan = true } = {}) {
@@ -125,21 +149,26 @@ async function analyse(buffer, { scan = true } = {}) {
   const [phash, exif] = await Promise.all([fingerprint(image), readExif(buffer)]);
   const reasons = [];
   let status = 'clean';
+  let ocr = null;
   if (scan && (await configService.getConfig('fraud.image_scan_enabled', true))) {
     const ai = await aiContactScan(image);
     if (ai?.contains_contact_info || ai?.is_visiting_card) {
       status = 'blocked';
       if (ai.is_visiting_card) reasons.push('Image looks like a visiting card');
       if (ai.kinds?.length) reasons.push(`Contact details visible in image: ${ai.kinds.join(', ')}`);
+    } else if (!ai && (ocr = await ocrContactScan(image)) && ocr.kinds.length) {
+      // Clear read = reject; a shaky read goes to human review instead.
+      status = ocr.confidence >= 60 ? 'blocked' : 'flagged';
+      reasons.push(`Contact details visible in image: ${ocr.kinds.join(', ')}`);
     } else if (!ai && looksLikeVisitingCard(width, height)) {
       status = 'flagged';
       reasons.push('Visiting-card shaped image - check for contact details');
-    } else if (ai?.text_heavy) {
+    } else if (ai?.text_heavy || ocr?.textHeavy) {
       status = 'flagged';
       reasons.push('Text-heavy image');
     }
   }
-  return { decodable: true, width, height, phash, exif, scan: { status, reasons, ai: !!aiClient } };
+  return { decodable: true, width, height, phash, exif, scan: { status, reasons, ai: !!aiClient, ocr: !!ocr } };
 }
 
 module.exports = { analyse, fingerprint, hamming, looksLikeVisitingCard };

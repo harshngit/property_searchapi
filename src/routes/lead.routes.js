@@ -486,4 +486,82 @@ router.get(
   leadController.getActivity
 );
 
+// ---------------------------------------------------------------------
+// Sec. 34 assignment cascade - first contact + assignment trail.
+// ---------------------------------------------------------------------
+const asyncHandler = require('../utils/asyncHandler');
+const { success } = require('../utils/response');
+const { assertTenantVisible } = require('../utils/ownership');
+const leadService = require('../services/lead.service');
+const assignmentService = require('../services/assignment.service');
+
+async function visibleLead(req) {
+  const lead = await leadService.getLeadById(req.params.id);
+  assertTenantVisible(req.user, lead, 'Lead not found', { ownerFields: ['created_by', 'assigned_to', 'arb_rep_id'] });
+  return lead;
+}
+
+/**
+ * @swagger
+ * /leads/{id}/contacted:
+ *   post:
+ *     summary: Log first contact (call made) - stops the assignment cascade; only the assigned A R representative or an admin
+ *     tags: [Leads]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters: [{ in: path, name: id, required: true, schema: { type: string, format: uuid } }]
+ *     responses: { 200: { description: Contact logged }, 403: { description: Not the assigned representative } }
+ */
+router.post(
+  '/:id/contacted',
+  authenticate,
+  [param('id').isUUID()],
+  validate,
+  asyncHandler(async (req, res) => {
+    await visibleLead(req);
+    return success(res, 200, 'First contact logged', await assignmentService.markContacted(req.params.id, req.user, 'logged_call'));
+  })
+);
+
+/**
+ * @swagger
+ * /leads/{id}/assignment:
+ *   get:
+ *     summary: Assignment cascade state - current representative, hop, window due time, response SLA, full transfer history
+ *     tags: [Leads]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters: [{ in: path, name: id, required: true, schema: { type: string, format: uuid } }]
+ *     responses: { 200: { description: Assignment } }
+ */
+router.get(
+  '/:id/assignment',
+  authenticate,
+  [param('id').isUUID()],
+  validate,
+  asyncHandler(async (req, res) => {
+    await visibleLead(req);
+    return success(res, 200, 'Lead assignment', await assignmentService.leadAssignment(req.params.id));
+  })
+);
+
+/**
+ * @swagger
+ * /leads/{id}/sources:
+ *   get:
+ *     summary: Every source this lead arrived from (immutable source history - dedupe keeps them all)
+ *     tags: [Leads]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters: [{ in: path, name: id, required: true, schema: { type: string, format: uuid } }]
+ *     responses: { 200: { description: Source history } }
+ */
+router.get(
+  '/:id/sources',
+  authenticate,
+  [param('id').isUUID()],
+  validate,
+  asyncHandler(async (req, res) => {
+    await visibleLead(req);
+    return success(res, 200, 'Lead sources', await require('../services/ingestion/ingestion.service').leadSources(req.params.id));
+  })
+);
+
 module.exports = router;

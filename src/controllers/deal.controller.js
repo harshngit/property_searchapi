@@ -3,7 +3,7 @@ const { success } = require('../utils/response');
 const { assertOwnerOrAdmin, assertTenantVisible } = require('../utils/ownership');
 const { bulkDelete } = require('../utils/bulkDelete');
 
-const DEAL_OWNER_FIELDS = ['broker_id'];
+const DEAL_OWNER_FIELDS = ['broker_id', 'assigned_rep_id'];
 
 // GET /api/deals
 async function listDeals(req, res, next) {

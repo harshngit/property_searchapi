@@ -5,7 +5,8 @@ const auditService = require('../audit.service');
 const opportunityService = require('../opportunity.service');
 const { uploadBuffer } = require('../../utils/storage');
 const { badRequest, notFound } = require('../../utils/httpError');
-const { parseSource, extractFromText, pdfText, enrichWithAi } = require('./parsers');
+const { parseSource, extractFromText, readNotice, enrichWithAi } = require('./parsers');
+const referenceData = require('./referenceData');
 
 // Section 23 pipeline orchestration (master_scheduler.js in the contract):
 //   Layer 1 crawl (polite fetcher) -> Layer 2 parse (adapters / regex / AI)
@@ -21,7 +22,7 @@ const { parseSource, extractFromText, pdfText, enrichWithAi } = require('./parse
 const SOURCE_FIELDS = {
   name: 'name', baseUrl: 'base_url', listUrl: 'list_url', adapter: 'adapter', config: 'config', scheduleHours: 'schedule_hours',
   defaultListingCategory: 'default_listing_category', requiresLegalReview: 'requires_legal_review', useAiParser: 'use_ai_parser',
-  maxPages: 'max_pages', isEnabled: 'is_enabled',
+  maxPages: 'max_pages', isEnabled: 'is_enabled', output: 'output',
 };
 
 async function listSources() {
@@ -139,8 +140,30 @@ async function runSource(sourceId, { trigger = 'manual', user = null } = {}) {
   const nextRun = new Date(Date.now() + source.schedule_hours * 3600 * 1000);
 
   try {
-    const { items, raw, pages } = await parseSource(source);
+    const { items, raw, pages, ocrPages = 0 } = await parseSource(source);
     const rawPath = trigger === 'test' ? null : await archiveRaw(source, raw);
+    // Reference-data modules (crawler_rera / crawler_nhb_rbi / crawler_portal_market).
+    if (source.output !== 'opportunity') {
+      const stored = await referenceData.store(source, items, { dryRun: trigger === 'test' });
+      await finish(
+        {
+          status: stored.received ? 'success' : 'partial',
+          pages_fetched: pages,
+          items_found: stored.received,
+          items_ingested: stored.stored + stored.updated,
+          items_skipped: stored.rejected,
+          ocr_pages: ocrPages,
+          raw_object_path: rawPath,
+          sample: stored.sample,
+          recovery_action: stored.received ? null : 'No rows found - check the item selector / field mapping (or rowPattern for PDFs)',
+        },
+        trigger === 'test'
+          ? { status: 'idle' }
+          : { status: 'healthy', consecutive_failures: 0, last_success_at: new Date(), last_error: null, next_run_at: nextRun }
+      );
+      if (trigger !== 'test' && source.output !== 'rera_projects') require('../market.service').clearCache();
+      return { runId, pages, found: stored.received, summary: stored, sample: stored.sample, output: source.output, ocrPages };
+    }
     let summary = { received: items.length, published: 0, needs_review: 0, duplicate: 0, skipped_existing: 0 };
     if (trigger !== 'test' && items.length) {
       summary = await opportunityService.ingestItems(
@@ -157,6 +180,7 @@ async function runSource(sourceId, { trigger = 'manual', user = null } = {}) {
         items_ingested: (summary.needs_review || 0) + (summary.published || 0),
         items_duplicate: summary.duplicate || 0,
         items_skipped: summary.skipped_existing || 0,
+        ocr_pages: ocrPages,
         raw_object_path: rawPath,
         sample: items.slice(0, 5),
         recovery_action: items.length ? null : 'No items found - check the item selector / field mapping',
@@ -207,18 +231,18 @@ async function runSource(sourceId, { trigger = 'manual', user = null } = {}) {
 // (regex + AI) and queued for review. Useful for notices from sources that
 // are not crawled (newspaper cuttings, e-mailed bank notices).
 async function parseUploadedNotice(file, { sourceName, listingCategory, legalReview }, user) {
-  if (!file) throw badRequest('Upload a PDF or text file');
-  let text;
-  if ((file.mimetype || '').includes('pdf') || /\.pdf$/i.test(file.originalname || '')) text = await pdfText(file.buffer);
-  else text = file.buffer.toString('utf8');
-  if (!text.trim()) throw badRequest('No readable text in this file (scanned image PDFs need the AI parser with vision / OCR)');
+  if (!file) throw badRequest('Upload a PDF, a scan / photo of the notice, or a text file');
+  const isPdf = (file.mimetype || '').includes('pdf') || /\.pdf$/i.test(file.originalname || '');
+  // Scanned PDFs and photos of newspaper cuttings are read with OCR.
+  const { text, method, ocrPages, confidence } = await readNotice(file.buffer, isPdf ? 'application/pdf' : file.mimetype || 'text/plain');
+  if (!text.trim()) throw badRequest('No readable text in this file - the scan could not be read by OCR. Try a clearer scan.');
   const item = await enrichWithAi({ ...extractFromText(text), auction_reference_id: `upload-${Date.now()}` }, text, true);
   const summary = await opportunityService.ingestItems(
     [item],
     { sourceName: sourceName || 'Uploaded notice', dataSource: 'crawler', defaultCategory: listingCategory || 'auction', requiresLegalReview: String(legalReview) === 'true' },
     user
   );
-  return { parsed: item, summary };
+  return { parsed: item, summary, reader: { method, ocrPages, confidence: confidence ?? null } };
 }
 
 async function healthSummary() {

@@ -9,6 +9,8 @@ const TEMPLATE_ENV_VAR_BY_PURPOSE = {
   login: 'MSG91_OTP_TEMPLATE_ID_LOGIN',
   reset_password: 'MSG91_OTP_TEMPLATE_ID_RESET_PASSWORD',
   mobile_verification: 'MSG91_OTP_TEMPLATE_ID_MOBILE_VERIFICATION',
+  fee_consent: 'MSG91_OTP_TEMPLATE_ID_FEE_CONSENT',
+  guest_interest: 'MSG91_OTP_TEMPLATE_ID_GUEST_INTEREST',
 };
 
 // Returns the configured template id for a purpose, or undefined if no
@@ -16,7 +18,10 @@ const TEMPLATE_ENV_VAR_BY_PURPOSE = {
 // means for them (skip in dev, hard-fail in prod - see auth.service.js).
 function getTemplateIdForPurpose(purpose) {
   const envVar = TEMPLATE_ENV_VAR_BY_PURPOSE[purpose];
-  return envVar ? process.env[envVar] : undefined;
+  const id = envVar ? process.env[envVar] : undefined;
+  // Guest interest can share the mobile-verification template until its own is approved on DLT.
+  if (!id && purpose === 'guest_interest') return process.env.MSG91_OTP_TEMPLATE_ID_MOBILE_VERIFICATION;
+  return id;
 }
 
 // DLT_TE_ID is the DLT REGISTRY's own template id (assigned by the telecom
@@ -30,11 +35,15 @@ const DLT_TE_ID_ENV_VAR_BY_PURPOSE = {
   login: 'MSG91_DLT_TE_ID_LOGIN',
   reset_password: 'MSG91_DLT_TE_ID_RESET_PASSWORD',
   mobile_verification: 'MSG91_DLT_TE_ID_MOBILE_VERIFICATION',
+  fee_consent: 'MSG91_DLT_TE_ID_FEE_CONSENT',
+  guest_interest: 'MSG91_DLT_TE_ID_GUEST_INTEREST',
 };
 
 function getDltTeIdForPurpose(purpose) {
   const envVar = DLT_TE_ID_ENV_VAR_BY_PURPOSE[purpose];
-  return envVar ? process.env[envVar] : undefined;
+  const id = envVar ? process.env[envVar] : undefined;
+  if (!id && purpose === 'guest_interest') return process.env.MSG91_DLT_TE_ID_MOBILE_VERIFICATION;
+  return id;
 }
 
 // MSG91 expects the mobile number with a country code and no leading '+',

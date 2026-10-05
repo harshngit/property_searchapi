@@ -6,6 +6,7 @@ const referralService = require('./referral.service');
 const matchEngine = require('./matchEngine.service');
 const notificationService = require('./notification.service');
 const auditService = require('./audit.service');
+const mandateService = require('./mandate.service');
 const { signUrls } = require('../utils/storage');
 const { parsePriceToNumber } = require('../utils/price');
 const { badRequest, forbidden, notFound } = require('../utils/httpError');
@@ -31,17 +32,7 @@ const LEAD_STATUS_LABELS = {
   lost: 'Closed',
 };
 
-const DEAL_STAGE_LABELS = {
-  inquiry: 'Enquiry',
-  site_visit: 'Site visit',
-  negotiation: 'Negotiation',
-  booking: 'Booking',
-  documentation: 'Documentation',
-  payment: 'Payment',
-  closed_won: 'Closed - deal done',
-  closed_lost: 'Closed',
-  on_hold: 'On hold',
-};
+const DEAL_STAGE_LABELS = { ...require('./dealStages').LABELS, closed_won: 'Closed - deal done', closed_lost: 'Closed' };
 
 
 // ------------------------------------------------------------------ helpers
@@ -280,10 +271,15 @@ function requirementSummary(r) {
 async function listRequirements(user) {
   const customer = await resolveCustomer(user);
   const result = await pool.query(
-    `SELECT r.*, l.status AS lead_status, u.full_name AS representative_name
+    `SELECT r.*, l.status AS lead_status, u.full_name AS representative_name, ar.platform_number AS representative_number,
+            (SELECT json_build_object('id', m.id, 'number', m.mandate_number, 'type', m.mandate_type, 'status', m.status,
+              'start_date', m.mandate_start_date, 'end_date', m.mandate_end_date, 'valuation_status', m.valuation_status,
+              'due_diligence_status', m.due_diligence_status, 'deed_writer_waiver_status', m.deed_writer_waiver_status)
+             FROM mandates m WHERE m.requirement_id = r.id ORDER BY m.created_at DESC LIMIT 1) AS mandate
      FROM requirements r
      LEFT JOIN leads l ON l.id = r.lead_id
-     LEFT JOIN users u ON u.id = l.assigned_to
+     LEFT JOIN users u ON u.id = COALESCE(l.arb_rep_id, l.assigned_to)
+     LEFT JOIN arb_representatives ar ON ar.user_id = u.id
      WHERE r.customer_id = $1
      ORDER BY (r.status = 'active') DESC, r.created_at DESC`,
     [customer.id]
@@ -296,7 +292,11 @@ async function listRequirements(user) {
 // representative picks it up. Fee consent + mandate type are mandatory.
 async function createRequirement(user, data, meta = {}) {
   const customer = await resolveCustomer(user);
-  if (!data.feeConsent) throw badRequest('Please accept the professional fee terms to post a requirement');
+  // Module 46: OTP-verified fee consent + mandate type (+ budget range for
+  // an Exclusive Mandate) - validated before anything is written.
+  const mandateType = data.mandateType === 'exclusive' ? 'exclusive' : 'standard';
+  const range = mandateService.validatePriceRange('requirement', mandateType, data.priceRange);
+  await mandateService.assertConsentUsable(user, data.consentToken, 'requirement');
   const temperature = await temperatureFor(data.urgency || 'flexible');
 
   const client = await pool.connect();
@@ -328,7 +328,7 @@ async function createRequirement(user, data, meta = {}) {
         data.urgency || 'flexible',
         temperature,
         data.notes || null,
-        data.mandateType || 'standard',
+        'standard', // becomes 'exclusive' (Priority Buyer) only once the mandate is active
         lead.rows[0].id,
         JSON.stringify((data.amenities || []).map((a) => String(a).trim()).filter(Boolean)),
         data.latitude ?? null,
@@ -337,6 +337,10 @@ async function createRequirement(user, data, meta = {}) {
       ]
     );
     const requirement = inserted.rows[0];
+    const mandate = await mandateService.createForPost(client, {
+      user, customerId: customer.id, kind: 'requirement', targetId: requirement.id, mandateType, consentToken: data.consentToken, range,
+    });
+    requirement.mandate = { id: mandate.id, number: mandate.mandate_number, type: mandate.mandate_type, status: mandate.status };
     await client.query('INSERT INTO lead_notes (lead_id, user_id, note) VALUES ($1, $2, $3)', [
       lead.rows[0].id,
       user.id,
@@ -353,6 +357,9 @@ async function createRequirement(user, data, meta = {}) {
         [data.purpose === 'rent' ? 'tenant' : 'buyer', customer.id]
       );
     }
+    // Sec. 34: the requirement's lead gets an A R representative at once.
+    await require('./assignment.service').safeAssign(requirement.lead_id);
+    await mandateService.afterCreate(requirement.mandate && { id: requirement.mandate.id, mandate_number: requirement.mandate.number, mandate_type: requirement.mandate.type }, `a ${data.purpose} requirement in ${data.city}`);
     // Reverse matching: Hot matches alert the buyer and the listing brokers.
     matchEngine.safeRefreshRequirement(requirement.id);
     return requirement;
@@ -601,13 +608,14 @@ async function listEnquiries(user) {
   const result = await pool.query(
     `SELECT l.id, l.status, l.source, l.created_at, l.updated_at, l.property_id,
             p.title AS property_title, p.city, p.locality, p.transaction_type, p.price, p.price_value,
-            u.full_name AS representative_name,
+            u.full_name AS representative_name, ar.platform_number AS representative_number,
             d.id AS deal_id, d.stage AS deal_stage,
             (SELECT MIN(sv.scheduled_at) FROM site_visits sv WHERE sv.deal_id = d.id AND sv.status = 'scheduled' AND sv.scheduled_at >= now()) AS next_visit_at,
             EXISTS (SELECT 1 FROM requirements r WHERE r.lead_id = l.id) AS is_requirement
      FROM leads l
      LEFT JOIN properties p ON p.id = l.property_id
-     LEFT JOIN users u ON u.id = l.assigned_to
+     LEFT JOIN users u ON u.id = COALESCE(l.arb_rep_id, l.assigned_to)
+     LEFT JOIN arb_representatives ar ON ar.user_id = u.id
      LEFT JOIN LATERAL (SELECT id, stage FROM deals WHERE lead_id = l.id ORDER BY created_at DESC LIMIT 1) d ON true
      WHERE l.customer_id = $1
      ORDER BY l.created_at DESC`,
@@ -629,7 +637,7 @@ async function listVisits(user) {
      JOIN deals d ON d.id = sv.deal_id
      LEFT JOIN properties p ON p.id = d.property_id
      LEFT JOIN leads l ON l.id = d.lead_id
-     LEFT JOIN users u ON u.id = COALESCE(l.assigned_to, d.broker_id)
+     LEFT JOIN users u ON u.id = COALESCE(d.assigned_rep_id, l.arb_rep_id, l.assigned_to, d.broker_id)
      WHERE d.customer_id = $1
      ORDER BY sv.scheduled_at DESC`,
     [customer.id]
@@ -673,6 +681,10 @@ async function listListings(user) {
   const validityDays = await listingValidityDays();
   const result = await pool.query(
     `SELECT ${LISTING_CARD_COLUMNS}, p.status, p.rejection_reason, p.approved_at, p.listing_renewed_at, p.mandate_type,
+            (SELECT json_build_object('id', m.id, 'number', m.mandate_number, 'type', m.mandate_type, 'status', m.status,
+              'start_date', m.mandate_start_date, 'end_date', m.mandate_end_date, 'valuation_status', m.valuation_status,
+              'due_diligence_status', m.due_diligence_status, 'deed_writer_waiver_status', m.deed_writer_waiver_status)
+             FROM mandates m WHERE m.listing_id = p.id ORDER BY m.created_at DESC LIMIT 1) AS mandate,
             p.verification_level, p.under_review, p.fraud_band, p.duplicate_status,
             (SELECT COUNT(*) FROM leads l WHERE l.property_id = p.id)::int AS enquiry_count,
             (SELECT COUNT(DISTINCT l.customer_id) FROM leads l WHERE l.property_id = p.id)::int AS interested_count,
@@ -701,7 +713,11 @@ const LISTING_INPUT_FIELDS = [
 // Professional fee consent + mandate type are mandatory.
 async function createListing(user, data, meta = {}) {
   const customer = await resolveCustomer(user);
-  if (!data.feeConsent) throw badRequest('Please accept the professional fee terms to post a property');
+  // Module 46: OTP-verified fee consent + mandate type (+ price range for an
+  // Exclusive Mandate) - validated before the listing is created.
+  const mandateType = data.mandateType === 'exclusive' ? 'exclusive' : 'standard';
+  const range = mandateService.validatePriceRange('listing', mandateType, data.priceRange);
+  await mandateService.assertConsentUsable(user, data.consentToken, 'listing');
   const input = Object.fromEntries(LISTING_INPUT_FIELDS.filter((k) => data[k] !== undefined).map((k) => [k, data[k]]));
   if (data.pg) input.tags = ['PG'];
   // Engine 4 deal sourcing from direct sellers: a sale tagged Urgent Sale /
@@ -722,10 +738,25 @@ async function createListing(user, data, meta = {}) {
     { id: user.id, role: user.role, tenant_id: null },
     { autoVerify: false }
   );
-  await pool.query('UPDATE properties SET fee_consent_at = now(), mandate_type = $1 WHERE id = $2', [
-    data.mandateType || 'standard',
-    property.id,
-  ]);
+  // Consent + mandate record in one transaction; if that fails the new
+  // listing is withdrawn so nothing stays without a mandate status.
+  let mandate;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`UPDATE properties SET fee_consent_at = now(), mandate_type = 'standard' WHERE id = $1`, [property.id]);
+    mandate = await mandateService.createForPost(client, {
+      user, customerId: customer.id, kind: 'listing', targetId: property.id, mandateType, consentToken: data.consentToken, range,
+    });
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    await pool.query('DELETE FROM properties WHERE id = $1', [property.id]).catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+  await mandateService.afterCreate(mandate, property.title);
   const role = data.transactionType === 'rent' ? 'owner' : 'seller';
   if (!customer.portal_roles?.includes(role)) {
     await pool.query(
@@ -734,7 +765,12 @@ async function createListing(user, data, meta = {}) {
     );
   }
   await auditService.log({ actor: user, action: 'listing.posted', entityType: 'property', entityId: property.id, ...meta });
-  return { ...property, mandate_type: data.mandateType || 'standard', listing_category: special.listingCategory };
+  return {
+    ...property,
+    mandate_type: 'standard',
+    mandate: { id: mandate.id, number: mandate.mandate_number, type: mandate.mandate_type, status: mandate.status },
+    listing_category: special.listingCategory,
+  };
 }
 
 async function getOwnListing(user, id) {
@@ -791,10 +827,13 @@ async function listListingEnquiries(user, id) {
   await getOwnListing(user, id);
   const result = await pool.query(
     `SELECT l.id, l.status, l.created_at, split_part(c.full_name, ' ', 1) AS first_name,
+            rep.full_name AS representative_name, ar.platform_number AS representative_number,
             d.stage AS deal_stage,
             (SELECT COUNT(*) FROM site_visits sv WHERE sv.deal_id = d.id)::int AS visits
      FROM leads l
      JOIN customers c ON c.id = l.customer_id
+     LEFT JOIN users rep ON rep.id = l.arb_rep_id
+     LEFT JOIN arb_representatives ar ON ar.user_id = l.arb_rep_id
      LEFT JOIN LATERAL (SELECT id, stage FROM deals WHERE lead_id = l.id ORDER BY created_at DESC LIMIT 1) d ON true
      WHERE l.property_id = $1
      ORDER BY l.created_at DESC`,

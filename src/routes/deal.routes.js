@@ -6,10 +6,7 @@ const dealController = require('../controllers/deal.controller');
 const validate = require('../middlewares/validate');
 const { authenticate, authorize } = require('../middlewares/auth');
 
-const DEAL_STAGES = [
-  'inquiry', 'site_visit', 'negotiation', 'booking',
-  'documentation', 'payment', 'closed_won', 'closed_lost', 'on_hold',
-];
+const DEAL_STAGES = require('../services/dealStages').ALL;
 const VISIT_STATUSES = ['scheduled', 'completed', 'cancelled', 'no_show'];
 const CREATE_ROLES = ['broker', 'agency_admin', 'internal_sales', 'admin', 'super_admin'];
 
@@ -42,7 +39,7 @@ const CREATE_ROLES = ['broker', 'agency_admin', 'internal_sales', 'admin', 'supe
  *         schema: { type: integer, default: 20 }
  *       - in: query
  *         name: stage
- *         schema: { type: string, enum: [inquiry, site_visit, negotiation, booking, documentation, payment, closed_won, closed_lost, on_hold] }
+ *         schema: { type: string, enum: [inquiry, requirement, match, site_visit, negotiation, legal_coordination, loan_referral, insurance_referral, payment, closed_won, closed_lost, on_hold] }
  *       - in: query
  *         name: brokerId
  *         schema: { type: string, format: uuid }
@@ -283,7 +280,7 @@ router.post(
  *             properties:
  *               stage:
  *                 type: string
- *                 enum: [inquiry, site_visit, negotiation, booking, documentation, payment, closed_won, closed_lost, on_hold]
+ *                 enum: [inquiry, requirement, match, site_visit, negotiation, legal_coordination, loan_referral, insurance_referral, payment, closed_won, closed_lost, on_hold]
  *               notes: { type: string, example: "Customer confirmed site visit for Saturday." }
  *               override: { type: boolean, description: "Admin only - move forward although the target stage's requirements (Module 40) are not met; notes become the logged reason." }
  *     responses:
@@ -450,8 +447,8 @@ router.post(
  * @swagger
  * /deals/{id}/booking:
  *   post:
- *     summary: Record booking details and move the deal to the 'booking' stage
- *     description: Only valid from stages that allow a transition to 'booking' (normally 'negotiation') - see the deal stage transition map.
+ *     summary: Record the booking / token and move the deal to Legal Coordination
+ *     description: Only valid from Negotiation. Legal Coordination requires the agreed deal value (orchestration).
  *     tags: [Deals]
  *     security:
  *       - bearerAuth: []

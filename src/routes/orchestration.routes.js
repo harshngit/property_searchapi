@@ -38,6 +38,36 @@ const meta = (req) => auditService.requestMeta(req);
  *     parameters: [{ in: path, name: id, required: true, schema: { type: string, format: uuid } }]
  *     responses: { 200: { description: Deal orchestration state }, 403: { description: Not your deal } }
  */
+/**
+ * @swagger
+ * /orchestration/deals/{id}/referrals:
+ *   put:
+ *     summary: Legal coordination / loan referral / insurance referral status (referral-only; "not_needed" is valid) - auto-advances when met
+ *     tags: [Orchestration]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters: [{ in: path, name: id, required: true, schema: { type: string, format: uuid } }]
+ *     requestBody:
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               loanStatus: { type: string, enum: [pending, not_needed, referred, sanctioned, disbursed] }
+ *               loanLender: { type: string }
+ *               insuranceStatus: { type: string, enum: [pending, not_needed, referred, issued] }
+ *               insuranceProvider: { type: string }
+ *               legalAdvocate: { type: string }
+ *               legalNotes: { type: string }
+ *     responses: { 200: { description: Evaluation after the change } }
+ */
+router.put(
+  '/deals/:id/referrals',
+  authorize(...DEAL_ROLES),
+  [param('id').isUUID()],
+  validate,
+  asyncHandler(async (req, res) => success(res, 200, 'Referrals recorded', await orchestration.recordReferrals(req.user, req.params.id, req.body || {}, meta(req))))
+);
+
 router.get(
   '/deals/:id',
   authorize(...DEAL_ROLES),

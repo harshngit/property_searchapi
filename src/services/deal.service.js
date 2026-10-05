@@ -18,17 +18,8 @@ function badRequest(message) {
 // Which stages a deal may move to from its current stage. A self-transition
 // (toStage === fromStage) is always allowed regardless of this map - it's
 // used to log an activity (e.g. a negotiation round) without changing stage.
-const STAGE_TRANSITIONS = {
-  inquiry: ['site_visit', 'on_hold', 'closed_lost'],
-  site_visit: ['negotiation', 'on_hold', 'closed_lost'],
-  negotiation: ['booking', 'on_hold', 'closed_lost'],
-  booking: ['documentation', 'on_hold', 'closed_lost'],
-  documentation: ['payment', 'on_hold', 'closed_lost'],
-  payment: ['closed_won', 'on_hold', 'closed_lost'],
-  on_hold: ['inquiry', 'site_visit', 'negotiation', 'booking', 'documentation', 'payment', 'closed_lost'],
-  closed_won: [],
-  closed_lost: [],
-};
+// Contract pipeline (Lead -> ... -> Closure) - see dealStages.js.
+const STAGE_TRANSITIONS = require('./dealStages').TRANSITIONS;
 
 const TERMINAL_STAGES = ['closed_won', 'closed_lost'];
 
@@ -51,7 +42,7 @@ const DEAL_SELECT = `
 function applyTenantScope(user, where, params) {
   if (isAdmin(user.role)) return;
   params.push(user.tenant_id || null, user.id);
-  where.push(`(d.tenant_id = $${params.length - 1} OR d.broker_id = $${params.length})`);
+  where.push(`(d.tenant_id = $${params.length - 1} OR d.broker_id = $${params.length} OR d.assigned_rep_id = $${params.length})`);
 }
 
 async function listDeals(user, filters, page, limit) {
@@ -143,8 +134,8 @@ async function createDeal(data, user) {
     const result = await client.query(
       `INSERT INTO deals (
          tenant_id, lead_id, customer_id, property_id, unit_id, broker_id,
-         stage, deal_value, commission_amount, commission_percent
-       ) VALUES ($1, $2, $3, $4, $5, $6, 'inquiry', $7, $8, $9)
+         stage, deal_value, commission_amount, commission_percent, assigned_rep_id
+       ) VALUES ($1, $2, $3, $4, $5, $6, 'inquiry', $7, $8, $9, $10)
        RETURNING *`,
       [
         user.tenant_id || null,
@@ -156,6 +147,8 @@ async function createDeal(data, user) {
         data.dealValue ?? null,
         data.commissionAmount ?? null,
         data.commissionPercent ?? null,
+        // The A R representative on the inquiry handles the deal (sec. 10 / 34).
+        (lead && lead.arb_rep_id) || (user.role === 'internal_sales' ? user.id : null),
       ]
     );
     const deal = result.rows[0];
@@ -163,7 +156,10 @@ async function createDeal(data, user) {
     await logStageChange(client, deal.id, null, deal.stage, user.id, 'Deal created');
 
     await client.query('COMMIT');
-    return deal;
+    // Module 40: auto-trigger the next stages whose requirements are already
+    // met (Lead -> Requirement -> Match when the requirement and property exist).
+    const ev = await require('./orchestration.service').evaluate(deal.id, { actor: user }).catch(() => null);
+    return ev ? { ...deal, stage: ev.stage } : deal;
   } catch (err) {
     await client.query('ROLLBACK');
     throw err;
@@ -376,7 +372,8 @@ async function logNegotiation(dealId, { offerAmount, notes }, user) {
 
 async function recordBooking(dealId, { bookingAmount, notes }, user) {
   const combinedNotes = bookingAmount ? `Booking amount: ${bookingAmount}. ${notes || ''}`.trim() : notes;
-  return changeStage(dealId, 'booking', user, combinedNotes);
+  // "Booking" (token / agreed terms) now opens Legal Coordination.
+  return changeStage(dealId, 'legal_coordination', user, combinedNotes);
 }
 
 async function closeDeal(dealId, { outcome, reason }, user) {

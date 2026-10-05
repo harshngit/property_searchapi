@@ -8,6 +8,7 @@
     "dev": "nodemon src/server.js",
     "migrate": "node src/db/runMigrations.js",
     "seed:superadmin": "node src/db/seedSuperAdmin.js",
+    "vapid:generate": "node -e \"const k=require('./src/services/push.service').generateVapidKeys();console.log('VAPID_PUBLIC_KEY='+k.publicKey+'\\nVAPID_PRIVATE_KEY='+k.privateKey)\"",
     "test": "node --test --test-concurrency=1 tests/"
   },
   "dependencies": {
@@ -32,6 +33,7 @@
     "pg": "^8.12.0",
     "swagger-jsdoc": "^6.3.0",
     "swagger-ui-express": "^5.0.1",
+    "tesseract.js": "^5.1.1",
     "uuid": "^9.0.1"
   },
   "devDependencies": {

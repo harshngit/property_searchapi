@@ -68,11 +68,12 @@ const uploadDocumentFile = multer({
   ]),
 });
 
-// Auction / sale notices for the parser: PDF or plain text, up to 20MB.
+// Auction / sale notices for the parser: PDF (text or scanned), a photo /
+// scan of the notice, or plain text, up to 20MB.
 const uploadNoticeFile = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 20 * 1024 * 1024 },
-  fileFilter: fileFilter(['application/pdf', 'text/plain']),
+  fileFilter: fileFilter(['application/pdf', 'text/plain', 'image/jpeg', 'image/png', 'image/webp']),
 });
 
 module.exports = {

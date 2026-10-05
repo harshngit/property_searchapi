@@ -377,6 +377,8 @@ async function expressInterest(propertyId, data, user) {
     interestId = interest.rows[0].id;
     await logStage(client, interestId, null, 'lead', user.id, 'Interest expressed');
     await client.query('COMMIT');
+    // Sec. 34: the investor's own RM is hop 1; otherwise the cascade picks one.
+    await require('./assignment.service').safeAssign(lead.rows[0].id);
   } catch (err) {
     await client.query('ROLLBACK');
     throw err;

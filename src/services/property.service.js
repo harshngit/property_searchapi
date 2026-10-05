@@ -98,8 +98,6 @@ const OPPORTUNITY_FIELDS = {
   isInstitutionalAsset: 'is_institutional_asset',
   // Exclusive Mandate (+20 matching boost) and the private minimum price
   // for the staff-only Price-Compatible flag (sec. 7).
-  mandateType: 'mandate_type',
-  minAcceptablePrice: 'min_acceptable_price',
 };
 const OPPORTUNITY_JSON_FIELDS = { situationTags: 'situation_tags', riskIndicators: 'risk_indicators' };
 

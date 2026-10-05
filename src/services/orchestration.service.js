@@ -20,13 +20,13 @@ const { badRequest, forbidden, notFound } = require('../utils/httpError');
 //     residents, IGST for NRI / OCI; net-7 due; day-8 overdue alerts. The
 //     deal is not fully closed until the instalments are paid.
 
-const FLOW = ['inquiry', 'site_visit', 'negotiation', 'booking', 'documentation', 'payment', 'closed_won'];
+const stages = require('./dealStages');
+
+const FLOW = stages.FLOW;
 const STAFF = ['internal_sales', 'admin', 'super_admin'];
 const ADMIN = ['admin', 'super_admin'];
-const DEFAULT_SLA = { inquiry: 2, site_visit: 5, negotiation: 7, booking: 5, documentation: 15, payment: 30 };
-const STAGE_LABEL = {
-  inquiry: 'Enquiry', site_visit: 'Site visit', negotiation: 'Negotiation', booking: 'Booking', documentation: 'Documentation', payment: 'Payment', closed_won: 'Closed',
-};
+const DEFAULT_SLA = stages.DEFAULT_SLA_DAYS;
+const STAGE_LABEL = stages.LABELS;
 
 async function cfg() {
   const [sla, auto, needPaid, rate, split, gst, gstin, dueDays, parties, note] = await Promise.all([
@@ -85,14 +85,27 @@ async function requirementsFor(deal, stage, c) {
      FROM site_visits WHERE deal_id = $1`
   );
   const req = [];
+  if (stage === 'requirement') {
+    const r = await q(
+      `SELECT (EXISTS (SELECT 1 FROM requirements WHERE lead_id = $1 OR (customer_id = $2 AND status = 'active'))
+               OR EXISTS (SELECT 1 FROM customer_preferences WHERE customer_id = $2))::int AS n`,
+      [deal.lead_id, deal.customer_id]
+    );
+    req.push({ key: 'requirement_captured', label: "Buyer's requirement captured (posted requirement or preferences)", met: r.n > 0 });
+  }
+  if (stage === 'match') req.push({ key: 'property_matched', label: 'Matched property linked to the deal', met: !!deal.property_id });
   if (stage === 'site_visit') req.push({ key: 'visit_scheduled', label: 'A site visit is scheduled', met: visits.any > 0 });
   if (stage === 'negotiation') req.push({ key: 'visit_completed', label: 'A site visit is completed', met: visits.done > 0 });
-  if (stage === 'booking') req.push({ key: 'deal_value', label: 'Agreed deal value recorded', met: Number(deal.deal_value) > 0 });
-  if (stage === 'documentation') {
+  if (stage === 'legal_coordination') req.push({ key: 'deal_value', label: 'Agreed deal value recorded', met: Number(deal.deal_value) > 0 });
+  if (stage === 'loan_referral') {
     if (deal.isRent) req.push({ key: 'lease_executed', label: 'Lease / leave-and-licence execution date recorded', met: !!deal.lease_execution_date });
     else req.push({ key: 'ats_executed', label: 'Agreement to Sell execution date recorded', met: !!deal.ats_execution_date });
   }
+  if (stage === 'insurance_referral') {
+    req.push({ key: 'loan_decided', label: 'Home loan referred, or marked not needed', met: deal.loan_referral_status !== 'pending' });
+  }
   if (stage === 'payment') {
+    req.push({ key: 'insurance_decided', label: 'Property insurance referred, or marked not needed', met: deal.insurance_referral_status !== 'pending' });
     if (deal.isRent) {
       req.push({ key: 'lease_invoice', label: 'Lease professional-fee invoice issued', met: !!deal.lease_invoice_id });
     } else {
@@ -351,6 +364,34 @@ async function recordDates(user, dealId, { atsExecutionDate, saleDeedExecutionDa
   return evaluate(dealId, { actor: user });
 }
 
+// Legal coordination / loan referral / insurance referral (referral-only
+// facilitation - "not needed" is a valid outcome). Auto-advances when met.
+const LOAN = ['pending', 'not_needed', 'referred', 'sanctioned', 'disbursed'];
+const INSURANCE = ['pending', 'not_needed', 'referred', 'issued'];
+async function recordReferrals(user, dealId, data, meta = {}) {
+  const deal = await loadDeal(dealId);
+  if (!STAFF.includes(user.role) && deal.broker_id !== user.id && deal.assigned_rep_id !== user.id) throw forbidden('Only the A R representative or the deal broker records referrals');
+  const map = {
+    loanStatus: ['loan_referral_status', LOAN], loanLender: ['loan_lender'],
+    insuranceStatus: ['insurance_referral_status', INSURANCE], insuranceProvider: ['insurance_provider'],
+    legalAdvocate: ['legal_advocate'], legalNotes: ['legal_notes'],
+  };
+  const set = [];
+  const params = [];
+  for (const [key, [col, allowed]] of Object.entries(map)) {
+    if (data[key] === undefined) continue;
+    if (allowed && !allowed.includes(data[key])) throw badRequest(`${key} must be one of ${allowed.join(', ')}`);
+    params.push(data[key] === '' ? null : data[key]);
+    set.push(`${col} = $${params.length}`);
+  }
+  if (!set.length) throw badRequest('Nothing to update');
+  params.push(dealId);
+  await pool.query(`UPDATE deals SET ${set.join(', ')} WHERE id = $${params.length}`, params);
+  await logEvent(dealId, 'referrals', { detail: data, actorId: user.id });
+  await auditService.log({ actor: user, action: 'deal.referrals', entityType: 'deal', entityId: dealId, after: data, ...meta });
+  return evaluate(dealId, { actor: user });
+}
+
 async function recordInvoicePayment(user, invoiceId, { reference, waive = false, note }, meta = {}) {
   const inv = (await pool.query('SELECT * FROM invoices WHERE id = $1', [invoiceId])).rows[0];
   if (!inv) throw notFound('Invoice not found');
@@ -554,6 +595,12 @@ async function dealView(user, dealId) {
     flow: FLOW,
     isRent: deal.isRent,
     dates: { atsExecutionDate: deal.ats_execution_date, saleDeedExecutionDate: deal.sale_deed_execution_date, leaseExecutionDate: deal.lease_execution_date },
+    referrals: {
+      loanStatus: deal.loan_referral_status, loanLender: deal.loan_lender,
+      insuranceStatus: deal.insurance_referral_status, insuranceProvider: deal.insurance_provider,
+      legalAdvocate: deal.legal_advocate, legalNotes: deal.legal_notes,
+    },
+    stageLabels: STAGE_LABEL,
     health,
     invoices,
     events: events.rows,
@@ -596,6 +643,7 @@ module.exports = {
   safeEvaluate,
   evaluateForProperty,
   recordDates,
+  recordReferrals,
   recordInvoicePayment,
   listInvoices,
   invoicePdf,

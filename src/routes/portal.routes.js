@@ -118,7 +118,7 @@ router.get('/overview', portal.overview);
  *         application/json:
  *           schema:
  *             type: object
- *             required: [purpose, city, feeConsent]
+ *             required: [purpose, city, consentToken]
  *             properties:
  *               purpose: { type: string, enum: [buy, rent] }
  *               propertyType: { type: string, enum: [apartment, villa, independent_house, plot, commercial, farmhouse, other] }
@@ -132,8 +132,9 @@ router.get('/overview', portal.overview);
  *               urgency: { type: string, enum: [immediate, 30_days, flexible] }
  *               notes: { type: string }
  *               mandateType: { type: string, enum: [standard, exclusive] }
- *               feeConsent: { type: boolean, example: true }
- *     responses: { 201: { description: Requirement }, 400: { description: Missing fee consent } }
+ *               consentToken: { type: string, description: From POST /mandates/consent/verify (kind requirement) }
+ *               priceRange: { type: object, description: 'Exclusive only - { minBudget, maxBudget } in INR, stored encrypted' }
+ *     responses: { 201: { description: Requirement + its mandate record }, 400: { description: Missing / invalid OTP consent or budget range } }
  */
 router.get('/requirements', portal.listRequirements);
 router.post(
@@ -154,7 +155,8 @@ router.post(
     body('amenities').optional().isArray({ max: 30 }),
     body('latitude').optional({ nullable: true }).isFloat({ min: -90, max: 90 }),
     body('longitude').optional({ nullable: true }).isFloat({ min: -180, max: 180 }),
-    body('feeConsent').isBoolean().withMessage('Fee consent is required'),
+    body('consentToken').isString().notEmpty().withMessage('Confirm the professional fee consent by OTP first'),
+    body('priceRange').optional({ nullable: true }).isObject(),
   ],
   validate,
   portal.createRequirement
@@ -410,15 +412,20 @@ const listingValidators = (creating) => [
   body('bathrooms').optional({ nullable: true }).isInt({ min: 0, max: 20 }),
   body('amenities').optional().isArray(),
   body('description').optional().isLength({ max: 5000 }),
-  body('mandateType').optional().isIn(['standard', 'exclusive']),
   ...(creating
     ? [
+        body('mandateType').optional().isIn(['standard', 'exclusive']),
         body('situationTags').optional().isArray({ max: 4 }),
         body('situationTags.*').optional().isIn(['urgent_sale', 'financial_distress', 'investor_exit', 'time_bound_sale']),
         body('estimatedMarketValue').optional({ nullable: true }).isFloat({ min: 1 }),
       ]
     : []),
-  ...(creating ? [body('feeConsent').isBoolean().withMessage('Fee consent is required')] : []),
+  ...(creating
+    ? [
+        body('consentToken').isString().notEmpty().withMessage('Confirm the professional fee consent by OTP first'),
+        body('priceRange').optional({ nullable: true }).isObject(),
+      ]
+    : []),
 ];
 
 /**
@@ -440,7 +447,7 @@ const listingValidators = (creating) => [
  *         application/json:
  *           schema:
  *             type: object
- *             required: [title, propertyType, transactionType, price, city, locality, feeConsent]
+ *             required: [title, propertyType, transactionType, price, city, locality, consentToken]
  *             properties:
  *               title: { type: string, example: 3 BHK apartment in Sector 56 }
  *               propertyType: { type: string, enum: [apartment, villa, independent_house, plot, commercial, farmhouse, other] }
@@ -457,8 +464,9 @@ const listingValidators = (creating) => [
  *               description: { type: string }
  *               pg: { type: boolean, description: Tag the listing as PG / co-living }
  *               mandateType: { type: string, enum: [standard, exclusive] }
- *               feeConsent: { type: boolean, example: true }
- *     responses: { 201: { description: Listing (pending approval) } }
+ *               consentToken: { type: string, description: From POST /mandates/consent/verify (kind listing) }
+ *               priceRange: { type: object, description: 'Exclusive only - { minPrice, maxPrice } in INR, stored encrypted' }
+ *     responses: { 201: { description: Listing (pending approval) + its mandate record } }
  */
 router.get('/listings', portal.listListings);
 router.post('/listings', listingValidators(true), validate, portal.createListing);
