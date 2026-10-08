@@ -86,7 +86,7 @@ async function submit({ mobile, otp, fullName, propertyId, requirementId, messag
     const rep = (await pool.query('SELECT arb_rep_id FROM leads WHERE id = $1', [leadId])).rows[0];
     representative = await assignment.repCard(rep?.arb_rep_id);
   } else {
-    const lead = await leadService.createPublicInquiry({ fullName: name, mobile: m, propertyId: propertyId || undefined, message: note, source: 'website', anonymousId });
+    const lead = await leadService.createPublicInquiry({ fullName: name, mobile: m, propertyId: propertyId || undefined, message: note, source: 'website', anonymousId, topic: 'Guest interest', enquiryType: requirementId ? 'requirement' : 'property', requirementId });
     leadId = lead.id;
     representative = lead.representative || null;
   }

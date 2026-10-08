@@ -166,6 +166,10 @@ async function sendAcknowledgement(leadId, user) {
 // opens a 'website' lead against it.
 async function createPublicInquiry(data) {
   const { fullName, email, mobile, propertyId, message, source } = data;
+  // Which desk this belongs to (CRM Enquiries tabs): from the form's topic.
+  const enquiry = require('./enquiry.service');
+  const topic = data.topic || (String(message || '').match(/^\[([^\]]{1,150})\]/) || [])[1] || null;
+  const enquiryType = enquiry.classify({ enquiryType: data.enquiryType, topic, propertyId, requirementId: data.requirementId });
 
   const customer = await customerService.findOrCreateCustomerByContact({ fullName, email, mobile });
 
@@ -174,10 +178,10 @@ async function createPublicInquiry(data) {
     await client.query('BEGIN');
 
     const result = await client.query(
-      `INSERT INTO leads (source, property_id, customer_id, status)
-       VALUES ($1, $2, $3, 'new')
+      `INSERT INTO leads (source, property_id, customer_id, status, enquiry_type, enquiry_topic, enquiry_details)
+       VALUES ($1, $2, $3, 'new', $4, $5, $6)
        RETURNING *`,
-      [source || 'website', propertyId || null, customer.id]
+      [source || 'website', propertyId || null, customer.id, enquiryType, topic ? String(topic).slice(0, 150) : null, JSON.stringify(enquiry.cleanDetails(data.details))]
     );
     const lead = result.rows[0];
 
@@ -208,6 +212,10 @@ async function createPublicInquiry(data) {
     await sendAcknowledgement(lead.id, null);
     if (propertyId) require('./matchEngine.service').recordEvent({ customerId: customer.id, propertyId, event: 'enquired' });
     const out = await getLeadById(lead.id);
+    // Engine 7: an enquiry on an institutional asset is Stage 1 (Intent Received).
+    if (propertyId && !data.skipInstitutionalHook) {
+      await require('./institutional.service').onLeadCreated(out, data.topic === 'Guest interest' ? 'guest' : 'platform').catch((err) => console.error('[institutional] intake failed:', err.message));
+    }
     out.representative = placed ? await assignment.repCard(placed.userId) : null;
     return out;
   } catch (err) {
@@ -372,11 +380,20 @@ async function getActivity(leadId) {
 // Used by the Broker CRM dashboard (GET /api/broker/dashboard) - counts of
 // this user's assigned leads grouped by status. Lives here rather than in
 // broker.service.js since this service owns all leads-table querying.
-async function getStatusCounts(userId) {
-  const result = await pool.query(
-    `SELECT status, COUNT(*) AS count FROM leads WHERE assigned_to = $1 GROUP BY status`,
-    [userId]
-  );
+// Whose leads a dashboard number covers: admins - every lead; an agency
+// admin - their agency's; anyone else - the leads they hold, whether
+// assigned directly or through the inquiry assignment cascade (arb_rep_id).
+// Accepts a user object (role-aware) or a bare user id (that user only).
+function dashboardScope(userOrId) {
+  const user = typeof userOrId === 'object' && userOrId ? userOrId : { id: userOrId };
+  if (user.role && isAdmin(user.role)) return { sql: 'TRUE', params: [] };
+  if (user.role === 'agency_admin' && user.tenant_id) return { sql: '(tenant_id = $1 OR assigned_to = $2 OR arb_rep_id = $2)', params: [user.tenant_id, user.id] };
+  return { sql: '(assigned_to = $1 OR arb_rep_id = $1)', params: [user.id] };
+}
+
+async function getStatusCounts(userOrId) {
+  const s = dashboardScope(userOrId);
+  const result = await pool.query(`SELECT status, COUNT(*) AS count FROM leads WHERE ${s.sql} GROUP BY status`, s.params);
   const counts = {};
   for (const row of result.rows) {
     counts[row.status] = Number(row.count);
@@ -389,9 +406,10 @@ async function getStatusCounts(userId) {
 // the given date range, how many have since become 'won'. from/to filter
 // on created_at (when the lead entered the pipeline), not on when it
 // converted - see getWonCount() below for a "won during this window" metric.
-async function getConversionStats(userId, { from, to } = {}) {
-  const where = ['assigned_to = $1'];
-  const params = [userId];
+async function getConversionStats(userOrId, { from, to } = {}) {
+  const s = dashboardScope(userOrId);
+  const where = [s.sql];
+  const params = [...s.params];
 
   if (from) {
     params.push(from);
@@ -429,9 +447,10 @@ async function getConversionStats(userId, { from, to } = {}) {
 // column, and a status change is the only thing that touches updated_at
 // after creation). This is distinct from getConversionStats() above, which
 // filters on when the lead was created, not when it converted.
-async function getWonCount(userId, { from, to } = {}) {
-  const where = ['assigned_to = $1', `status = 'won'`];
-  const params = [userId];
+async function getWonCount(userOrId, { from, to } = {}) {
+  const s = dashboardScope(userOrId);
+  const where = [s.sql, `status = 'won'`];
+  const params = [...s.params];
 
   if (from) {
     params.push(from);

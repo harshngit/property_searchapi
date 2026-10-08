@@ -48,6 +48,22 @@ router.get(
 
 /**
  * @swagger
+ * /trust/public/properties/{propertyId}/reviews:
+ *   get:
+ *     summary: Public - published reviews written about one listing, with their average rating (first name only, no contact)
+ *     tags: [Trust & Reputation]
+ *     parameters: [{ in: path, name: propertyId, required: true, schema: { type: string, format: uuid } }]
+ *     responses: { 200: { description: Rating summary and reviews } }
+ */
+router.get(
+  '/public/properties/:propertyId/reviews',
+  [param('propertyId').isUUID()],
+  validate,
+  asyncHandler(async (req, res) => success(res, 200, 'Reviews fetched', await reviewService.forProperty(req.params.propertyId)))
+);
+
+/**
+ * @swagger
  * /trust/badges/{id}/image.svg:
  *   get:
  *     summary: Shareable badge image (Featured Agent, Best Broker, Top Broker, Highly Rated, Community Champion) for social media
@@ -319,6 +335,41 @@ router.get('/reviews/mine', asyncHandler(async (req, res) => success(res, 200, '
  *     responses: { 200: { description: Reviews } }
  */
 router.get('/reviews/about-me', asyncHandler(async (req, res) => success(res, 200, 'Reviews fetched', await reviewService.aboutMe(req.user))));
+
+/**
+ * @swagger
+ * /trust/reviews:
+ *   get:
+ *     summary: "[Staff] Reviews desk - every review in any status, with totals by status"
+ *     tags: [Trust & Reputation]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters:
+ *       - { in: query, name: status, schema: { type: string, enum: [published, pending_moderation, hidden, rejected] } }
+ *       - { in: query, name: rating, schema: { type: integer, minimum: 1, maximum: 5 } }
+ *       - { in: query, name: q, schema: { type: string }, description: Review text, reviewer, reviewed person or property title }
+ *       - { in: query, name: propertyId, schema: { type: string, format: uuid } }
+ *       - { in: query, name: subjectId, schema: { type: string, format: uuid } }
+ *       - { in: query, name: reported, schema: { type: boolean }, description: Only reviews reported and not yet decided }
+ *       - { in: query, name: page, schema: { type: integer } }
+ *       - { in: query, name: limit, schema: { type: integer } }
+ *     responses: { 200: { description: Reviews, pagination and totals } }
+ */
+router.get(
+  '/reviews',
+  authorize(...STAFF),
+  [
+    query('status').optional().isIn(['published', 'pending_moderation', 'hidden', 'rejected']),
+    query('rating').optional().isInt({ min: 1, max: 5 }),
+    query('q').optional().isString().isLength({ max: 100 }),
+    query('propertyId').optional().isUUID(),
+    query('subjectId').optional().isUUID(),
+    query('reported').optional().isBoolean(),
+    query('page').optional().isInt({ min: 1 }),
+    query('limit').optional().isInt({ min: 1, max: 100 }),
+  ],
+  validate,
+  asyncHandler(async (req, res) => success(res, 200, 'Reviews fetched', await reviewService.adminList({ ...req.query, reported: req.query.reported === 'true' })))
+);
 
 /**
  * @swagger

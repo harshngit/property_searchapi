@@ -2,6 +2,25 @@ const pool = require('../config/db');
 const { signUrls, getReadUrl } = require('../utils/storage');
 const disclaimerService = require('./disclaimer.service');
 const opportunityService = require('./opportunity.service');
+const configService = require('./config.service');
+
+// Module 28 ranking and matching settings (app_config, admin-editable).
+async function searchSettings() {
+  const [weights, boost, maxSponsored, recencyDays, typo, radius, maxRadius] = await Promise.all([
+    configService.getConfig('search.ranking_weights', {}), configService.getConfig('search.sponsored_boost', 60), configService.getConfig('search.sponsored_max', 3),
+    configService.getConfig('search.recency_days', 60), configService.getConfig('search.typo_similarity', 0.35), configService.getConfig('search.default_radius_km', 5), configService.getConfig('search.max_radius_km', 100),
+  ]);
+  const w = (k) => (Number.isFinite(Number(weights?.[k])) ? Number(weights[k]) : 1);
+  return {
+    weights: { trust: w('trust'), verification: w('verification'), recency: w('recency'), match: w('match'), sponsored: w('sponsored'), text: w('text') },
+    sponsoredBoost: Number(boost) || 60, sponsoredMax: Math.max(Number(maxSponsored) || 0, 0), recencyDays: Number(recencyDays) || 60,
+    typo: Math.min(Math.max(Number(typo) || 0.35, 0.1), 0.9), radiusKm: Number(radius) || 5, maxRadiusKm: Number(maxRadius) || 100,
+  };
+}
+
+// Distance in km between a listing and a point ($lat / $lng are parameter numbers).
+const distanceSql = (lat, lng) =>
+  `(6371 * acos(LEAST(1, GREATEST(-1, cos(radians($${lat}::float8)) * cos(radians(properties.latitude::float8)) * cos(radians(properties.longitude::float8) - radians($${lng}::float8)) + sin(radians($${lat}::float8)) * sin(radians(properties.latitude::float8))))))`;
 
 function notFound(message = 'Property not found') {
   const err = new Error(message);
@@ -59,7 +78,7 @@ async function signImageArrays(rows, field) {
   );
 }
 
-function buildWhere(filters) {
+function buildWhere(filters, settings = { typo: 0.35, radiusKm: 5, maxRadiusKm: 100 }) {
   // Qualified with the table name (harmless when unjoined, e.g. in the
   // COUNT query below) since the results SELECT joins `users` for
   // builder_name, and `users` also has its own status/created_at columns -
@@ -82,9 +101,59 @@ function buildWhere(filters) {
     params.push(filters.locality);
     where.push(`locality ILIKE $${params.length}`);
   }
+  // Free text: full-text match, a plain "contains", or - for a typing mistake -
+  // a word close enough to one in the title, locality or city.
+  const extra = { q: null, lat: null, lng: null };
   if (filters.q) {
-    params.push(`%${filters.q}%`);
-    where.push(`(title ILIKE $${params.length} OR locality ILIKE $${params.length} OR city ILIKE $${params.length})`);
+    const q = String(filters.q).trim().slice(0, 120);
+    params.push(q);
+    extra.q = params.length;
+    params.push(`%${q}%`);
+    const like = params.length;
+    params.push(settings.typo);
+    const typo = params.length;
+    where.push(`(properties.search_vector @@ websearch_to_tsquery('simple', $${extra.q})
+      OR title ILIKE $${like} OR locality ILIKE $${like} OR city ILIKE $${like}
+      OR word_similarity(lower($${extra.q}), lower(title)) >= $${typo}::real
+      OR word_similarity(lower($${extra.q}), lower(coalesce(locality, '') || ' ' || coalesce(city, ''))) >= $${typo}::real)`);
+  }
+  // Geo-search: listings within a radius of a point (bounding box first so the index is used).
+  if (filters.lat !== undefined && filters.lng !== undefined && filters.lat !== null && filters.lng !== null) {
+    const radius = Math.min(Math.max(Number(filters.radiusKm) || settings.radiusKm, 0.1), settings.maxRadiusKm);
+    params.push(Number(filters.lat));
+    extra.lat = params.length;
+    params.push(Number(filters.lng));
+    extra.lng = params.length;
+    params.push(radius);
+    const r = params.length;
+    where.push(`properties.latitude IS NOT NULL AND properties.longitude IS NOT NULL
+      AND properties.latitude BETWEEN $${extra.lat}::numeric - ($${r}::numeric / 111.0) AND $${extra.lat}::numeric + ($${r}::numeric / 111.0)
+      AND properties.longitude BETWEEN $${extra.lng}::numeric - ($${r}::numeric / (111.0 * GREATEST(cos(radians($${extra.lat}::float8)), 0.01))::numeric) AND $${extra.lng}::numeric + ($${r}::numeric / (111.0 * GREATEST(cos(radians($${extra.lat}::float8)), 0.01))::numeric)
+      AND ${distanceSql(extra.lat, extra.lng)} <= $${r}::float8`);
+    extra.radiusKm = radius;
+  }
+  if (filters.minArea) {
+    params.push(filters.minArea);
+    where.push(`COALESCE(area_sqft, carpet_area_sqft) >= $${params.length}`);
+  }
+  if (filters.maxArea) {
+    params.push(filters.maxArea);
+    where.push(`COALESCE(area_sqft, carpet_area_sqft) <= $${params.length}`);
+  }
+  // Trust score of whoever listed it (sec. 8).
+  if (filters.minTrust) {
+    params.push(filters.minTrust);
+    where.push(`EXISTS (SELECT 1 FROM trust_scores ts WHERE ts.user_id = COALESCE(properties.broker_id, properties.created_by) AND ts.score >= $${params.length})`);
+  }
+  // Urgency: listings marked for a quick or time-bound sale.
+  if (filters.urgency === 'urgent') {
+    where.push(`(EXISTS (SELECT 1 FROM jsonb_array_elements_text(COALESCE(properties.situation_tags, '[]'::jsonb) || COALESCE(properties.tags, '[]'::jsonb)) t WHERE t ILIKE '%urgent%' OR t ILIKE '%time-bound%' OR t ILIKE '%time bound%' OR t ILIKE '%quick sale%') OR properties.badge ILIKE '%urgent%')`);
+  }
+  // Deal type in the words the site uses.
+  if (filters.dealType) {
+    const deal = { sale: `transaction_type::text IN ('sell', 'buy')`, rent: `transaction_type::text = 'rent'`, lease: `transaction_type::text IN ('rent', 'lease')`, new_launch: `properties.badge ILIKE '%new launch%'`,
+      resale: `transaction_type::text IN ('sell', 'buy') AND properties.builder_id IS NULL` }[filters.dealType];
+    if (deal) where.push(`(${deal})`);
   }
   // propertyType / furnishing / possessionStatus accept one value or a
   // comma-separated list (the website's multi-select filters).
@@ -181,16 +250,75 @@ function buildWhere(filters) {
     }
   }
 
-  return { where, params };
+  return { where, params, extra };
 }
 
-async function searchProperties(filters, page, limit, sort) {
-  const { where, params } = buildWhere(filters);
-  const whereClause = `WHERE ${where.join(' AND ')}`;
-  const orderClause = SORT_OPTIONS[sort] || SORT_OPTIONS.recommended;
-  const offset = (page - 1) * limit;
+// Faceted search: how many results each choice would give, for the filters in force.
+async function facetsFor(whereClause, params) {
+  const run = (sql) => pool.query(`${sql}`, params).then((r) => r.rows).catch(() => []);
+  const [types, beds, furnishing, localities, bands, flags] = await Promise.all([
+    run(`SELECT property_type::text AS value, COUNT(*)::int AS count FROM properties ${whereClause} GROUP BY 1 ORDER BY 2 DESC`),
+    run(`SELECT LEAST(bedrooms, 5) AS value, COUNT(*)::int AS count FROM properties ${whereClause} AND bedrooms IS NOT NULL GROUP BY 1 ORDER BY 1`),
+    run(`SELECT lower(furnishing) AS value, COUNT(*)::int AS count FROM properties ${whereClause} AND COALESCE(furnishing, '') <> '' GROUP BY 1 ORDER BY 2 DESC`),
+    run(`SELECT locality AS value, COUNT(*)::int AS count FROM properties ${whereClause} AND COALESCE(locality, '') <> '' GROUP BY 1 ORDER BY 2 DESC LIMIT 15`),
+    run(`SELECT CASE WHEN price_value < 2500000 THEN 'under_25l' WHEN price_value < 5000000 THEN '25l_50l' WHEN price_value < 10000000 THEN '50l_1cr' WHEN price_value < 20000000 THEN '1cr_2cr' WHEN price_value < 50000000 THEN '2cr_5cr' ELSE 'above_5cr' END AS value,
+                MIN(price_value) AS lo, COUNT(*)::int AS count FROM properties ${whereClause} AND price_value IS NOT NULL GROUP BY 1 ORDER BY 2`),
+    run(`SELECT COUNT(*) FILTER (WHERE is_verified)::int AS verified, COUNT(*) FILTER (WHERE COALESCE(rera_number, '') <> '')::int AS rera FROM properties ${whereClause}`),
+  ]);
+  return {
+    propertyType: types, bedrooms: beds.map((b) => ({ value: Number(b.value), label: Number(b.value) >= 5 ? '5+' : String(b.value), count: b.count })), furnishing, locality: localities,
+    priceBand: bands.map((b) => ({ value: b.value, count: b.count })), verified: flags[0]?.verified || 0, rera: flags[0]?.rera || 0,
+  };
+}
 
-  const countResult = await pool.query(`SELECT COUNT(*) FROM properties ${whereClause}`, params);
+// "Did you mean": the nearest known city / locality / project to what was typed.
+async function didYouMean(q, typo) {
+  const r = await pool.query(
+    `SELECT term, kind, city, similarity(lower(term), lower($1)) AS sim FROM search_terms WHERE lower(term) % lower($1) OR word_similarity(lower($1), lower(term)) >= $2::real
+     ORDER BY GREATEST(similarity(lower(term), lower($1)), word_similarity(lower($1), lower(term))) DESC, listings DESC LIMIT 1`,
+    [q, Math.max(typo - 0.1, 0.2)]
+  ).catch(() => ({ rows: [] }));
+  const hit = r.rows[0];
+  return hit && hit.term.toLowerCase() !== String(q).toLowerCase() ? { term: hit.term, kind: hit.kind, city: hit.city || null } : null;
+}
+
+async function searchProperties(filters, page, limit, sort, { userId = null, viewerKey = null, facets = false } = {}) {
+  const settings = await searchSettings();
+  const { where, params, extra } = buildWhere(filters, settings);
+  const whereClause = `WHERE ${where.join(' AND ')}`;
+  const offset = (page - 1) * limit;
+  const W = settings.weights;
+  const geo = extra.lat !== null;
+  // Sponsored boost: a live, approved Sponsored / Featured campaign on this listing (for the city searched, if it targets cities).
+  params.push(filters.city || null);
+  const cityParam = params.length;
+  const sponsoredSql = `(SELECT c.id FROM ad_campaigns c JOIN advertisers a ON a.id = c.advertiser_id
+      WHERE c.property_id = properties.id AND c.status = 'approved' AND a.status = 'active' AND CURRENT_DATE BETWEEN c.start_date AND c.end_date AND c.placements ?| ARRAY['search_sponsored', 'featured_listing']
+        AND (jsonb_array_length(COALESCE(c.targeting->'cities', '[]'::jsonb)) = 0 OR ($${cityParam}::varchar IS NOT NULL AND EXISTS (SELECT 1 FROM jsonb_array_elements_text(c.targeting->'cities') tc WHERE lower(tc) = lower($${cityParam}))))
+      ORDER BY (c.placements ? 'featured_listing') DESC LIMIT 1)`;
+  // Match score: how well it fits the signed-in buyer's own active requirements (sec. 7).
+  params.push(userId);
+  const userParam = params.length;
+  const matchSql = `(SELECT MAX(m.score) FROM requirement_matches m JOIN requirements r ON r.id = m.requirement_id JOIN customers cu ON cu.id = r.customer_id
+      WHERE m.property_id = properties.id AND r.status = 'active' AND cu.user_id = $${userParam}::uuid)`;
+  const textSql = extra.q ? `(ts_rank(properties.search_vector, websearch_to_tsquery('simple', $${extra.q})) * 40 + GREATEST(word_similarity(lower($${extra.q}), lower(title)), word_similarity(lower($${extra.q}), lower(coalesce(locality, '') || ' ' || coalesce(city, '')))) * 20)` : '0';
+  // Sec. 21.1 ranking: trust score + verification level + recency + match score + sponsored boost (+ text relevance when searching by words).
+  const scoreSql = `(
+      ${W.trust} * COALESCE((SELECT ts.search_boost FROM trust_scores ts WHERE ts.user_id = COALESCE(properties.broker_id, properties.created_by)), 0)
+    + ${W.verification} * (COALESCE((SELECT (ac.value->>(properties.verification_level::text))::numeric FROM app_config ac WHERE ac.config_key = 'verification.search_boost'), 0) + CASE WHEN is_verified THEN 5 ELSE 0 END)
+    + ${W.recency} * GREATEST(0, 20 * (1 - EXTRACT(EPOCH FROM (now() - properties.created_at)) / (86400.0 * ${settings.recencyDays})))
+    + ${W.match} * COALESCE(${matchSql}, 0) / 4.0
+    + ${W.text} * ${textSql})`;
+  const sorts = {
+    ...SORT_OPTIONS,
+    recommended: `(sponsored_campaign IS NOT NULL) DESC, rank_score DESC, properties.created_at DESC`,
+    relevance: `(sponsored_campaign IS NOT NULL) DESC, rank_score DESC, properties.created_at DESC`,
+    distance: geo ? 'distance_km ASC NULLS LAST' : 'properties.created_at DESC',
+  };
+  const orderClause = sorts[sort] || (geo && !sort ? sorts.distance : sorts.recommended);
+
+  // (The WHERE clause uses only the filter parameters, which come first.)
+  const countResult = await pool.query(`SELECT COUNT(*) FROM properties ${whereClause}`, params.slice(0, cityParam - 1));
   const pagination = {
     page,
     limit,
@@ -198,25 +326,29 @@ async function searchProperties(filters, page, limit, sort) {
     totalPages: Math.ceil(Number(countResult.rows[0].count) / limit),
   };
 
-  params.push(limit, offset);
-
   if (RESTRICTED_CATEGORIES.includes(filters.listingCategory)) {
+    // Masked teasers: the plain filters and sort only (no sponsored or match ranking on confidential stock).
+    const teaserParams = [...params.slice(0, cityParam - 1), limit, offset];
+    const teaserOrder = geo && (!sort || sort === 'distance') ? `${distanceSql(extra.lat, extra.lng)} ASC` : SORT_OPTIONS[sort] || SORT_OPTIONS.recommended;
     const result = await pool.query(
       // TEASER_COLUMNS is written against alias `p`; this query uses the
       // unaliased table name because buildWhere's clauses do.
       `SELECT ${opportunityService.TEASER_COLUMNS.replace(/\bp\./g, 'properties.')}
        FROM properties ${whereClause}
-       ORDER BY ${orderClause}
-       LIMIT $${params.length - 1} OFFSET $${params.length}`,
-      params
+       ORDER BY ${teaserOrder}
+       LIMIT $${teaserParams.length - 1} OFFSET $${teaserParams.length}`,
+      teaserParams
     );
     const items = await signUrls(result.rows.map(opportunityService.toTeaser), 'primary_image');
     const disclaimers = await disclaimerService.getDisclaimers(['all_listings', filters.listingCategory]);
     return { items, pagination, disclaimers };
   }
 
+  params.push(limit, offset);
+
   const result = await pool.query(
-    `SELECT properties.id, title, description, property_type, transaction_type, price, price_value, rate,
+    `SELECT * FROM (
+     SELECT properties.id, title, description, property_type, transaction_type, price, price_value, rate,
             listing_category, city, locality, latitude, longitude, area_sqft, carpet_area_sqft,
             bedrooms, bathrooms, amenities, furnishing, possession_status, facing, floor_number, total_floors,
             is_verified, badge, tags, rera_number, liquidity_band, properties.created_at,
@@ -230,19 +362,42 @@ async function searchProperties(filters, page, limit, sort) {
             (SELECT json_build_object('score', ts.score,
                     'badges', (SELECT COALESCE(json_agg(ub.badge_key), '[]'::json) FROM user_badges ub
                                WHERE ub.user_id = ts.user_id AND ub.status <> 'revoked'))
-             FROM trust_scores ts WHERE ts.user_id = COALESCE(properties.broker_id, properties.created_by)) AS lister_trust
+             FROM trust_scores ts WHERE ts.user_id = COALESCE(properties.broker_id, properties.created_by)) AS lister_trust,
+            ${scoreSql} AS rank_score,
+            ${matchSql} AS match_score,
+            ${geo ? `round((${distanceSql(extra.lat, extra.lng)})::numeric, 2)` : 'NULL::numeric'} AS distance_km,
+            ${sponsoredSql} AS sponsored_campaign
      FROM properties
      LEFT JOIN users builder ON builder.id = properties.builder_id
      ${whereClause}
-     ORDER BY ${orderClause}
+     ) ranked
+     ORDER BY ${orderClause.replace(/properties\./g, '')}
      LIMIT $${params.length - 1} OFFSET $${params.length}`,
     params
   );
 
-  const signed = await signImageArrays(await signUrls(result.rows.map(publicCoordinates), 'primary_image'), 'images');
-  const disclaimers = await disclaimerService.getDisclaimers(['all_listings']);
+  // Only the first few sponsored listings are shown as such on a page; the label is always shown (sec. F.3).
+  let shown = 0;
+  const ads = require('./advertising.service');
+  const rows = [];
+  for (const row of result.rows) {
+    const { sponsored_campaign: campaign, rank_score: rank, match_score: match, distance_km: distance, ...rest } = row;
+    const item = { ...rest, rank_score: Math.round(Number(rank) * 10) / 10, match_score: match === null ? null : Number(match), distance_km: distance === null ? null : Number(distance), sponsored: null };
+    if (campaign && shown < settings.sponsoredMax) {
+      shown += 1;
+      const label = await ads.sponsoredLabel(campaign, { viewerKey, userId, city: filters.city || null }).catch(() => null);
+      if (label) item.sponsored = label;
+    }
+    rows.push(item);
+  }
 
-  return { items: signed, pagination, disclaimers };
+  const signed = await signImageArrays(await signUrls(rows.map(publicCoordinates), 'primary_image'), 'images');
+  const disclaimers = await disclaimerService.getDisclaimers(['all_listings']);
+  const facetParams = params.slice(0, cityParam - 1);
+  const out = { items: signed, pagination, disclaimers, search: { sort: sort || (geo ? 'distance' : 'recommended'), radiusKm: extra.radiusKm || null } };
+  if (facets) out.facets = await facetsFor(whereClause, facetParams);
+  if (extra.q && pagination.total === 0) out.didYouMean = await didYouMean(filters.q, settings.typo);
+  return out;
 }
 
 async function getFilterOptions() {
@@ -356,9 +511,19 @@ async function getSuggestions(term) {
     ),
   ]);
 
+  // Typo-tolerant matches from the search dictionary ("gurgoan" -> Gurgaon, "dwraka" -> Dwarka), and project names.
+  const fuzzy = await pool
+    .query(
+      `SELECT term AS value, kind AS type, NULLIF(city, '') AS city FROM search_terms
+       WHERE lower(term) LIKE lower($1) || '%' OR lower(term) % lower($1) OR word_similarity(lower($1), lower(term)) >= $2::real
+       ORDER BY (lower(term) LIKE lower($1) || '%') DESC, GREATEST(similarity(lower(term), lower($1)), word_similarity(lower($1), lower(term))) DESC, listings DESC LIMIT 10`,
+      [term, (await searchSettings()).typo]
+    )
+    .catch(() => ({ rows: [] }));
+
   const seen = new Set();
   const merged = [];
-  for (const row of [...masterCities.rows, ...masterLocalities.rows, ...cities.rows, ...localities.rows]) {
+  for (const row of [...masterCities.rows, ...masterLocalities.rows, ...cities.rows, ...localities.rows, ...fuzzy.rows]) {
     const key = `${row.type}:${String(row.value).toLowerCase()}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -411,4 +576,38 @@ async function getHomeData() {
   };
 }
 
-module.exports = { searchProperties, getFilterOptions, getSuggestions, getPublicPropertyById, getHomeData };
+// Rebuild the search dictionary from the geography master and live listings.
+async function refreshSearchTerms() {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM search_terms');
+    await client.query(
+      `INSERT INTO search_terms (term, kind, city, listings)
+       SELECT term, kind, city, SUM(n)::int FROM (
+         SELECT c.city_name AS term, 'city' AS kind, '' AS city, 0 AS n FROM cities c WHERE c.status IN ('active', 'coming_soon')
+         UNION ALL SELECT l.locality_name, 'locality', c.city_name, 0 FROM localities l JOIN cities c ON c.id = l.city_id WHERE l.is_active AND c.status IN ('active', 'coming_soon')
+         UNION ALL SELECT p.city, 'city', '', COUNT(*) FROM properties p WHERE p.status = 'approved' AND COALESCE(p.city, '') <> '' GROUP BY 1
+         UNION ALL SELECT p.locality, 'locality', COALESCE(p.city, ''), COUNT(*) FROM properties p WHERE p.status = 'approved' AND COALESCE(p.locality, '') <> '' GROUP BY 1, 3
+         UNION ALL SELECT left(p.title, 200), 'project', COALESCE(p.city, ''), 1 FROM properties p WHERE p.status = 'approved' AND p.listing_category::text = 'residential' AND length(p.title) BETWEEN 4 AND 200
+       ) t WHERE btrim(term) <> '' GROUP BY term, kind, city
+       ON CONFLICT DO NOTHING`
+    );
+    await client.query('COMMIT');
+    return (await pool.query('SELECT COUNT(*)::int AS n FROM search_terms')).rows[0].n;
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+let termsTimer = null;
+function startScheduler() {
+  if (termsTimer) return;
+  refreshSearchTerms().catch((err) => console.error('[search] dictionary refresh failed:', err.message));
+  termsTimer = setInterval(() => refreshSearchTerms().catch((err) => console.error('[search] dictionary refresh failed:', err.message)), 30 * 60 * 1000);
+}
+
+module.exports = { searchProperties, getFilterOptions, getSuggestions, getPublicPropertyById, getHomeData, refreshSearchTerms, startScheduler, buildWhere, searchSettings };

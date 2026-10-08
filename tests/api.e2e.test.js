@@ -1788,7 +1788,8 @@ test('orchestration + invoices + intelligence + reputation: gating, auto-advance
   assert.equal(Number(inv1.total_amount), 59000);
   assert.equal(inv1.gstin, '07DERPR1574G2ZY');
   assert.match(inv1.invoice_number, /^ARB\/\d{4}-\d{2}\/\d{6}$/);
-  assert.equal(Math.round((new Date(inv1.due_date) - new Date(today)) / 86400000), 7, 'net 7');
+  // Due date against the invoice's own issue date (the database's date, not this process's UTC date).
+  assert.equal(Math.round((new Date(inv1.due_date) - new Date(inv1.issue_date)) / 86400000), 7, 'net 7');
   assert.ok((await pool.query(`SELECT 1 FROM notifications WHERE user_id = $1 AND type = 'invoice'`, [buyer.id])).rows.length, 'buyer notified');
 
   // Loan referral (referral-only) -> Insurance Referral; insurance not needed still waits for the approved agreement.
@@ -2696,4 +2697,1645 @@ test('guest interest (OTP, no account), web push, reference-data crawlers (RERA 
     }
     server.close();
   }
+});
+
+test('UAT round 1: role-scoped dashboard, enquiry desk by type, site-visit requests, attention counts, reviews on the listing, testimonials, notification preferences', async () => {
+  const A = ctx.admin.token;
+  const S = ctx.sales.token;
+  const UCITY = `Uat City ${RUN}`;
+  const lister = await createUser('broker', 'uatLister');
+  const outsider = await createUser('broker', 'uatOutsider');
+  const listing = await api('POST', '/properties', { token: lister.token, body: { ...baseListing(), title: `Uat flat ${RUN}`, city: UCITY, price: '70 Lakh' } });
+  const P = listing.data.id;
+  await pool.query(`UPDATE properties SET status = 'approved', under_review = false WHERE id = $1`, [P]);
+  const phone = () => `7${String(Math.floor(Math.random() * 1e9)).padStart(9, '0')}`;
+
+  // ---- enquiries land in the right desk
+  const loan = await api('POST', '/leads/public-inquiry', {
+    body: { fullName: `Loan Seeker ${RUN}`, mobile: phone(), message: '[Home Loan & Financing] Need a loan for a flat', topic: 'Home Loan & Financing', details: { loanAmount: 4500000, employment: 'Salaried', 'bad key!': 'x' } },
+  });
+  assert.equal(loan.status, 201, JSON.stringify(loan.body));
+  const loanRow = (await pool.query('SELECT enquiry_type, enquiry_topic, enquiry_details FROM leads WHERE id = $1', [loan.data.id])).rows[0];
+  assert.equal(loanRow.enquiry_type, 'home_loan');
+  assert.equal(loanRow.enquiry_topic, 'Home Loan & Financing');
+  assert.deepEqual(loanRow.enquiry_details, { loanAmount: 4500000, employment: 'Salaried' });
+  // Older clients send only "[Topic] message" - still classified.
+  const legacy = await api('POST', '/leads/public-inquiry', { body: { fullName: `Insurer ${RUN}`, mobile: phone(), message: '[Insurance referral] cover for my home' } });
+  assert.equal((await pool.query('SELECT enquiry_type FROM leads WHERE id = $1', [legacy.data.id])).rows[0].enquiry_type, 'insurance');
+  const prop = await api('POST', '/leads/public-inquiry', { body: { fullName: `Buyer ${RUN}`, mobile: phone(), propertyId: P, message: '[Property enquiry] is it available' } });
+  assert.equal((await pool.query('SELECT enquiry_type FROM leads WHERE id = $1', [prop.data.id])).rows[0].enquiry_type, 'property');
+
+  const loans = await api('GET', `/enquiries?type=home_loan&search=${encodeURIComponent(`Loan Seeker ${RUN}`)}`, { token: A });
+  assert.equal(loans.data.items.length, 1);
+  assert.equal(loans.data.items[0].message, 'Need a loan for a flat', 'topic prefix stripped');
+  assert.equal(loans.data.items[0].enquiry_details.loanAmount, 4500000);
+  assert.ok(!(await api('GET', '/enquiries?type=insurance', { token: A })).data.items.some((i) => i.id === loan.data.id), 'each type in its own list');
+  const summary = await api('GET', '/enquiries/summary', { token: A });
+  assert.ok(summary.data.types.find((t) => t.type === 'home_loan').total >= 1 && summary.data.types.find((t) => t.type === 'insurance').new >= 1);
+  assert.equal((await api('GET', `/enquiries?search=${encodeURIComponent(`Loan Seeker ${RUN}`)}`, { token: outsider.token })).data.items.length, 0, 'another broker does not see it');
+  assert.equal((await api('GET', '/enquiries', { token: ctx.customer.token })).status, 403);
+  // The representative the cascade assigned sees it; so does the admin.
+  const rep = (await pool.query('SELECT arb_rep_id FROM leads WHERE id = $1', [loan.data.id])).rows[0].arb_rep_id;
+  if (rep) {
+    const repUser = (await pool.query('SELECT email FROM users WHERE id = $1', [rep])).rows[0];
+    assert.ok(repUser, 'assigned representative exists');
+  }
+
+  // ---- dashboard: admins see the platform, not just leads assigned to them personally
+  const dash = await api('GET', '/broker/dashboard', { token: A });
+  assert.equal(dash.data.scope, 'all');
+  const totalLeads = Object.values(dash.data.leadsByStatus).reduce((a, b) => a + b, 0);
+  assert.ok(totalLeads >= 3 && dash.data.propertiesListedCount >= 1, JSON.stringify(dash.data));
+  const mineDash = await api('GET', '/broker/dashboard', { token: outsider.token });
+  assert.equal(mineDash.data.scope, 'mine');
+  assert.equal(Object.values(mineDash.data.leadsByStatus).reduce((a, b) => a + b, 0), 0);
+  // A lead held through the assignment cascade (arb_rep_id) counts for that representative.
+  await pool.query('UPDATE leads SET arb_rep_id = $1 WHERE id = $2', [ctx.sales.id, prop.data.id]);
+  const repDash = await api('GET', '/broker/dashboard', { token: S });
+  assert.ok(Object.values(repDash.data.leadsByStatus).reduce((a, b) => a + b, 0) >= 1);
+
+  // ---- site-visit request: record, CRM list, attention, schedule -> deal + visit
+  const buyer = await createUser('customer', 'uatBuyer');
+  await api('GET', '/me/profile', { token: buyer.token });
+  const buyerCust = (await pool.query('SELECT id FROM customers WHERE user_id = $1', [buyer.id])).rows[0].id;
+  const lead = (await pool.query(`INSERT INTO leads (source, property_id, customer_id, status, arb_rep_id) VALUES ('website', $1, $2, 'new', $3) RETURNING id`, [P, buyerCust, ctx.sales.id])).rows[0].id;
+  const when = new Date(Date.now() + 3 * 86400000).toISOString();
+  const asked = await api('POST', `/me/enquiries/${lead}/visit-request`, { token: buyer.token, body: { preferredAt: when, note: 'Evening please' } });
+  assert.ok([200, 201].includes(asked.status), JSON.stringify(asked.body));
+  const pending = await api('GET', '/enquiries/visit-requests', { token: S });
+  const vr = pending.data.find((r) => r.lead_id === lead);
+  assert.ok(vr && vr.status === 'pending' && vr.property_title === `Uat flat ${RUN}`);
+  assert.ok((await pool.query(`SELECT 1 FROM notifications WHERE user_id = $1 AND type = 'visit_request' AND related_entity_id = $2`, [ctx.sales.id, lead])).rows.length, 'representative holding the enquiry is notified');
+  assert.ok(!(await api('GET', '/enquiries/visit-requests', { token: outsider.token })).data.some((r) => r.id === vr.id));
+  const att = await api('GET', '/enquiries/attention', { token: S });
+  assert.ok(att.data.items.find((i) => i.key === 'visit_requests').count >= 1);
+  assert.ok(att.data.items.some((i) => i.key === 'deal_room_requests') && att.data.items.some((i) => i.key === 'listings_pending'));
+  assert.ok(!(await api('GET', '/enquiries/attention', { token: outsider.token })).data.items.some((i) => i.key === 'deal_room_requests'), 'staff-only queues hidden from brokers');
+  assert.equal((await api('POST', `/enquiries/visit-requests/${vr.id}/decline`, { token: S, body: {} })).status, 422, 'decline needs a reason');
+  const scheduled = await api('POST', `/enquiries/visit-requests/${vr.id}/schedule`, { token: S, body: {} });
+  assert.equal(scheduled.status, 200, JSON.stringify(scheduled.body));
+  assert.ok(scheduled.data.dealId && scheduled.data.siteVisitId);
+  const deal = (await pool.query('SELECT lead_id, customer_id, property_id FROM deals WHERE id = $1', [scheduled.data.dealId])).rows[0];
+  assert.deepEqual(deal, { lead_id: lead, customer_id: buyerCust, property_id: P });
+  assert.ok((await api('GET', '/me/visits', { token: buyer.token })).data.some((v) => v.id === scheduled.data.siteVisitId), 'customer sees the booked visit');
+  assert.equal((await api('POST', `/enquiries/visit-requests/${vr.id}/schedule`, { token: S, body: {} })).status, 400, 'handled once');
+
+  // ---- a published review about a party on this property shows on the listing page
+  const owner = await createUser('customer', 'uatOwner');
+  await pool.query(
+    `INSERT INTO reviews (reviewer_id, subject_user_id, property_id, deal_id, interaction, rating, title, body, status) VALUES ($1, $2, $3, $4, 'site_visit', 4, 'Smooth visit', $5, 'published')`,
+    [buyer.id, owner.id, P, scheduled.data.dealId, `Owner was helpful ${RUN}`]
+  );
+  const pub = await api('GET', `/trust/public/listings/${P}`);
+  assert.ok(pub.data.reviews.some((r) => r.body === `Owner was helpful ${RUN}`), 'review of a non-primary party still shows on that listing');
+
+  // ---- reviews for the property (public) and the admin Reviews desk
+  const propReviews = await api('GET', `/trust/public/properties/${P}/reviews`);
+  assert.ok(propReviews.data.reviews.some((r) => r.body === `Owner was helpful ${RUN}`), 'property page lists its own reviews');
+  assert.equal(propReviews.data.rating.count, propReviews.data.reviews.length);
+  assert.equal((await api('GET', '/trust/reviews', { token: outsider.token })).status, 403, 'Reviews desk is staff only');
+  const desk = await api('GET', `/trust/reviews?propertyId=${P}`, { token: A });
+  const deskRow = desk.data.items.find((r) => r.body === `Owner was helpful ${RUN}`);
+  assert.ok(deskRow && deskRow.reviewerName && deskRow.propertyId === P, 'desk shows the review with who wrote it');
+  assert.ok(desk.data.stats.published >= 1);
+  assert.equal((await api('PUT', `/trust/reviews/${deskRow.id}/moderate`, { token: A, body: { action: 'hide', note: 'check' } })).status, 200);
+  assert.equal((await api('GET', `/trust/public/properties/${P}/reviews`)).data.reviews.some((r) => r.id === deskRow.id), false, 'hidden review leaves the website');
+  assert.equal((await api('GET', `/trust/reviews?propertyId=${P}&status=hidden`, { token: A })).data.items.length, 1);
+  assert.equal((await api('PUT', `/trust/reviews/${deskRow.id}/moderate`, { token: A, body: { action: 'approve' } })).status, 200);
+
+  // ---- testimonials
+  assert.equal((await api('POST', '/content/manage/testimonials', { token: outsider.token, body: { personName: 'X Y', quote: 'A fine experience overall.' } })).status, 403);
+  assert.equal((await api('POST', '/content/manage/testimonials', { token: A, body: { personName: 'Asha', quote: 'Great service, call me on 9876543210 for details.' } })).status, 422, 'contact details blocked');
+  const t1 = await api('POST', '/content/manage/testimonials', { token: A, body: { personName: `Asha ${RUN}`, personRole: 'Home buyer', city: UCITY, quote: `Found my flat in two weeks ${RUN}.`, rating: 5 } });
+  assert.equal(t1.status, 201, JSON.stringify(t1.body));
+  const hidden = await api('GET', `/content/testimonials?city=${encodeURIComponent(UCITY)}&limit=24`);
+  assert.ok(!hidden.data.some((t) => t.id === t1.data.id), 'unpublished stays off the site');
+  await api('PUT', `/content/manage/testimonials/${t1.data.id}`, { token: A, body: { isPublished: true } });
+  const shown = await api('GET', `/content/testimonials?city=${encodeURIComponent(UCITY)}`);
+  assert.equal(shown.data[0].id, t1.data.id, "a city's own testimonial comes first");
+  assert.ok(!('createdBy' in shown.data[0]));
+  assert.equal((await api('DELETE', `/content/manage/testimonials/${t1.data.id}`, { token: A })).status, 200);
+
+  // ---- notification preferences: topics and quiet hours hold push back
+  const prefs0 = await api('GET', '/notifications/preferences', { token: buyer.token });
+  assert.equal(prefs0.data.pushEnabled, true);
+  assert.equal(prefs0.data.topics.length, 6);
+  assert.equal((await api('PUT', '/notifications/preferences', { token: buyer.token, body: { quietStart: '22:00' } })).status, 400, 'both ends of quiet hours');
+  const saved = await api('PUT', '/notifications/preferences', { token: buyer.token, body: { pushMuted: ['rentals', 'nonsense'], quietStart: '22:00', quietEnd: '07:00', timezone: 'Asia/Kolkata' } });
+  assert.deepEqual(saved.data.pushMuted, ['rentals']);
+  const push = require('../src/services/push.service');
+  assert.deepEqual(await push.pushAllowed(buyer.id, 'rent_due', new Date('2026-10-05T06:30:00Z')), { allowed: false, reason: 'topic_muted' });
+  assert.deepEqual(await push.pushAllowed(buyer.id, 'match_hot', new Date('2026-10-05T18:00:00Z')), { allowed: false, reason: 'quiet_hours' }, '23:30 IST');
+  assert.deepEqual(await push.pushAllowed(buyer.id, 'match_hot', new Date('2026-10-05T06:30:00Z')), { allowed: true }, '12:00 IST');
+  await api('PUT', '/notifications/preferences', { token: buyer.token, body: { pushEnabled: false } });
+  assert.equal((await push.pushAllowed(buyer.id, 'match_hot', new Date('2026-10-05T06:30:00Z'))).reason, 'push_off');
+});
+
+test('institutional engine: confidential listing, buyer qualification, NDA gate, 9-stage pipeline, due diligence, valuation, offers, closure', async () => {
+  const A = ctx.admin.token;
+  const S = ctx.sales.token;
+  const ICITY = `Inst City ${RUN}`;
+  const NAME = `Sunrise Public School ${RUN}`;
+  const payload = {
+    institutionName: NAME, assetClass: 'k12_school', boardAffiliation: 'CBSE', yearEstablished: new Date().getFullYear() - 25, city: ICITY, locality: 'Knowledge Park',
+    address: '12 Campus Road', latitude: 28.61, longitude: 77.23, campusAreaAcres: 2, builtUpAreaSqft: 60000, buildingCount: 3, studentEnrollment: 800, facultyCount: 60,
+    enrollmentHistory: [{ year: 2022, count: 600 }, { year: 2023, count: 700 }, { year: 2024, count: 800 }],
+    nocStatus: 'valid', approvals: [{ name: 'CBSE affiliation', status: 'valid' }, { name: 'Fire safety certificate', status: 'pending' }],
+    landOwnership: 'owned', dealType: 'full_sale', askingPriceCr: 45, annualRevenueCr: 10, ebitdaCr: 4,
+  };
+
+  // ---- who may list; geolocation is mandatory
+  const plainBroker = await createUser('broker', 'instBroker');
+  assert.equal((await api('POST', '/institutional/listings', { token: plainBroker.token, body: payload })).status, 403, 'only certified institutional brokers');
+  const { latitude, ...noGeo } = payload;
+  assert.equal((await api('POST', '/institutional/listings', { token: S, body: noGeo })).status, 400, 'lat / long mandatory');
+  const created = await api('POST', '/institutional/listings', { token: S, body: payload });
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  const P = created.data.id;
+  assert.equal(created.data.campusAreaSqft, 87120, 'acres converted');
+  assert.equal(created.data.ebitdaMultiple, 11.25);
+  const seller = await createUser('customer', 'instSeller');
+  const sellerListing = await api('POST', '/institutional/listings', { token: seller.token, body: { ...payload, institutionName: `Seller College ${RUN}`, assetClass: 'college' } });
+  assert.equal(sellerListing.data.status, 'pending_approval', "a seller's own listing waits for approval");
+  assert.equal((await api('GET', `/institutional/listings/${sellerListing.data.id}`)).status, 404, 'not public until approved');
+
+  // ---- confidentiality: the name is nowhere in the public surfaces
+  const propRow = (await pool.query('SELECT title, description, listing_category, status FROM properties WHERE id = $1', [P])).rows[0];
+  assert.equal(propRow.title, 'K-12 School in Knowledge Park');
+  assert.ok(!JSON.stringify(propRow).includes('Sunrise'));
+  const list = await api('GET', `/institutional/listings?city=${encodeURIComponent(ICITY)}&assetClass=k12_school&budgetMaxCr=50`);
+  const card = list.data.items.find((i) => i.id === P);
+  assert.ok(card, JSON.stringify(list.body).slice(0, 300));
+  assert.equal(card.summary, 'K-12 School, 500-1,000 students, Knowledge Park, Asking ₹25-50 Cr');
+  assert.ok(!JSON.stringify(list.body).includes('Sunrise') && !('askingPriceCr' in card) && !('studentEnrollment' in card) && !('latitude' in card));
+  assert.match(list.data.disclaimer, /do not act as legal counsel/);
+  assert.equal((await api('GET', `/institutional/listings?city=${encodeURIComponent(ICITY)}&budgetMaxCr=20`)).data.items.length, 0, 'budget filter');
+  const anon = await api('GET', `/institutional/listings/${P}`);
+  assert.equal(anon.data.access.full, false);
+  assert.ok(!JSON.stringify(anon.body).includes('Sunrise') && !anon.data.valuation);
+  for (const path of [`/properties/${P}`, `/search/properties?city=${encodeURIComponent(ICITY)}`, `/opportunities/public/${P}`]) {
+    const r = await api('GET', path);
+    assert.ok(!JSON.stringify(r.body).includes('Sunrise'), `${path} must not leak the institution name`);
+  }
+
+  // ---- valuation (indicative)
+  const staffView = await api('GET', `/institutional/listings/${P}`, { token: S });
+  assert.equal(staffView.data.listing.institutionName, NAME);
+  const v = staffView.data.valuation;
+  assert.equal(v.enrollmentTrend.trend, 'growing');
+  assert.equal(v.ebitdaLinked.appliedMultiple, 9.9, 'sector multiple 9 + 10% for growing enrollment');
+  assert.equal(v.ebitdaLinked.valueCr, 39.6);
+  assert.equal(v.assetBased.landValueCr, 21.78, '87,120 sq ft x default land rate');
+  assert.equal(v.assetBased.buildingReplacementCr, 16.8);
+  assert.equal(v.assetBased.brandValueCr, 2, '25 years -> 20% of revenue');
+  assert.equal(v.assetBased.valueCr, 41.18, 'land + building + brand + approvals (0.5 + 0.1)');
+  assert.equal(v.replacementCost.valueCr, 44.37);
+  assert.equal(v.impliedEbitdaMultiple, 11.3);
+  assert.ok(v.exitPotential.score >= 0 && v.exitPotential.score <= 100 && v.exitPotential.factors.length === 6);
+  assert.ok(!v.benchmarking.sameCity, 'no comparable in this city yet');
+  await api('POST', '/institutional/manage/comparables', { token: S, body: { assetClass: 'k12_school', city: ICITY, dealYear: 2025, dealValueCr: 30, ebitdaCr: 3, enrollment: 600, areaAcres: 2 } });
+  const bench = (await api('GET', `/institutional/listings/${P}`, { token: S })).data.valuation.benchmarking;
+  assert.equal(bench.sameCity, 1);
+  assert.ok(bench.implied.some((i) => i.basis === 'EV / EBITDA') && bench.askingVsComparablesPercent !== null);
+
+  // ---- due diligence: checklist, automated flags, staff review
+  const dd = await api('GET', `/institutional/manage/listings/${P}/due-diligence`, { token: S });
+  assert.equal(dd.data.sector, 'education');
+  assert.ok(['land_records', 'noc', 'fire_noc', 'affiliation_certificate', 'trust_deed'].every((t) => dd.data.checklist.some((c) => c.type === t && !c.present)));
+  assert.ok(dd.data.riskFlags.some((f) => /Fire safety certificate: approval pending/.test(f.detail)));
+  assert.ok(dd.data.riskFlags.some((f) => /State education department recognition/.test(f.detail)), 'expected approval not declared');
+  assert.equal((await api('PUT', `/institutional/manage/listings/${P}/due-diligence`, { token: S, body: { key: 'encumbrance', status: 'issue' } })).status, 400, 'an issue needs a note');
+  const reviewed = await api('PUT', `/institutional/manage/listings/${P}/due-diligence`, { token: S, body: { key: 'ownershipChain', status: 'ok', note: 'Sale deeds 1998-2001 traced' } });
+  assert.equal(reviewed.data.review.find((r) => r.key === 'ownershipChain').status, 'ok');
+  assert.equal((await api('GET', `/institutional/manage/listings/${P}/due-diligence`, { token: plainBroker.token })).status, 403);
+
+  // ---- Stage 1: intent -> lead through the cascade + pipeline record
+  const buyer = await createUser('customer', 'instBuyer');
+  const intent = await api('POST', `/institutional/listings/${P}/interest`, { token: buyer.token, body: { message: 'Our trust runs three schools.' } });
+  assert.equal(intent.status, 201, JSON.stringify(intent.body));
+  const D = intent.data.id;
+  assert.match(intent.data.dealNumber, /^INST-\d{4}-\d{4}$/);
+  assert.equal(intent.data.stage, 'intent_received');
+  assert.equal(intent.data.stages.length, 9);
+  assert.ok(!('buyer' in intent.data) && !('institutionName' in intent.data.listing), 'buyer view carries no internals');
+  const lead = (await pool.query('SELECT l.enquiry_type FROM institutional_deals d JOIN leads l ON l.id = d.lead_id WHERE d.id = $1', [D])).rows[0];
+  assert.equal(lead.enquiry_type, 'institutional');
+  assert.equal((await api('POST', `/institutional/listings/${P}/interest`, { token: buyer.token, body: {} })).data.id, D, 'one live deal per buyer per asset');
+  assert.equal((await pool.query('SELECT COUNT(*)::int AS n FROM institutional_deals WHERE property_id = $1', [P])).rows[0].n, 1);
+  const staffDeal = () => api('GET', `/institutional/deals/${D}`, { token: S });
+  const act = (action, body = {}) => api('POST', `/institutional/manage/deals/${D}/${action}`, { token: S, body });
+
+  // ---- Stage 2: screened -> Buyer Qualification
+  assert.equal((await act('screen', { note: 'Genuine education trust' })).data.stage, 'buyer_qualification');
+  // NDA is refused until the buyer is qualified.
+  const nda = (name) => api('POST', `/deal-room/${P}/nda`, { token: buyer.token, body: { fullName: name, accept: true } });
+  assert.equal((await nda('Inst Buyer')).status, 403);
+  assert.equal((await api('GET', `/institutional/deals/${D}`, { token: buyer.token })).data.yourAction, 'complete_buyer_profile');
+  const profile = await api('PUT', '/institutional/buyer-profile', { token: buyer.token, body: { buyerType: 'trust', organisationName: `Vidya Trust ${RUN}`, budgetMinCr: 20, budgetMaxCr: 60, geographies: [ICITY], assetClasses: ['k12_school'], intent: 'Acquire a running CBSE school', capacityNote: 'Corpus of 80 Cr, banker letter available' } });
+  assert.equal(profile.data.status, 'pending');
+  assert.equal((await api('PUT', `/institutional/manage/buyers/${buyer.id}`, { token: S, body: { decision: 'rejected' } })).status, 400, 'rejection needs a reason');
+  assert.equal((await api('PUT', `/institutional/manage/buyers/${buyer.id}`, { token: S, body: { decision: 'qualified', note: 'Banker letter seen' } })).data.status, 'qualified');
+  assert.equal((await staffDeal()).data.stage, 'buyer_qualification', 'qualified but NDA not signed yet');
+  assert.equal((await api('GET', `/institutional/deals/${D}`, { token: buyer.token })).data.yourAction, 'sign_nda');
+
+  // ---- Stage 3: NDA executed (auto)
+  assert.ok([200, 201].includes((await nda('Inst Buyer')).status));
+  assert.equal((await staffDeal()).data.stage, 'nda_executed');
+  assert.equal((await api('GET', `/institutional/listings/${P}`, { token: buyer.token })).data.access.full, false, 'NDA alone does not unlock - admin approval pending');
+
+  // ---- Stage 4: admin approval -> Data Room Access; full details unlocked
+  const reqs = await api('GET', '/deal-room/manage/requests?status=pending_approval', { token: A });
+  const accessId = reqs.data.find((r) => r.property_id === P && r.user_id === buyer.id).id;
+  await api('PUT', `/deal-room/manage/access/${accessId}`, { token: A, body: { action: 'approve' } });
+  assert.equal((await staffDeal()).data.stage, 'data_room_access');
+  const unlocked = await api('GET', `/institutional/listings/${P}`, { token: buyer.token });
+  assert.equal(unlocked.data.access.full, true);
+  assert.equal(unlocked.data.listing.institutionName, NAME);
+  assert.ok(unlocked.data.valuation && unlocked.data.dueDiligence && unlocked.data.dueDiligence.review.every((r) => r.note === undefined), 'buyer sees review status, not staff notes');
+  const stranger = await createUser('customer', 'instStranger');
+  assert.equal((await api('GET', `/institutional/listings/${P}`, { token: stranger.token })).data.access.full, false);
+  assert.equal((await api('GET', `/institutional/deals/${D}`, { token: stranger.token })).status, 403);
+
+  // ---- Stages 5-8
+  assert.equal((await act('complete_visit')).status, 400, 'visit must be scheduled first');
+  assert.equal((await act('schedule_visit', { at: new Date(Date.now() + 86400000).toISOString() })).data.stage, 'site_visit');
+  assert.equal((await act('complete_visit')).data.stage, 'valuation_discussion');
+  assert.equal((await api('POST', `/institutional/deals/${D}/offers`, { token: buyer.token, body: { amountCr: 36 } })).status, 400, 'offers open at stage 8');
+  assert.equal((await act('share_valuation')).data.stage, 'legal_due_diligence');
+  assert.equal((await act('clear_legal')).status, 400, "legal panel's finding required");
+  assert.equal((await act('clear_legal', { note: 'Title, trust deed and CBSE affiliation reviewed - clear' })).data.stage, 'offer_negotiation');
+
+  // ---- Stage 8: term sheet, offer, counter-offer
+  await api('POST', `/institutional/deals/${D}/offers`, { token: S, body: { kind: 'term_sheet', byParty: 'seller', amountCr: 42, terms: 'Full sale, 90-day completion' } });
+  const offered = await api('POST', `/institutional/deals/${D}/offers`, { token: buyer.token, body: { amountCr: 36, kind: 'term_sheet', byParty: 'seller' } });
+  assert.equal(offered.status, 201);
+  assert.deepEqual([offered.data.offers[0].kind, offered.data.offers[0].byParty, offered.data.offers[0].status], ['offer', 'buyer', 'open'], 'a buyer can only make a buyer offer');
+  assert.equal(offered.data.offers[1].status, 'superseded');
+  const counter = await api('POST', `/institutional/deals/${D}/offers`, { token: S, body: { kind: 'counter_offer', byParty: 'seller', amountCr: 38 } });
+  assert.equal((await api('PUT', `/institutional/manage/offers/${counter.data.offers[0].id}`, { token: buyer.token, body: { decision: 'accepted' } })).status, 403);
+  const accepted = await api('PUT', `/institutional/manage/offers/${counter.data.offers[0].id}`, { token: S, body: { decision: 'accepted' } });
+  assert.equal(accepted.data.stage, 'closure');
+  assert.equal(accepted.data.agreedValueCr, 38);
+
+  // ---- admin override is logged; staff cannot
+  assert.equal((await act('move', { stage: 'site_visit', note: 'x' })).status, 403);
+  // ---- a second buyer's deal on the same asset (to be ended on closure) and a guest enquiry
+  const buyer2 = await createUser('customer', 'instBuyer2');
+  const D2 = (await api('POST', `/institutional/listings/${P}/interest`, { token: buyer2.token, body: {} })).data.id;
+  const guestLead = await api('POST', '/leads/public-inquiry', { body: { fullName: `Inst Guest ${RUN}`, mobile: `7${String(Math.floor(Math.random() * 1e9)).padStart(9, '0')}`, propertyId: P, message: '[Property enquiry] interested' } });
+  const guestDeal = (await pool.query('SELECT source, buyer_user_id, stage FROM institutional_deals WHERE lead_id = $1', [guestLead.data.id])).rows[0];
+  assert.deepEqual(guestDeal, { source: 'platform', buyer_user_id: null, stage: 'intent_received' }, 'an enquiry by any route opens Stage 1');
+
+  // ---- Stage 9: closure
+  const today = new Date().toISOString().slice(0, 10);
+  assert.equal((await api('POST', `/institutional/manage/deals/${D}/close`, { token: S, body: { agreementDate: today, paymentConfirmed: false } })).status, 400);
+  const closed = await api('POST', `/institutional/manage/deals/${D}/close`, { token: S, body: { agreementDate: today, paymentConfirmed: true } });
+  assert.equal(closed.status, 200, JSON.stringify(closed.body));
+  assert.equal(closed.data.status, 'closed_won');
+  assert.equal(closed.data.advisoryFeeCr, 0.38, '1% of 38 Cr');
+  assert.ok(closed.data.stages.every((s) => s.done));
+  assert.equal((await pool.query('SELECT status::text FROM properties WHERE id = $1', [P])).rows[0].status, 'inactive');
+  assert.equal((await pool.query('SELECT status FROM institutional_deals WHERE id = $1', [D2])).rows[0].status, 'dropped');
+  assert.ok((await pool.query(`SELECT 1 FROM institutional_comparables WHERE deal_id = $1 AND deal_value_cr = 38`, [D])).rows.length, 'closed deal becomes a comparable');
+  await assert.rejects(pool.query('DELETE FROM institutional_deal_events WHERE deal_id = $1', [D]), /append-only/);
+  const kinds = closed.data.events.map((e) => e.kind);
+  assert.ok(['created', 'stage', 'site_visit', 'valuation', 'legal', 'offer', 'closed'].every((k) => kinds.includes(k)));
+  assert.equal((await act('note', { note: 'x' })).status, 400, 'closed deals are final');
+
+  // ---- desk views
+  const pipeline = await api('GET', '/institutional/manage/deals?status=all', { token: S });
+  assert.equal(pipeline.data.stages.length, 9);
+  assert.ok(pipeline.data.items.some((i) => i.id === D && i.institutionName === NAME && i.ndaSigned));
+  assert.equal((await api('GET', '/institutional/manage/deals', { token: plainBroker.token })).status, 403);
+  const mine = await api('GET', '/institutional/my/deals', { token: buyer.token });
+  assert.equal(mine.data[0].id, D);
+  assert.ok((await api('GET', '/institutional/my/listings', { token: seller.token })).data.some((l) => l.id === sellerListing.data.id));
+  assert.ok((await api('GET', '/institutional/manage/summary', { token: S })).data.closed_deals >= 1);
+  assert.equal((await api('GET', '/institutional/meta')).data.stages[8].label, 'Closure');
+});
+
+test('advertising: eligibility approval + AV code, rate card, GST invoice, payment, campaign review checks, serving with targeting / frequency cap / A-B, stats, revenue', async () => {
+  const A = ctx.admin.token;
+  const ADCITY = `Ad City ${RUN}`;
+  const day = (offset) => new Date(Date.now() + offset * 86400000 + 5.5 * 3600000).toISOString().slice(0, 10);
+
+  // No self-signup: the public can only raise an enquiry; the portal is closed to other roles.
+  const reg = await api('POST', '/auth/register', { body: { fullName: 'Self Ad', email: `selfad.${RUN}@e2e.test`, password: PASSWORD, role: 'advertiser' } });
+  assert.equal(reg.status, 422);
+  assert.equal((await api('GET', '/ads/portal', { token: ctx.broker.token })).status, 403);
+  const lead = await api('POST', '/bd-leads', { body: { category: 'advertiser', fullName: `Builder Ad ${RUN}`, email: `bd.ad.${RUN}@e2e.test`, businessName: `Skyline Builders ${RUN}`, businessCategory: 'builder_developer', desiredPlacement: 'Area page' } });
+  assert.equal(lead.status, 201, JSON.stringify(lead.body));
+  const enquiries = await api('GET', '/ads/manage/enquiries', { token: A });
+  assert.ok(enquiries.data.some((e) => e.id === lead.data.id && e.eligible));
+
+  // Eligibility approval -> AV code + portal login; the enquiry is converted.
+  assert.equal((await api('POST', '/ads/manage/advertisers', { token: ctx.sales.token, body: { bdLeadId: lead.data.id, password: PASSWORD } })).status, 403);
+  const notEligible = await api('POST', '/ads/manage/advertisers', { token: A, body: { businessName: 'Coin Flip', businessCategory: 'crypto_exchange', loginEmail: `coin.${RUN}@e2e.test`, password: PASSWORD } });
+  assert.equal(notEligible.status, 400);
+  const adv = await api('POST', '/ads/manage/advertisers', { token: A, body: { bdLeadId: lead.data.id, password: PASSWORD } });
+  assert.equal(adv.status, 201, JSON.stringify(adv.body));
+  assert.match(adv.data.avCode, /^AV-\d{4,}$/);
+  assert.equal(adv.data.source, 'inbound');
+  assert.equal((await api('POST', '/ads/manage/advertisers', { token: A, body: { bdLeadId: lead.data.id, password: PASSWORD, loginEmail: `x.${RUN}@e2e.test` } })).status, 400, 'an enquiry is approved once');
+  assert.equal((await pool.query('SELECT status::text FROM bd_leads WHERE id = $1', [lead.data.id])).rows[0].status, 'converted');
+  const login = await api('POST', '/auth/login', { body: { identifier: `bd.ad.${RUN}@e2e.test`, password: PASSWORD } });
+  assert.equal(login.status, 200, JSON.stringify(login.body));
+  const V = login.data.accessToken;
+  const home = await api('GET', '/ads/portal', { token: V });
+  assert.equal(home.data.advertiser.avCode, adv.data.avCode);
+
+  // Rate card: admin sets a city rate; the quote uses it and adds GST 18%.
+  assert.equal((await api('POST', '/ads/manage/rates', { token: V, body: { formatKey: 'city_banner', city: ADCITY, rate: 5 } })).status, 403);
+  const rate = await api('POST', '/ads/manage/rates', { token: A, body: { formatKey: 'city_banner', city: ADCITY, rate: 20000 } });
+  assert.equal(rate.status, 200, JSON.stringify(rate.body));
+  const card = await api('GET', '/ads/rate-card', { token: V });
+  assert.ok(card.data.items.some((i) => i.formatKey === 'home_sidebar' && i.minUnits === 2) && card.data.items.some((i) => i.formatKey === 'package_builder'));
+  const q = await api('POST', '/ads/quote', { token: V, body: { formatKey: 'city_banner', units: 2, city: ADCITY } });
+  assert.deepEqual([q.data.amount, q.data.gstAmount, q.data.total], [40000, 7200, 47200]);
+  assert.equal((await api('POST', '/ads/quote', { token: V, body: { formatKey: 'home_sidebar', units: 1 } })).status, 400, 'minimum 2 weeks');
+
+  // Campaign: validation, then created with an invoice and waiting for payment.
+  const base = { name: `Launch ${RUN}`, formatKey: 'city_banner', units: 2, startDate: day(0), headline: 'Skyline Heights - 3 BHK homes', body: 'Guaranteed returns on every booking', ctaUrl: 'https://example.com/skyline', targeting: { cities: [ADCITY], roles: ['all'], device: 'all' }, variantB: { headline: 'Skyline Heights - ready to move' } };
+  assert.equal((await api('POST', '/ads/campaigns', { token: V, body: { ...base, ctaUrl: 'http://example.com' } })).status, 400, 'https only');
+  assert.equal((await api('POST', '/ads/campaigns', { token: V, body: { ...base, targeting: {} } })).status, 400, 'area banner needs a city');
+  assert.equal((await api('POST', '/ads/campaigns', { token: V, body: { ...base, formatKey: 'featured_listing' } })).status, 400, 'listing format needs a listing');
+  const camp = await api('POST', '/ads/campaigns', { token: V, body: base });
+  assert.equal(camp.status, 201, JSON.stringify(camp.body));
+  assert.equal(camp.data.status, 'pending_payment');
+  assert.equal(camp.data.invoice.total, 47200);
+  assert.match(camp.data.invoice.number, /^ADV\/\d{4}-\d{2}\/\d{6}$/);
+  const id = camp.data.id;
+  const invId = camp.data.invoice.id;
+  // Unpaid and unapproved -> never served.
+  assert.equal((await api('GET', `/ads/serve?placement=city_banner&city=${encodeURIComponent(ADCITY)}&viewer=v0`)).data.ads.length, 0);
+  const other = await createUser('customer', 'adsnoop');
+  assert.equal((await api('GET', `/ads/campaigns/${id}`, { token: other.token })).status, 403);
+
+  // Payment: online is off without Razorpay keys; staff record a bank transfer; a PDF invoice exists.
+  assert.equal((await api('POST', `/ads/invoices/${invId}/pay/order`, { token: V })).status, 400);
+  assert.equal((await api('POST', `/ads/invoices/${invId}/pay/record`, { token: V, body: { reference: 'UTR123' } })).status, 403);
+  const paid = await api('POST', `/ads/invoices/${invId}/pay/record`, { token: ctx.sales.token, body: { reference: `UTR${RUN}` } });
+  assert.equal(paid.status, 200, JSON.stringify(paid.body));
+  assert.equal(paid.data.status, 'pending_review');
+  const pdf = await fetch(`${BASE}/ads/invoices/${invId}/pdf`, { headers: { authorization: `Bearer ${V}` } });
+  assert.equal(pdf.headers.get('content-type'), 'application/pdf');
+  assert.equal(Buffer.from(await pdf.arrayBuffer()).subarray(0, 4).toString(), '%PDF');
+
+  // Review: prohibited claim + missing RERA block approval; reject needs a reason.
+  const flagged = await api('GET', `/ads/campaigns/${id}`, { token: A });
+  assert.ok(flagged.data.reviewFlags.some((f) => f.rule === 'prohibited_claim') && flagged.data.reviewFlags.some((f) => f.rule === 'rera_missing'), JSON.stringify(flagged.data.reviewFlags));
+  assert.equal((await api('POST', `/ads/campaigns/${id}/review`, { token: ctx.sales.token, body: { decision: 'approve' } })).status, 403);
+  const blocked = await api('POST', `/ads/campaigns/${id}/review`, { token: A, body: { decision: 'approve' } });
+  assert.equal(blocked.status, 400);
+  assert.match(blocked.body.message, /Prohibited claim/);
+  assert.equal((await api('POST', `/ads/campaigns/${id}/review`, { token: A, body: { decision: 'reject' } })).status, 400);
+  const rejected = await api('POST', `/ads/campaigns/${id}/review`, { token: A, body: { decision: 'reject', note: 'Remove the returns claim and add the RERA number.' } });
+  assert.equal(rejected.data.status, 'rejected');
+  // The advertiser fixes the creative -> back to review -> approved.
+  const fixed = await api('PATCH', `/ads/campaigns/${id}`, { token: V, body: { body: 'Sample flat open this weekend', reraNumber: 'DLRERA2026P0001' } });
+  assert.equal(fixed.status, 200, JSON.stringify(fixed.body));
+  assert.equal(fixed.data.status, 'pending_review');
+  const approved = await api('POST', `/ads/campaigns/${id}/review`, { token: A, body: { decision: 'approve' } });
+  assert.equal(approved.status, 200, JSON.stringify(approved.body));
+  assert.equal(approved.data.state, 'active');
+
+  // Serving: city targeting, labelled, impressions logged, frequency cap of 3 per viewer per day, A/B variants.
+  assert.equal((await api('GET', '/ads/serve?placement=city_banner&city=Elsewhere&viewer=v1')).data.ads.length, 0);
+  const serveUrl = (viewer) => `/ads/serve?placement=city_banner&city=${encodeURIComponent(ADCITY)}&viewer=${viewer}&device=mobile`;
+  const first = await api('GET', serveUrl('v1'));
+  assert.equal(first.data.ads.length, 1, JSON.stringify(first.body));
+  const ad = first.data.ads[0];
+  assert.equal(ad.campaignId, id);
+  assert.equal(ad.label, 'Sponsored');
+  assert.equal(ad.reraNumber, 'DLRERA2026P0001');
+  await api('GET', serveUrl('v1'));
+  await api('GET', serveUrl('v1'));
+  assert.equal((await api('GET', serveUrl('v1'))).data.ads.length, 0, 'capped after 3 views today');
+  // The same page view asking again is one impression, not two.
+  const before = (await pool.query(`SELECT COUNT(*)::int AS n FROM ad_events WHERE campaign_id = $1`, [id])).rows[0].n;
+  for (let i = 0; i < 3; i += 1) assert.equal((await api('GET', `${serveUrl('pv')}&view=view-${RUN}`)).data.ads.length, 1);
+  assert.equal((await pool.query(`SELECT COUNT(*)::int AS n FROM ad_events WHERE campaign_id = $1`, [id])).rows[0].n, before + 1);
+  const variants = new Set([ad.variant]);
+  for (let i = 0; i < 12 && variants.size < 2; i += 1) variants.add((await api('GET', serveUrl(`ab${i}`))).data.ads[0].variant);
+  assert.equal(variants.size, 2, 'both creatives are served');
+  const clicked = await api('POST', `/ads/click/${id}`, { body: { placement: 'city_banner', variant: ad.variant, viewer: 'v1' } });
+  assert.equal(clicked.data.url, 'https://example.com/skyline');
+
+  // Advertiser dashboard: impressions, clicks, CTR, variant split; pause stops serving.
+  const stats = (await api('GET', `/ads/campaigns/${id}`, { token: V })).data;
+  assert.ok(stats.stats.impressions >= 4 && stats.stats.clicks === 1 && stats.stats.ctr > 0, JSON.stringify(stats.stats));
+  assert.equal(stats.stats.impressionsToday, stats.stats.impressions);
+  assert.equal(stats.stats.variants.length, 2);
+  assert.equal(stats.spent + stats.remaining, 40000);
+  assert.equal((await api('POST', `/ads/campaigns/${id}/pause`, { token: V })).data.status, 'paused');
+  assert.equal((await api('GET', serveUrl('v9'))).data.ads.length, 0);
+  assert.equal((await api('POST', `/ads/campaigns/${id}/resume`, { token: V })).data.status, 'approved');
+
+  // Role targeting: a broker-only CRM banner reaches brokers, not customers or staff. A zero-rated format needs no payment.
+  const crm = await api('POST', '/ads/campaigns', { token: V, body: { name: `CRM ${RUN}`, formatKey: 'crm_dashboard', startDate: day(0), headline: `Channel partner scheme ${RUN}`, ctaUrl: 'https://example.com/cp', reraNumber: 'DLRERA2026P0001', targeting: { roles: ['broker'] } } });
+  assert.equal(crm.status, 201, JSON.stringify(crm.body));
+  assert.equal(crm.data.status, 'pending_review', 'nothing to pay at a zero rate');
+  await api('POST', `/ads/campaigns/${crm.data.id}/review`, { token: A, body: { decision: 'approve' } });
+  for (const c of (await pool.query(`SELECT id FROM ad_campaigns WHERE id <> $1 AND status = 'approved' AND placements ? 'crm_dashboard'`, [crm.data.id])).rows) await pool.query(`UPDATE ad_campaigns SET status = 'ended' WHERE id = $1`, [c.id]);
+  assert.equal((await api('GET', '/ads/serve?placement=crm_dashboard', { token: ctx.broker.token })).data.ads[0]?.campaignId, crm.data.id);
+  assert.equal((await api('GET', '/ads/serve?placement=crm_dashboard', { token: ctx.customer.token })).data.ads.length, 0);
+  assert.equal((await api('GET', '/ads/serve?placement=crm_dashboard')).data.ads.length, 0);
+
+  // Sponsored listing: promotes a live listing and carries its public card.
+  const prop = (await pool.query(`INSERT INTO properties (created_by, title, property_type, transaction_type, city, locality, price, status) VALUES ($1, $2, 'apartment', 'sell', $3, 'Sector 1', '80 Lakh', 'approved') RETURNING id`, [ctx.admin.id, `Sponsored flat ${RUN}`, ADCITY])).rows[0].id;
+  const sp = await api('POST', '/ads/campaigns', { token: V, body: { name: `Sponsored ${RUN}`, formatKey: 'search_sponsored', startDate: day(0), propertyId: prop, reraNumber: 'DLRERA2026P0001', targeting: { cities: [ADCITY] } } });
+  assert.equal(sp.status, 201, JSON.stringify(sp.body));
+  await api('POST', `/ads/campaigns/${sp.data.id}/review`, { token: A, body: { decision: 'approve' } });
+  await pool.query(`UPDATE ad_campaigns SET status = 'ended' WHERE id <> $1 AND status = 'approved' AND placements ? 'search_sponsored'`, [sp.data.id]);
+  const sponsored = await api('GET', `/ads/serve?placement=search_sponsored&city=${encodeURIComponent(ADCITY)}&viewer=s1`);
+  assert.equal(sponsored.data.ads[0].listing.id, prop);
+  assert.equal(sponsored.data.ads[0].listing.title, `Sponsored flat ${RUN}`);
+
+  // Exclusive slot: a second login splash over the same dates cannot be approved.
+  const far = 400 + (parseInt(RUN, 16) % 3000) * 8;
+  const splash = (n) => api('POST', '/ads/campaigns', { token: V, body: { name: `Splash ${n} ${RUN}`, formatKey: 'login_splash', startDate: day(far), headline: `Splash ${n}`, ctaUrl: 'https://example.com/s', reraNumber: 'DLRERA2026P0001' } });
+  const s1 = await splash(1);
+  assert.equal((await api('POST', `/ads/campaigns/${s1.data.id}/review`, { token: A, body: { decision: 'approve' } })).status, 200);
+  const s2 = await splash(2);
+  const clash = await api('POST', `/ads/campaigns/${s2.data.id}/review`, { token: A, body: { decision: 'approve' } });
+  assert.equal(clash.status, 400);
+  assert.match(clash.body.message, /exclusive/);
+
+  // Digest slot: one sponsored line per digest, counted against the booked sends.
+  const dg = await api('POST', '/ads/campaigns', { token: V, body: { name: `Digest ${RUN}`, formatKey: 'digest_sponsored', units: 5, startDate: day(0), headline: `Digest offer ${RUN}`, body: 'Site visits this weekend', ctaUrl: 'https://example.com/d', reraNumber: 'DLRERA2026P0001' } });
+  assert.equal(dg.status, 201, JSON.stringify(dg.body));
+  await api('POST', `/ads/campaigns/${dg.data.id}/review`, { token: A, body: { decision: 'approve' } });
+  await pool.query(`UPDATE ad_campaigns SET status = 'ended' WHERE id <> $1 AND status = 'approved' AND placements ? 'digest_sponsored'`, [dg.data.id]);
+  const line = await require('../src/services/advertising.service').digestSponsor(ctx.customer.id);
+  assert.match(line, new RegExp(`^Sponsored: Digest offer ${RUN}`));
+  assert.equal((await api('GET', `/ads/campaigns/${dg.data.id}`, { token: V })).data.sendsUsed, 1);
+
+  // Admin: revenue dashboard, advertiser list, suggestions; sweep ends finished campaigns.
+  const rev = await api('GET', '/ads/manage/revenue', { token: A });
+  assert.ok(rev.data.revenueThisMonth >= 40000 && rev.data.revenueYtd >= 40000 && rev.data.activeCampaigns >= 1, JSON.stringify(rev.data));
+  // (Top advertisers is a top-10 list, so on a database with many earlier runs this run's advertiser may not be in it.)
+  assert.ok(rev.data.revenueByFormat.some((f) => f.format_key === 'city_banner') && rev.data.topAdvertisers.length >= 1 && rev.data.topAdvertisers[0].spend >= 40000);
+  const list = await api('GET', '/ads/manage/advertisers', { token: A });
+  assert.equal(list.data.items.find((x) => x.id === adv.data.id).totalSpend, 40000);
+  assert.equal((await api('GET', '/ads/manage/suggestions', { token: A })).status, 200);
+  assert.equal((await api('GET', '/ads/manage/revenue', { token: V })).status, 403);
+  await pool.query(`UPDATE ad_campaigns SET start_date = CURRENT_DATE - 20, end_date = CURRENT_DATE - 1 WHERE id = $1`, [id]);
+  const swept = await api('POST', '/ads/manage/sweep', { token: A });
+  assert.ok(swept.data.ended >= 1);
+  assert.equal((await api('GET', `/ads/campaigns/${id}`, { token: V })).data.status, 'ended');
+
+  // A suspended advertiser stops serving and loses the portal.
+  await api('PATCH', `/ads/manage/advertisers/${adv.data.id}`, { token: A, body: { status: 'suspended' } });
+  assert.equal((await api('GET', `/ads/serve?placement=search_sponsored&city=${encodeURIComponent(ADCITY)}&viewer=s2`)).data.ads.length, 0);
+  assert.equal((await api('GET', '/ads/portal', { token: V })).status, 403);
+});
+
+test('gamification: points from platform activity, idempotent sync, tiers, streak-safe login point, area + platform leaderboards, admin rules / tiers / adjustments', async () => {
+  const A = ctx.admin.token;
+  const GCITY = `Game City ${RUN}`;
+  const b1 = await createUser('broker', 'gamer1');
+  const b2 = await createUser('broker', 'gamer2');
+  const cust = await createUser('customer', 'gamecust');
+
+  // Signing in earned the daily point once (createUser logs in via the API).
+  await new Promise((r) => setTimeout(r, 300));
+  const start = await api('GET', '/gamification/me', { token: b1.token });
+  assert.equal(start.status, 200, JSON.stringify(start.body));
+  assert.equal(start.data.totalPoints, 2);
+  assert.equal(start.data.tier.key, 'bronze');
+  assert.equal(start.data.nextTier.key, 'silver');
+  assert.ok(start.data.howToEarn.some((r) => r.action_key === 'deal_closed') && !start.data.howToEarn.some((r) => r.action_key === 'requirement_posted'), 'broker rules only');
+  await api('POST', '/auth/login', { body: { identifier: b1.email, password: PASSWORD } });
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal((await api('GET', '/gamification/me', { token: b1.token })).data.totalPoints, 2, 'one sign-in point per day');
+  assert.equal((await api('GET', '/gamification/me', { token: ctx.admin.token })).status, 403, 'staff do not play');
+
+  // Activity already on the platform turns into points: 2 approved listings (1 verified), a fast lead response, a closed deal.
+  const prop = async (owner, title, verified) => (await pool.query(
+    `INSERT INTO properties (created_by, broker_id, title, property_type, transaction_type, city, price, status, approved_at, is_verified) VALUES ($1, $1, $2, 'apartment', 'sell', $3, '1 Cr', 'approved', now(), $4) RETURNING id`,
+    [owner.id, `${title} ${RUN}`, GCITY, verified])).rows[0].id;
+  const p1 = await prop(b1, 'Game flat one', true);
+  await prop(b1, 'Game flat two', false);
+  await prop(b2, 'Game flat three', false);
+  const custId = (await pool.query(`INSERT INTO customers (full_name, mobile, user_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING id`, [`Game cust ${RUN}`, `96${String(Math.floor(Math.random() * 1e8)).padStart(8, '0')}`, cust.id])).rows[0]?.id
+    || (await pool.query('SELECT id FROM customers WHERE user_id = $1', [cust.id])).rows[0].id;
+  const lead = (await pool.query(`INSERT INTO leads (created_by, source, property_id, customer_id, assigned_to, first_contacted_by, first_contacted_at, response_sla_due_at) VALUES ($1, 'manual', $2, $3, $1, $1, now(), now() + interval '1 hour') RETURNING id`, [b1.id, p1, custId])).rows[0].id;
+  await pool.query(`INSERT INTO deals (lead_id, customer_id, property_id, broker_id, stage, closed_at) VALUES ($1, $2, $3, $4, 'closed_won', now())`, [lead, custId, p1, b1.id]);
+
+  const after = await api('GET', '/gamification/me', { token: b1.token });
+  // 2 login + 2x20 approved + 15 verified + 10 fast response + 100 deal
+  assert.equal(after.data.totalPoints, 167, JSON.stringify(after.data.byAction));
+  assert.equal(after.data.pointsThisMonth, 167);
+  assert.ok(after.data.cities.some((c) => c.city === GCITY && c.points === 165));
+  assert.equal(after.data.pointsToNext, 250 - 167);
+  // Idempotent: a second sync awards nothing new.
+  const again = await api('POST', '/gamification/manage/sync', { token: A });
+  assert.equal(again.status, 200);
+  assert.equal((await api('GET', '/gamification/me', { token: b1.token })).data.totalPoints, 167);
+  // The customer earns on their own board: sign-in + completed purchase.
+  const cme = await api('GET', '/gamification/me', { token: cust.token });
+  assert.equal(cme.data.totalPoints, 52, JSON.stringify(cme.data.byAction));
+  assert.equal(cme.data.audience, 'customer');
+
+  // Area leaderboard: b1 ahead of b2 in the city; customers are not on the professional board.
+  await api('GET', '/gamification/me', { token: b2.token });
+  const area = await api('GET', `/gamification/leaderboard?scope=area&city=${encodeURIComponent(GCITY)}&period=month`, { token: b2.token });
+  assert.equal(area.status, 200, JSON.stringify(area.body));
+  assert.deepEqual(area.data.items.map((i) => [i.rank, i.points]), [[1, 165], [2, 20]]);
+  assert.equal(area.data.me.rank, 2);
+  assert.ok(area.data.items[1].isMe && !area.data.items[0].isMe);
+  assert.equal((await api('GET', '/gamification/leaderboard?scope=area', { token: b2.token })).status, 400);
+  const platform = await api('GET', '/gamification/leaderboard?period=all', { token: b1.token });
+  assert.ok(platform.data.me.points >= 167 && platform.data.items.every((i, n, arr) => n === 0 || arr[n - 1].points >= i.points));
+  // Customers see a customer board with masked names.
+  const cboard = await api('GET', '/gamification/leaderboard?period=month', { token: cust.token });
+  assert.equal(cboard.data.audience, 'customer');
+  assert.ok(cboard.data.items.every((i) => i.userId === undefined && !/gamecust \w{6}$/.test(i.name)));
+  assert.ok((await api('GET', '/gamification/cities', { token: b1.token })).data.some((c) => c.city === GCITY));
+
+  // Admin: bonus with a reason moves the tier and notifies; deduction is another ledger row.
+  assert.equal((await api('POST', '/gamification/manage/adjust', { token: ctx.sales.token, body: { userId: b1.id, points: 100, reason: 'Top performer' } })).status, 403);
+  assert.equal((await api('POST', '/gamification/manage/adjust', { token: A, body: { userId: b1.id, points: 100 } })).status, 422);
+  const bonus = await api('POST', '/gamification/manage/adjust', { token: A, body: { userId: b1.id, points: 100, reason: 'Best broker of the month' } });
+  assert.equal(bonus.status, 200, JSON.stringify(bonus.body));
+  assert.equal(bonus.data.tier, 'silver');
+  const notes = await pool.query(`SELECT title FROM notifications WHERE user_id = $1 AND type = 'gamification'`, [b1.id]);
+  assert.ok(notes.rows.some((n) => n.title === 'You reached Silver') && notes.rows.some((n) => n.title === '100 bonus points'));
+  await api('POST', '/gamification/manage/adjust', { token: A, body: { userId: b1.id, points: -50, reason: 'Duplicate listing removed' } });
+  const fin = await api('GET', '/gamification/me', { token: b1.token });
+  assert.equal(fin.data.totalPoints, 217);
+  assert.equal(fin.data.tier.key, 'bronze');
+  await assert.rejects(pool.query(`UPDATE gamification_points SET points = 9999 WHERE user_id = $1`, [b1.id]), /append-only/);
+
+  // Rules and tiers are admin-configurable; a switched-off rule stops awarding.
+  const settings = await api('GET', '/gamification/manage/settings', { token: ctx.sales.token });
+  assert.equal(settings.data.tiers.length, 5);
+  assert.deepEqual(settings.data.tiers.map((t) => t.label), ['Bronze', 'Silver', 'Gold', 'Platinum', 'Elite']);
+  assert.equal((await api('PUT', '/gamification/manage/rules/listing_approved', { token: ctx.sales.token, body: { points: 5 } })).status, 403);
+  try {
+    assert.equal((await api('PUT', '/gamification/manage/rules/listing_approved', { token: A, body: { isActive: false } })).status, 200);
+    await prop(b2, 'Game flat four', false);
+    assert.equal((await api('GET', '/gamification/me', { token: b2.token })).data.totalPoints, 22, 'no points while the rule is off');
+    const bad = await api('PUT', '/gamification/manage/tiers', { token: A, body: { tiers: settings.data.tiers.map((t) => ({ key: t.key, min: 10 })) } });
+    assert.equal(bad.status, 400);
+  } finally {
+    await api('PUT', '/gamification/manage/rules/listing_approved', { token: A, body: { isActive: true } });
+  }
+});
+
+test('languages: Hindi live at launch, public bundle with ETag, saved preference, self-serve regional language (activate, upload file, export template), catalogue import', async () => {
+  const A = ctx.admin.token;
+  // Public: English + Hindi are offered; regional languages are listed but off.
+  const langs = await api('GET', '/i18n/languages');
+  assert.equal(langs.status, 200);
+  assert.ok(langs.data.some((l) => l.code === 'en') && langs.data.some((l) => l.code === 'hi' && l.nativeName === 'हिन्दी'));
+  assert.ok(!langs.data.some((l) => l.code === 'ta'));
+  const hi = await fetch(`${BASE}/i18n/bundle/hi?app=website`);
+  const hiBody = await hi.json();
+  assert.equal(hiBody.data.strings['Post Property'], 'प्रॉपर्टी पोस्ट करें');
+  assert.equal((await fetch(`${BASE}/i18n/bundle/hi?app=website`, { headers: { 'if-none-match': hi.headers.get('etag') } })).status, 304);
+  assert.equal((await api('GET', '/i18n/bundle/hi?app=crm')).data.strings.Dashboard, 'डैशबोर्ड');
+  assert.deepEqual((await api('GET', '/i18n/bundle/en?app=website')).data.strings, {});
+  assert.deepEqual((await api('GET', '/i18n/bundle/ta?app=website')).data.strings, {}, 'an inactive language serves nothing');
+  assert.equal((await api('GET', '/i18n/bundle/hi?app=nope')).status, 422);
+
+  // A person's choice is saved on the account; only offered languages are accepted.
+  assert.equal((await api('PUT', '/i18n/me', { token: ctx.customer.token, body: { language: 'ta' } })).status, 400);
+  assert.equal((await api('PUT', '/i18n/me', { token: ctx.customer.token, body: { language: 'hi' } })).status, 200);
+  assert.equal((await api('GET', '/i18n/me', { token: ctx.customer.token })).data.language, 'hi');
+
+  // Admin overview: coverage per language and app.
+  assert.equal((await api('GET', '/i18n/manage/overview', { token: ctx.broker.token })).status, 403);
+  const over = await api('GET', '/i18n/manage/overview', { token: A });
+  const hiRow = over.data.languages.find((l) => l.code === 'hi');
+  assert.ok(hiRow.isActive && hiRow.coverage.find((c) => c.app === 'website').translated > 200);
+  assert.ok(over.data.apps.find((a) => a.app === 'crm').strings > 1000);
+
+  // Self-serve regional language: a new code, uploaded as a file, switched on - no deployment.
+  const code = `x${RUN.slice(0, 2)}`.replace(/[^a-z]/g, 'q');
+  assert.equal((await api('POST', '/i18n/manage/languages', { token: ctx.sales.token, body: { code, name: 'Test', nativeName: 'Test' } })).status, 403);
+  assert.equal((await api('POST', '/i18n/manage/languages', { token: A, body: { code } })).status, 400, 'a new language needs its names');
+  const added = await api('POST', '/i18n/manage/languages', { token: A, body: { code, name: `Testish ${RUN}`, nativeName: `टेस्ट ${RUN}` } });
+  assert.equal(added.status, 200, JSON.stringify(added.body));
+  const newText = `Brand new screen text ${RUN}`;
+  const up = await api('PUT', '/i18n/manage/strings', { token: A, body: { language: code, app: 'website', entries: { 'Post Property': `PP-${RUN}`, [newText]: `NT-${RUN}`, 'Buy': '' } } });
+  assert.equal(up.status, 200, JSON.stringify(up.body));
+  assert.equal(up.data.saved, 2);
+  assert.deepEqual((await api('GET', `/i18n/bundle/${code}?app=website`)).data.strings, {}, 'not served until switched on');
+  await api('POST', '/i18n/manage/languages', { token: A, body: { code, isActive: true } });
+  assert.ok((await api('GET', '/i18n/languages')).data.some((l) => l.code === code));
+  const served = (await api('GET', `/i18n/bundle/${code}?app=website`)).data.strings;
+  assert.equal(served['Post Property'], `PP-${RUN}`);
+  assert.equal(served[newText], `NT-${RUN}`);
+  assert.equal((await api('PUT', '/i18n/manage/strings', { token: A, body: { language: 'en', app: 'website', entries: { Buy: 'Purchase' } } })).status, 400, 'English is the source');
+
+  // The string list shows what is missing; the export is the file a translator fills in.
+  const missing = await api('GET', `/i18n/manage/strings?language=${code}&app=website&filter=missing&search=post%20requirement`, { token: A });
+  assert.ok(missing.data.items.some((i) => i.source === 'Post Requirement' && i.value === null));
+  const done = await api('GET', `/i18n/manage/strings?language=${code}&app=website&filter=translated`, { token: A });
+  assert.equal(done.data.total, 2);
+  const file = await (await fetch(`${BASE}/i18n/manage/export?language=${code}&app=website`, { headers: { authorization: `Bearer ${A}` } })).json();
+  assert.equal(file['Post Property'], `PP-${RUN}`);
+  assert.equal(file['Post Requirement'], '');
+  // Removing a translation falls back to English.
+  await api('PUT', '/i18n/manage/strings', { token: A, body: { language: code, app: 'website', entries: { 'Post Property': '' } } });
+  assert.equal((await api('GET', `/i18n/bundle/${code}?app=website`)).data.strings['Post Property'], undefined);
+
+  // Catalogue import (after a release) adds new text without touching translations.
+  const cat = await api('POST', '/i18n/manage/catalogue', { token: A, body: { app: 'crm', strings: [`Fresh label ${RUN}`, 'Dashboard'] } });
+  assert.equal(cat.status, 200, JSON.stringify(cat.body));
+  assert.equal(cat.data.added, 1);
+  assert.equal((await api('GET', '/i18n/bundle/hi?app=crm')).data.strings.Dashboard, 'डैशबोर्ड');
+  // The AI helper is optional: without a key it says so rather than failing silently.
+  if (!process.env.ANTHROPIC_API_KEY) assert.equal((await api('POST', '/i18n/manage/ai-draft', { token: A, body: { language: code, app: 'website' } })).status, 400);
+  await api('POST', '/i18n/manage/languages', { token: A, body: { code, isActive: false } });
+  await pool.query('DELETE FROM languages WHERE code = $1', [code]);
+  await pool.query(`DELETE FROM i18n_strings WHERE source_text IN ($1, $2)`, [newText, `Fresh label ${RUN}`]);
+});
+
+test('privacy (DPDP): consent log, my-data export JSON + CSV, deletion request with 30-day notice, legal hold, anonymisation, events kept without PII', async () => {
+  const A = ctx.admin.token;
+  // Self-registration logs consent for the six statutory categories.
+  const email = `dpdp.${RUN}@e2e.test`;
+  const reg = await api('POST', '/auth/register', { body: { fullName: `Dpdp Person ${RUN}`, email, mobile: `95${String(Math.floor(Math.random() * 1e8)).padStart(8, '0')}`, password: PASSWORD, role: 'customer' } });
+  assert.equal(reg.status, 201, JSON.stringify(reg.body));
+  const uid = reg.data.id;
+  await pool.query(`UPDATE users SET status = 'active', email_verified = true WHERE id = $1`, [uid]);
+  const U = (await api('POST', '/auth/login', { body: { identifier: email, password: PASSWORD } })).data.accessToken;
+  const priv = await api('GET', '/user/privacy', { token: U });
+  assert.equal(priv.status, 200, JSON.stringify(priv.body));
+  assert.ok(priv.data.consents.upToDate);
+  assert.equal(priv.data.consents.items.filter((c) => c.required && c.granted).length, 6);
+  // Optional consent can be given and withdrawn; a statutory one cannot be withdrawn piecemeal.
+  await api('POST', '/user/consent', { token: U, body: { categories: ['marketing'], granted: true } });
+  const off = await api('POST', '/user/consent', { token: U, body: { categories: ['marketing'], granted: false } });
+  assert.equal(off.data.items.find((c) => c.category === 'marketing').granted, false);
+  assert.equal((await api('POST', '/user/consent', { token: U, body: { categories: ['sharing'], granted: false } })).status, 400);
+  await assert.rejects(pool.query(`DELETE FROM consent_logs WHERE user_id = $1`, [uid]), /append-only/);
+
+  // Some data of their own: a requirement, a listing, an event.
+  const custId = (await pool.query('SELECT id FROM customers WHERE user_id = $1', [uid])).rows[0]?.id || (await pool.query(`INSERT INTO customers (full_name, email, user_id) VALUES ($1, $2, $3) RETURNING id`, [`Dpdp Person ${RUN}`, email, uid])).rows[0].id;
+  await pool.query(`INSERT INTO requirements (customer_id, created_by, purpose, property_type, city, budget_max, notes, fee_consent_at) VALUES ($1, $2, 'buy', 'apartment', 'Delhi', 9000000, 'near my office', now())`, [custId, uid]);
+  const listing = (await pool.query(`INSERT INTO properties (created_by, title, property_type, transaction_type, city, price, status) VALUES ($1, $2, 'apartment', 'sell', 'Delhi', '90 Lakh', 'approved') RETURNING id`, [uid, `Dpdp flat ${RUN}`])).rows[0].id;
+  await pool.query(`INSERT INTO events (event_id, event_timestamp, event_type, source_track, user_id, customer_id, properties_json, device_json) VALUES (gen_random_uuid(), now(), 'property_view', 'server', $1, $2, $3, '{"browser":"x"}')`, [uid, custId, JSON.stringify({ propertyId: listing, mobile: '9999999999', name: 'Dpdp' })]);
+
+  // My data: JSON and CSV, only for the signed-in person.
+  const mine = await api('GET', '/user/my-data', { token: U });
+  assert.equal(mine.status, 200, JSON.stringify(mine.body).slice(0, 300));
+  assert.equal(mine.data.profile[0].email, email);
+  assert.equal(mine.data.requirements.length, 1);
+  assert.equal(mine.data.listings[0].title, `Dpdp flat ${RUN}`);
+  assert.ok(mine.data.consents.length >= 6 && mine.data.activity.length === 1);
+  assert.ok(!JSON.stringify(mine.data).includes('password'), 'no credentials in the export');
+  const csv = await fetch(`${BASE}/user/my-data?format=csv`, { headers: { authorization: `Bearer ${U}` } });
+  assert.match(csv.headers.get('content-type'), /text\/csv/);
+  const csvText = await csv.text();
+  assert.ok(csvText.includes('# requirements') && csvText.includes(email) && csvText.includes(`Dpdp flat ${RUN}`));
+  assert.equal((await api('GET', '/user/my-data')).status, 401);
+  assert.equal((await api('GET', `/compliance/users/${uid}/data`, { token: A })).status, 403, 'only a Super Admin exports for someone else');
+  assert.equal((await api('GET', `/compliance/users/${uid}/data`, { token: ctx.superAdmin.token })).data.profile[0].email, email);
+
+  // Deletion request: 30-day notice, one open request, cancellable.
+  const del = await api('POST', '/user/request-deletion', { token: U, body: { reason: 'No longer needed' } });
+  assert.equal(del.status, 201, JSON.stringify(del.body));
+  assert.match(del.data.requestNumber, /^DR-\d{4}-\d{5}$/);
+  const days = (new Date(del.data.dueAt) - Date.now()) / 86400000;
+  assert.ok(days > 29 && days <= 30.01, `30-day notice, got ${days}`);
+  assert.equal((await api('POST', '/user/request-deletion', { token: U })).data.id, del.data.id, 'idempotent');
+  assert.equal((await api('DELETE', '/user/request-deletion', { token: U })).status, 200);
+  const del2 = await api('POST', '/user/request-deletion', { token: U });
+  const reqId = del2.data.id;
+  assert.equal((await api('POST', '/user/request-deletion', { token: ctx.sales.token })).status, 403, 'staff accounts are not self-deleted');
+
+  // Staff queue; nothing happens before the notice ends (except by a Super Admin).
+  const queue = await api('GET', '/compliance/data-requests?status=open', { token: ctx.sales.token });
+  assert.ok(queue.data.items.some((r) => r.id === reqId && r.daysLeft >= 29));
+  assert.equal((await api('POST', `/compliance/data-requests/${reqId}`, { token: ctx.sales.token, body: { action: 'process' } })).status, 403);
+  assert.equal((await api('POST', `/compliance/data-requests/${reqId}`, { token: A, body: { action: 'process' } })).status, 400, 'notice not over');
+
+  // Legal hold: an open deal blocks it even after the notice.
+  await pool.query(`UPDATE data_requests SET due_at = now() - interval '1 hour' WHERE id = $1`, [reqId]);
+  const lead = (await pool.query(`INSERT INTO leads (created_by, source, property_id, customer_id) VALUES ($1, 'manual', $2, $3) RETURNING id`, [ctx.admin.id, listing, custId])).rows[0].id;
+  const deal = (await pool.query(`INSERT INTO deals (lead_id, customer_id, property_id, broker_id, stage) VALUES ($1, $2, $3, $4, 'negotiation') RETURNING id`, [lead, custId, listing, ctx.broker.id])).rows[0].id;
+  const held = await api('POST', `/compliance/data-requests/${reqId}`, { token: A, body: { action: 'process' } });
+  assert.equal(held.data.status, 'on_hold', JSON.stringify(held.body));
+  assert.equal(held.data.holdReasons[0].code, 'open_deal');
+  assert.equal((await pool.query('SELECT anonymised_at FROM users WHERE id = $1', [uid])).rows[0].anonymised_at, null);
+
+  // Deal closes -> the sweep anonymises.
+  await pool.query(`UPDATE deals SET stage = 'closed_lost' WHERE id = $1`, [deal]);
+  const run = await api('POST', '/compliance/run', { token: A });
+  assert.equal(run.status, 200, JSON.stringify(run.body));
+  assert.ok(run.data.privacy.completed >= 1);
+  const gone = (await pool.query('SELECT full_name, email, mobile, password_hash, status::text AS status, anonymised_at FROM users WHERE id = $1', [uid])).rows[0];
+  assert.equal(gone.full_name, 'Deleted user');
+  assert.ok(gone.email.endsWith('@anonymised.invalid') && gone.mobile === null && gone.password_hash === null && gone.status === 'inactive' && gone.anonymised_at);
+  assert.equal((await api('POST', '/auth/login', { body: { identifier: email, password: PASSWORD } })).status >= 400, true, 'cannot sign in any more');
+  assert.equal((await pool.query('SELECT status::text AS s FROM properties WHERE id = $1', [listing])).rows[0].s, 'inactive', 'listing out of public view');
+  assert.equal((await pool.query('SELECT status::text AS s, notes FROM requirements WHERE customer_id = $1', [custId])).rows[0].s, 'closed');
+  assert.equal((await pool.query('SELECT full_name FROM customers WHERE id = $1', [custId])).rows[0].full_name, 'Deleted user');
+  // The event is still there, without the person.
+  const ev = (await pool.query(`SELECT user_id, customer_id, properties_json FROM events WHERE properties_json->>'propertyId' = $1`, [listing])).rows[0];
+  assert.ok(ev && ev.user_id === null && ev.customer_id === null);
+  assert.equal(ev.properties_json.mobile, undefined);
+  assert.equal(ev.properties_json.pii, 'deleted');
+  await assert.rejects(pool.query(`UPDATE events SET event_type = 'x' WHERE properties_json->>'propertyId' = $1`, [listing]), /append-only/, 'events stay append-only outside the anonymiser');
+  // Consent log and the deal record are kept.
+  assert.ok((await pool.query('SELECT COUNT(*)::int AS n FROM consent_logs WHERE user_id = $1', [uid])).rows[0].n >= 6);
+  assert.equal((await pool.query('SELECT COUNT(*)::int AS n FROM deals WHERE id = $1', [deal])).rows[0].n, 1);
+  const done = (await api('GET', '/compliance/data-requests?status=completed', { token: A })).data.items.find((r) => r.id === reqId);
+  assert.ok(done && done.summary.listings_delisted === 1 && done.summary.events_anonymised === 1, JSON.stringify(done?.summary));
+});
+
+test('compliance alerts: rules open and auto-resolve alerts, acknowledge / dismiss with reason, thresholds and on-off per rule, DPDP due alert', async () => {
+  const A = ctx.admin.token;
+  const builder = await createUser('builder', 'compbuilder');
+  const CCITY = `Comp City ${RUN}`;
+  const noRera = (await pool.query(`INSERT INTO properties (created_by, builder_id, title, property_type, transaction_type, city, price, status) VALUES ($1, $1, $2, 'apartment', 'sell', $3, '1 Cr', 'approved') RETURNING id`, [builder.id, `No RERA tower ${RUN}`, CCITY])).rows[0].id;
+  const risky = (await pool.query(`INSERT INTO properties (created_by, title, property_type, transaction_type, city, price, status, fraud_band, fraud_score, rera_number) VALUES ($1, $2, 'apartment', 'sell', $3, '1 Cr', 'approved', 'red', 88, 'R1') RETURNING id`, [builder.id, `Risky flat ${RUN}`, CCITY])).rows[0].id;
+
+  assert.equal((await api('GET', '/compliance/summary', { token: ctx.broker.token })).status, 403);
+  const run1 = await api('POST', '/compliance/run', { token: ctx.sales.token });
+  assert.equal(run1.status, 200, JSON.stringify(run1.body));
+  assert.ok(run1.data.opened >= 2);
+  const alerts = await api('GET', `/compliance/alerts?search=${encodeURIComponent(RUN)}`, { token: ctx.sales.token });
+  const rera = alerts.data.find((a) => a.entityId === noRera && a.ruleKey === 'rera_missing_builder_listing');
+  const fraud = alerts.data.find((a) => a.entityId === risky && a.ruleKey === 'fraud_listing_live');
+  assert.ok(rera && rera.severity === 'critical' && rera.status === 'open' && rera.link === `/app/properties/${noRera}` && rera.city === CCITY, JSON.stringify(alerts.data));
+  assert.ok(fraud && /score 88/.test(fraud.detail));
+  assert.ok(alerts.data.some((a) => a.ruleKey === 'professional_unverified_live' && a.entityId === builder.id));
+  // Critical ones come first.
+  assert.equal(alerts.data[0].severity, 'critical');
+  const note = await pool.query(`SELECT 1 FROM notifications WHERE user_id = $1 AND type = 'compliance'`, [ctx.admin.id]);
+  assert.ok(note.rows.length >= 1, 'admins are told about new critical alerts');
+
+  // A second run does not duplicate.
+  await api('POST', '/compliance/run', { token: A });
+  assert.equal((await pool.query(`SELECT COUNT(*)::int AS n FROM compliance_alerts WHERE entity_id = $1`, [noRera])).rows[0].n, 1);
+
+  // Acknowledge (staff); dismiss needs an admin and a reason; a dismissed alert stays quiet.
+  assert.equal((await api('POST', `/compliance/alerts/${rera.id}`, { token: ctx.sales.token, body: { action: 'acknowledge' } })).status, 200);
+  assert.equal((await api('POST', `/compliance/alerts/${fraud.id}`, { token: ctx.sales.token, body: { action: 'dismiss', note: 'Checked by hand' } })).status, 403);
+  assert.equal((await api('POST', `/compliance/alerts/${fraud.id}`, { token: A, body: { action: 'dismiss' } })).status, 400);
+  assert.equal((await api('POST', `/compliance/alerts/${fraud.id}`, { token: A, body: { action: 'dismiss', note: 'Documents checked in person - false positive' } })).status, 200);
+  await api('POST', '/compliance/run', { token: A });
+  const after = await api('GET', `/compliance/alerts?status=all&search=${encodeURIComponent(RUN)}`, { token: A });
+  assert.equal(after.data.find((a) => a.id === fraud.id).status, 'dismissed');
+  assert.equal(after.data.find((a) => a.id === rera.id).status, 'acknowledged');
+
+  // Fixing the record closes the alert automatically; breaking it again reopens it.
+  await pool.query(`UPDATE properties SET rera_number = 'DLRERA2026P0099' WHERE id = $1`, [noRera]);
+  await api('POST', '/compliance/run', { token: A });
+  const fixed = (await api('GET', `/compliance/alerts?status=resolved&search=${encodeURIComponent(RUN)}`, { token: A })).data.find((a) => a.id === rera.id);
+  assert.ok(fixed && fixed.autoResolved);
+  await pool.query(`UPDATE properties SET rera_number = NULL WHERE id = $1`, [noRera]);
+  await api('POST', '/compliance/run', { token: A });
+  assert.equal((await api('GET', `/compliance/alerts?search=${encodeURIComponent(RUN)}`, { token: A })).data.find((a) => a.id === rera.id).status, 'open');
+
+  // Rules: thresholds and on / off (admin only).
+  assert.equal((await api('PUT', '/compliance/rules/professional_unverified_live', { token: ctx.sales.token, body: { isActive: false } })).status, 403);
+  assert.equal((await api('PUT', '/compliance/rules/professional_unverified_live', { token: A, body: { params: { nope: 1 } } })).status, 400);
+  try {
+    const up = await api('PUT', '/compliance/rules/professional_unverified_live', { token: A, body: { params: { min_listings: 5 } } });
+    assert.equal(up.status, 200, JSON.stringify(up.body));
+    assert.ok(!(await api('GET', `/compliance/alerts?rule=professional_unverified_live`, { token: A })).data.some((a) => a.entityId === builder.id), 'below the new threshold');
+    await api('PUT', '/compliance/rules/fraud_listing_live', { token: A, body: { isActive: false } });
+    assert.equal((await api('GET', '/compliance/alerts?rule=fraud_listing_live', { token: A })).data.length, 0);
+  } finally {
+    await api('PUT', '/compliance/rules/professional_unverified_live', { token: A, body: { params: { min_listings: 1 } } });
+    await api('PUT', '/compliance/rules/fraud_listing_live', { token: A, body: { isActive: true } });
+  }
+
+  // DPDP: a deletion request within 5 days of its limit raises a critical alert.
+  const person = await createUser('customer', 'compdpdp');
+  const dr = await api('POST', '/user/request-deletion', { token: person.token });
+  await pool.query(`UPDATE data_requests SET due_at = now() + interval '2 days' WHERE id = $1`, [dr.data.id]);
+  await api('POST', '/compliance/run', { token: A });
+  const due = (await api('GET', '/compliance/alerts?area=dpdp', { token: A })).data.find((a) => a.entityId === dr.data.id);
+  assert.ok(due && due.severity === 'critical' && /due soon/.test(due.title));
+  await api('DELETE', '/user/request-deletion', { token: person.token });
+
+  const sum = await api('GET', '/compliance/summary', { token: A });
+  assert.equal(sum.data.rules.length, 12);
+  assert.ok(sum.data.totals.active >= 1 && sum.data.rules.find((r) => r.ruleKey === 'rera_missing_builder_listing').open >= 1);
+  // Leave the local data tidy.
+  await pool.query(`UPDATE properties SET status = 'inactive' WHERE id = ANY($1::uuid[])`, [[noRera, risky]]);
+  await api('POST', '/compliance/run', { token: A });
+});
+
+test('chat: conversation per enquiry with the representative always in it, contact sharing blocked + flagged, masked names, unread counts, immutable messages, masked buyer contact', async () => {
+  const A = ctx.admin.token;
+  const lister = await createUser('broker', 'chatlister');
+  const buyer = await createUser('customer', 'chatbuyer');
+  const outsider = await createUser('customer', 'chatout');
+  const prop = (await pool.query(`INSERT INTO properties (created_by, broker_id, title, property_type, transaction_type, city, price, status) VALUES ($1, $1, $2, 'apartment', 'sell', $3, '1 Cr', 'approved') RETURNING id`, [lister.id, `Chat flat ${RUN}`, CITY])).rows[0].id;
+  const mobile = `94${String(Math.floor(Math.random() * 1e8)).padStart(8, '0')}`;
+  const custId = (await pool.query('SELECT id FROM customers WHERE user_id = $1', [buyer.id])).rows[0]?.id
+    || (await pool.query(`INSERT INTO customers (full_name, mobile, email, user_id) VALUES ($1, $2, $3, $4) RETURNING id`, [`Chatbuyer Kumar ${RUN}`, mobile, buyer.email, buyer.id])).rows[0].id;
+  await pool.query('UPDATE customers SET mobile = $1, full_name = $2 WHERE id = $3', [mobile, `Chatbuyer Kumar ${RUN}`, custId]);
+  const lead = (await pool.query(`INSERT INTO leads (created_by, source, property_id, customer_id, assigned_to, arb_rep_id) VALUES ($1, 'website', $2, $3, $4, $5) RETURNING id`, [buyer.id, prop, custId, lister.id, ctx.sales.id])).rows[0].id;
+
+  // The buyer opens the conversation: buyer, lister and the representative are in it.
+  assert.ok((await api('GET', '/chat/startable', { token: buyer.token })).data.some((s) => s.leadId === lead));
+  assert.equal((await api('POST', '/chat/threads', { token: outsider.token, body: { leadId: lead } })).status, 403);
+  const opened = await api('POST', '/chat/threads', { token: buyer.token, body: { leadId: lead } });
+  assert.equal(opened.status, 200, JSON.stringify(opened.body));
+  const T = opened.data.id;
+  assert.equal(opened.data.myParty, 'enquirer');
+  assert.deepEqual(opened.data.participants.map((p) => p.party).sort(), ['enquirer', 'lister', 'representative']);
+  assert.ok(opened.data.hasRepresentative);
+  // The buyer sees the lister by first name only, and no one's number or email.
+  const listerSeen = opened.data.participants.find((p) => p.party === 'lister');
+  assert.equal(listerSeen.name, 'chatlister');
+  assert.ok(!JSON.stringify(opened.data).includes(lister.email) && !JSON.stringify(opened.data).includes(mobile));
+  assert.equal((await api('POST', '/chat/threads', { token: lister.token, body: { leadId: lead } })).data.id, T, 'one conversation per enquiry');
+
+  // Messages flow; contact details are rejected before saving and the account is flagged.
+  const m1 = await api('POST', `/chat/threads/${T}/messages`, { token: buyer.token, body: { body: 'Is the flat still available? I will contact my bank this week.' } });
+  assert.equal(m1.status, 201, JSON.stringify(m1.body));
+  for (const bad of ['Call me on 98765 43210', 'mail me at someone@example.com', 'see www.mysite.in for photos', 'whatsapp karo please', 'my number is +91-9876543210']) {
+    const r = await api('POST', `/chat/threads/${T}/messages`, { token: buyer.token, body: { body: bad } });
+    assert.equal(r.status, 422, `should block: ${bad}`);
+  }
+  assert.equal((await pool.query('SELECT COUNT(*)::int AS n FROM chat_messages WHERE thread_id = $1', [T])).rows[0].n, 1, 'blocked messages are not stored');
+  assert.equal((await pool.query(`SELECT COUNT(*)::int AS n FROM user_flags WHERE user_id = $1 AND reason = 'contact_sharing_attempt'`, [buyer.id])).rows[0].n, 1);
+  assert.equal((await pool.query(`SELECT COUNT(*)::int AS n FROM contact_access_log WHERE user_id = $1 AND action = 'message_blocked'`, [buyer.id])).rows[0].n, 5);
+  assert.equal((await api('POST', `/chat/threads/${T}/messages`, { token: outsider.token, body: { body: 'hello' } })).status, 403);
+
+  // Unread counts, notifications, reading.
+  assert.equal((await api('GET', '/chat/unread', { token: lister.token })).data.messages, 1);
+  assert.equal((await api('GET', '/chat/unread', { token: buyer.token })).data.messages, 0);
+  assert.ok((await pool.query(`SELECT 1 FROM notifications WHERE user_id = $1 AND type = 'chat_message'`, [ctx.sales.id])).rows.length >= 1, 'the representative is told');
+  const reply = await api('POST', '/inquiry/send-message', { token: lister.token, body: { leadId: lead, message: 'Yes, it is available. Visits are open on Saturday.' } });
+  assert.equal(reply.status, 201, JSON.stringify(reply.body));
+  assert.ok(reply.data.representativeCopied && reply.data.threadId === T);
+  const rep = await api('POST', `/chat/threads/${T}/messages`, { token: ctx.sales.token, body: { body: 'I will arrange the visit. Reach me on the platform number 011-40001234.' } });
+  assert.equal(rep.status, 201, 'the representative is the contact point and may give the platform number');
+  const msgs = await api('GET', `/chat/threads/${T}/messages`, { token: buyer.token });
+  assert.deepEqual(msgs.data.items.map((m) => m.party), ['enquirer', 'lister', 'representative']);
+  assert.equal(msgs.data.items[1].senderName, 'chatlister', 'first name only for the other side');
+  assert.ok(msgs.data.items[0].mine && !msgs.data.items[1].mine);
+  const newer = await api('GET', `/chat/threads/${T}/messages?after=${msgs.data.items[1].id}`, { token: buyer.token });
+  assert.equal(newer.data.items.length, 1);
+  assert.equal((await api('GET', '/chat/threads', { token: buyer.token })).data.find((t) => t.id === T).unread, 2);
+  await api('POST', `/chat/threads/${T}/read`, { token: buyer.token });
+  assert.equal((await api('GET', '/chat/unread', { token: buyer.token })).data.messages, 0);
+  await assert.rejects(pool.query('UPDATE chat_messages SET body = $1 WHERE thread_id = $2', ['edited', T]), /append-only/);
+
+  // Staff oversight: any conversation, and closing it stops further messages.
+  assert.ok((await api('GET', '/chat/threads?scope=all', { token: A })).data.some((t) => t.id === T));
+  assert.equal((await api('PUT', `/chat/threads/${T}/status`, { token: lister.token, body: { status: 'closed' } })).status, 403);
+  assert.equal((await api('PUT', `/chat/threads/${T}/status`, { token: A, body: { status: 'closed', reason: 'Deal moved to the deal room' } })).data.status, 'closed');
+  assert.equal((await api('POST', `/chat/threads/${T}/messages`, { token: buyer.token, body: { body: 'hello?' } })).status, 400);
+
+  // Masked buyer contact: assigned representative / admin only, never raw, every look logged.
+  assert.equal((await api('GET', `/inquiry/buyer-contact?leadId=${lead}`, { token: lister.token })).status, 403);
+  const masked = await api('GET', `/inquiry/buyer-contact?leadId=${lead}`, { token: ctx.sales.token });
+  assert.equal(masked.status, 200, JSON.stringify(masked.body));
+  assert.equal(masked.data.phone_masked, `${mobile.slice(0, 2)}XXXXXX${mobile.slice(-2)}`);
+  assert.ok(!JSON.stringify(masked.data).includes(mobile) && /^.\*@/.test(masked.data.email_masked));
+  assert.equal((await pool.query(`SELECT COUNT(*)::int AS n FROM contact_access_log WHERE lead_id = $1 AND action IN ('masked_contact_viewed', 'masked_contact_denied')`, [lead])).rows[0].n, 2);
+});
+
+test('API ecosystem: API keys with scopes, /v1 with cursor pagination + error format + rate limit + idempotency, masked contact, signed webhooks with retries', async () => {
+  const http = require('node:http');
+  const A = ctx.admin.token;
+  const dev = await createUser('broker', 'apidev');
+  const other = await createUser('broker', 'apiother');
+  for (let i = 0; i < 3; i += 1) await pool.query(`INSERT INTO properties (created_by, broker_id, title, property_type, transaction_type, city, price, status, created_at) VALUES ($1, $1, $2, 'apartment', 'sell', $3, '1 Cr', 'approved', now() - ($4 || ' minutes')::interval)`, [dev.id, `Api flat ${i} ${RUN}`, CITY, String(i)]);
+  const foreign = (await pool.query(`INSERT INTO properties (created_by, broker_id, title, property_type, transaction_type, city, price, status) VALUES ($1, $1, $2, 'apartment', 'sell', $3, '1 Cr', 'approved') RETURNING id`, [other.id, `Other flat ${RUN}`, CITY])).rows[0].id;
+
+  // Keys: customers cannot have one; the key is shown once and stored only as a hash.
+  assert.equal((await api('POST', '/developer/keys', { token: ctx.customer.token, body: { name: 'x key', scopes: ['leads:read'] } })).status, 403);
+  assert.equal((await api('POST', '/developer/keys', { token: dev.token, body: { name: 'Bad', scopes: ['everything'] } })).status, 400);
+  const made = await api('POST', '/developer/keys', { token: dev.token, body: { name: `Website sync ${RUN}`, scopes: ['properties:read', 'leads:read', 'leads:write'] } });
+  assert.equal(made.status, 201, JSON.stringify(made.body));
+  const KEY = made.data.key;
+  assert.match(KEY, /^psk_live_[0-9a-f]{48}$/);
+  assert.equal((await pool.query('SELECT COUNT(*)::int AS n FROM api_keys WHERE key_hash = $1', [KEY])).rows[0].n, 0, 'the key itself is not stored');
+  const listed = await api('GET', '/developer/keys', { token: dev.token });
+  assert.ok(listed.data.items.length === 1 && !JSON.stringify(listed.data).includes(KEY));
+  const v1 = async (method, path, { key = KEY, body, headers = {} } = {}) => {
+    const res = await fetch(`${BASE}/v1${path}`, { method, headers: { ...(key ? { 'x-api-key': key } : {}), ...(body ? { 'content-type': 'application/json' } : {}), ...headers }, body: body ? JSON.stringify(body) : undefined });
+    return { status: res.status, headers: res.headers, body: await res.json() };
+  };
+
+  // Auth and the error format.
+  const noKey = await v1('GET', '/properties', { key: null });
+  assert.equal(noKey.status, 401);
+  assert.ok(noKey.body.error.code === 'invalid_api_key' && noKey.body.error.status === 401 && noKey.body.error.trace_id && noKey.body.error.timestamp);
+  assert.equal((await v1('GET', '/properties', { key: `psk_live_${'0'.repeat(48)}` })).status, 401);
+  assert.equal((await v1('GET', '/me')).body.account.id, dev.id);
+  const noScope = await v1('GET', '/deals');
+  assert.equal(noScope.status, 403);
+  assert.equal(noScope.body.error.code, 'missing_scope');
+
+  // Own data only, cursor pagination.
+  const p1 = await v1('GET', '/properties?limit=2');
+  assert.equal(p1.status, 200, JSON.stringify(p1.body));
+  assert.ok(p1.body.items.length === 2 && p1.body.has_more && p1.body.total === 3 && p1.body.next_cursor);
+  assert.ok(p1.headers.get('x-ratelimit-limit') === '120' && Number(p1.headers.get('x-ratelimit-remaining')) < 120);
+  const p2 = await v1('GET', `/properties?limit=2&cursor=${p1.body.next_cursor}`);
+  assert.ok(p2.body.items.length === 1 && !p2.body.has_more && p2.body.next_cursor === null);
+  assert.equal(new Set([...p1.body.items, ...p2.body.items].map((i) => i.id)).size, 3);
+  assert.equal((await v1('GET', `/properties/${foreign}`)).status, 404, 'another broker\'s listing is not visible');
+  assert.equal((await v1('GET', '/properties?cursor=garbage')).body.error.code, 'invalid_cursor');
+
+  // Create a lead: validation, idempotency, external id, contact always masked.
+  const bad = await v1('POST', '/leads', { body: { full_name: 'X' } });
+  assert.equal(bad.status, 422);
+  assert.ok(bad.body.error.details.length >= 1);
+  const leadMobile = `93${String(Math.floor(Math.random() * 1e8)).padStart(8, '0')}`;
+  const body = { full_name: `Api Buyer ${RUN}`, mobile: leadMobile, email: `api.buyer.${RUN}@e2e.test`, property_id: p1.body.items[0].id, message: 'From the partner site', external_id: `ext-${RUN}` };
+  const created = await v1('POST', '/leads', { body, headers: { 'idempotency-key': `idem-${RUN}` } });
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  assert.equal(created.body.contact.phone_masked, `${leadMobile.slice(0, 2)}XXXXXX${leadMobile.slice(-2)}`);
+  assert.ok(!JSON.stringify(created.body).includes(leadMobile) && !JSON.stringify(created.body).includes(`api.buyer.${RUN}`));
+  const replay = await v1('POST', '/leads', { body, headers: { 'idempotency-key': `idem-${RUN}` } });
+  assert.ok(replay.status === 201 && replay.body.id === created.body.id && replay.headers.get('idempotent-replayed') === 'true');
+  const sameExternal = await v1('POST', '/leads', { body });
+  assert.ok(sameExternal.status === 200 && sameExternal.body.id === created.body.id);
+  assert.equal((await pool.query('SELECT COUNT(*)::int AS n FROM leads WHERE external_lead_id = $1', [`ext-${RUN}`])).rows[0].n, 1);
+  assert.equal((await v1('POST', '/leads', { body: { ...body, external_id: 'x2', property_id: foreign } })).status, 422, 'cannot attach someone else\'s listing');
+  const leads = await v1('GET', '/leads');
+  assert.ok(leads.body.items.some((l) => l.id === created.body.id) && !JSON.stringify(leads.body).includes(leadMobile));
+
+  // Rate limit: per key, per minute.
+  const keyId = listed.data.items[0].id;
+  assert.equal((await api('PUT', `/developer/keys/${keyId}/rate-limit`, { token: dev.token, body: { perMin: 5 } })).status, 403);
+  assert.equal((await api('PUT', `/developer/keys/${keyId}/rate-limit`, { token: A, body: { perMin: 1 } })).status, 200);
+  const limited = await v1('GET', '/me');
+  assert.equal(limited.status, 429);
+  assert.ok(limited.body.error.code === 'rate_limited' && limited.headers.get('retry-after'));
+  await api('PUT', `/developer/keys/${keyId}/rate-limit`, { token: A, body: { perMin: 600 } });
+
+  // Webhooks: https only, signed, delivered for the owner's events, retried on failure.
+  assert.equal((await api('POST', '/developer/webhooks', { token: dev.token, body: { url: 'ftp://example.com/x', events: ['lead.created'] } })).status, 400);
+  assert.equal((await api('POST', '/developer/webhooks', { token: dev.token, body: { url: 'http://127.0.0.1:1/x', events: ['nope'] } })).status, 400);
+  const got = [];
+  let failNext = false;
+  const server = http.createServer((req, res) => {
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => {
+      got.push({ headers: req.headers, raw });
+      res.statusCode = failNext ? 500 : 200;
+      res.end('ok');
+    });
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  try {
+    const hook = await api('POST', '/developer/webhooks', { token: dev.token, body: { url: `http://127.0.0.1:${server.address().port}/hook`, events: ['lead.created', 'lead.status_changed'], description: 'e2e' } });
+    assert.equal(hook.status, 201, JSON.stringify(hook.body));
+    assert.match(hook.data.secret, /^whsec_/);
+    assert.ok(!(await api('GET', '/developer/webhooks', { token: dev.token })).data.items[0].secret, 'the secret is shown once');
+    const ping = await api('POST', `/developer/webhooks/${hook.data.id}/test`, { token: dev.token });
+    assert.ok(ping.data.delivered, JSON.stringify(ping.data));
+    const sig = got[0].headers['x-propertyserch-signature'];
+    const [, t, v] = sig.match(/^t=(\d+),v1=([0-9a-f]{64})$/);
+    assert.equal(v, crypto.createHmac('sha256', hook.data.secret).update(`${t}.${got[0].raw}`).digest('hex'), 'signature verifies with the secret');
+    assert.equal(got[0].headers['x-propertyserch-event'], 'ping');
+
+    // A new lead of this broker -> lead.created; someone else's lead -> nothing.
+    await api('POST', '/developer/webhooks/run', { token: A });
+    got.length = 0;
+    const l2 = await v1('POST', '/leads', { body: { full_name: `Hook Buyer ${RUN}`, mobile: `92${String(Math.floor(Math.random() * 1e8)).padStart(8, '0')}` } });
+    const otherCust = (await pool.query(`INSERT INTO customers (full_name, mobile, created_by) VALUES ($1, $2, $3) RETURNING id`, [`Other buyer ${RUN}`, `91${String(Math.floor(Math.random() * 1e8)).padStart(8, '0')}`, other.id])).rows[0].id;
+    await pool.query(`INSERT INTO leads (created_by, source, property_id, assigned_to, customer_id) VALUES ($1, 'manual', $2, $1, $3)`, [other.id, foreign, otherCust]);
+    const run = await api('POST', '/developer/webhooks/run', { token: A });
+    assert.ok(run.data.queued >= 1 && run.data.delivered >= 1, JSON.stringify(run.data));
+    const events = got.map((g) => JSON.parse(g.raw));
+    const mine = events.filter((e) => e.event === 'lead.created');
+    assert.equal(mine.length, 1, 'only the owner\'s lead');
+    assert.equal(mine[0].data.lead_id, l2.body.id);
+    assert.ok(!/mobile|phone|email/.test(got[0].raw), 'no contact details in a webhook');
+
+    // A failing receiver: the event stays pending with a later retry time, then is visible in the delivery log.
+    failNext = true;
+    await pool.query(`INSERT INTO lead_activity_log (lead_id, user_id, action, details) VALUES ($1, $2, 'status_changed', '{"from":"new","to":"contacted"}')`, [l2.body.id, dev.id]);
+    await api('POST', '/developer/webhooks/run', { token: A });
+    const log = await api('GET', `/developer/webhooks/${hook.data.id}/deliveries`, { token: dev.token });
+    const failed = log.data.find((d) => d.event === 'lead.status_changed');
+    assert.ok(failed && failed.status === 'pending' && failed.attempts === 1 && failed.response_code === 500 && new Date(failed.next_attempt_at) > new Date(), JSON.stringify(failed));
+    assert.equal((await api('GET', `/developer/webhooks/${hook.data.id}/deliveries`, { token: other.token })).status, 403);
+    assert.equal((await api('DELETE', `/developer/webhooks/${hook.data.id}`, { token: dev.token })).status, 200);
+  } finally {
+    server.close();
+  }
+
+  // Revoking a key stops it at once.
+  assert.equal((await api('DELETE', `/developer/keys/${keyId}`, { token: dev.token })).status, 200);
+  assert.equal((await v1('GET', '/me')).status, 401);
+});
+
+test('property exchange: request + indicative valuation, direct swap (Model A) two-sided match, trade-in (Model B), guidance options, linked deals, closing both legs together', async () => {
+  const A = ctx.admin.token;
+  const XCITY = `Swap City ${RUN}`;
+  const YCITY = `Other City ${RUN}`;
+  const owner1 = await createUser('customer', 'swapone');
+  const owner2 = await createUser('customer', 'swaptwo');
+  const builder = await createUser('builder', 'swapbuilder');
+  const prop = async (u, title, city, type, beds, price, extra = '') => (await pool.query(
+    `INSERT INTO properties (created_by, ${extra ? 'builder_id,' : ''} title, property_type, transaction_type, city, locality, bedrooms, area_sqft, price, price_value, status)
+     VALUES ($1, ${extra ? '$1,' : ''} $2, $3, 'sell', $4, 'Central', $5, 1000, 'x', $6, 'approved') RETURNING id`, [u.id, `${title} ${RUN}`, type, city, beds, price])).rows[0].id;
+  const flat1 = await prop(owner1, 'Old flat in X', XCITY, 'apartment', 2, 8000000);
+  const villa2 = await prop(owner2, 'Villa in Y', YCITY, 'villa', 3, 9000000);
+  const newUnit = await prop(builder, 'New tower unit', YCITY, 'villa', 3, 12000000, 'builder');
+  await pool.query(`UPDATE properties SET created_at = now() - interval '120 days' WHERE id = $1`, [flat1]);
+
+  // Raise the request: only on your own listing, once per property; the flag is set and a value is given with its basis.
+  assert.equal((await api('POST', '/exchange/requests', { token: owner2.token, body: { oldPropertyId: flat1 } })).status, 403);
+  const r1 = await api('POST', '/exchange/requests', { token: owner1.token, body: { oldPropertyId: flat1, reinvestmentIntent: 'direct_swap', wantedCity: YCITY, wantedPropertyType: 'villa', wantedBedroomsMin: 3 } });
+  assert.equal(r1.status, 201, JSON.stringify(r1.body));
+  const X1 = r1.data.id;
+  assert.match(r1.data.requestNumber, /^EX-\d{5}$/);
+  assert.equal(r1.data.oldPropertyValuation, 8000000, JSON.stringify(r1.data.valuationBasis));
+  assert.ok(['platform', 'asking'].includes(r1.data.valuationSource));
+  assert.match(r1.data.guidance.valuationDisclaimer, /[Ii]ndicative/);
+  assert.match(r1.data.guidance.disclaimer, /not financial advice/);
+  assert.equal((await pool.query('SELECT exchange_intent FROM properties WHERE id = $1', [flat1])).rows[0].exchange_intent, true);
+  assert.equal((await api('POST', '/exchange/requests', { token: owner1.token, body: { oldPropertyId: flat1 } })).status, 400, 'one open request per property');
+  // Before the other owner asks, there is no swap; the builder unit is a trade-in option; an old listing suggests hold-and-rent.
+  const before = r1.data.options.map((o) => o.kind);
+  assert.ok(!before.includes('direct_swap') && before.includes('trade_in') && before.includes('hold_and_rent'), JSON.stringify(before));
+  const tradeIn = r1.data.options.find((o) => o.kind === 'trade_in').items.find((i) => i.propertyId === newUnit);
+  assert.equal(tradeIn.valueDifference, 4000000, 'owner pays the gap');
+
+  // The second owner wants a flat in X: now each has what the other wants -> Model A, shown first.
+  const r2 = await api('POST', '/exchange/requests', { token: owner2.token, body: { oldPropertyId: villa2, reinvestmentIntent: 'direct_swap', wantedCity: XCITY, wantedPropertyType: 'apartment' } });
+  const X2 = r2.data.id;
+  const d1 = await api('GET', `/exchange/requests/${X1}`, { token: owner1.token });
+  assert.equal(d1.data.options[0].kind, 'direct_swap');
+  assert.equal(d1.data.guidance.recommended[0], 'direct_swap');
+  const swap = d1.data.options[0].items[0];
+  assert.equal(swap.propertyId, villa2);
+  assert.equal(swap.valueDifference, 1000000);
+  // Controlled contact: the other owner is never identified.
+  const raw = JSON.stringify(d1.data);
+  assert.ok(!raw.includes(owner2.email) && !raw.includes(owner2.id) && !/swaptwo/.test(raw), 'no counterparty identity');
+  assert.ok(d1.data.representative === null || d1.data.representative.name, 'only the representative is named');
+  assert.equal((await api('GET', `/exchange/requests/${X1}`, { token: owner2.token })).status, 403);
+  // Out of tolerance (25%): a much dearer property is not offered as a swap.
+  await pool.query('UPDATE exchange_requests SET old_property_valuation = 30000000 WHERE id = $1', [X2]);
+  assert.ok(!(await api('GET', `/exchange/requests/${X1}`, { token: owner1.token })).data.options.some((o) => o.kind === 'direct_swap'));
+  // Staff valuation with its basis replaces it; the owner is told.
+  assert.equal((await api('PUT', `/exchange/requests/${X2}/valuation`, { token: owner2.token, body: { value: 9000000, note: 'Registry comparables' } })).status, 403);
+  assert.equal((await api('PUT', `/exchange/requests/${X2}/valuation`, { token: A, body: { value: 9000000 } })).status, 422);
+  const valued = await api('PUT', `/exchange/requests/${X2}/valuation`, { token: ctx.sales.token, body: { value: 9000000, note: 'Three registry comparables in the same block' } });
+  assert.equal(valued.data.valuationSource, 'admin');
+
+  // Owner 1 picks the swap; the representative confirms -> two linked deals, both requests in progress.
+  assert.equal((await api('POST', `/exchange/requests/${X1}/interest`, { token: owner1.token, body: { optionKind: 'direct_swap', propertyId: newUnit } })).status, 400, 'not one of the swap options');
+  const interest = await api('POST', `/exchange/requests/${X1}/interest`, { token: owner1.token, body: { optionKind: 'direct_swap', propertyId: villa2 } });
+  assert.equal(interest.status, 201, JSON.stringify(interest.body));
+  assert.equal((await api('GET', '/exchange/summary', { token: A })).data.to_confirm >= 1, true);
+  assert.equal((await api('POST', `/exchange/interests/${interest.data.id}/confirm`, { token: owner1.token })).status, 403);
+  const confirmed = await api('POST', `/exchange/interests/${interest.data.id}/confirm`, { token: ctx.sales.token });
+  assert.equal(confirmed.status, 200, JSON.stringify(confirmed.body));
+  assert.equal(confirmed.data.status, 'in_progress');
+  assert.equal(confirmed.data.exchangeType, 'direct_swap');
+  assert.equal(confirmed.data.valueDifference, 1000000);
+  assert.equal(confirmed.data.legs.length, 2);
+  const [legA, legB] = confirmed.data.legs;
+  assert.ok(legA.linkedDealId === legB.dealId && legB.linkedDealId === legA.dealId, 'each leg points at the other');
+  assert.deepEqual([legA.dealValue, legB.dealValue].sort(), [8000000, 9000000], 'each leg carries its own gross value for the fee');
+  const other = await api('GET', `/exchange/requests/${X2}`, { token: owner2.token });
+  assert.equal(other.data.status, 'in_progress');
+  assert.equal(other.data.valueDifference, -1000000, 'the other owner receives the difference');
+  assert.match(other.data.feeNote, /each leg/);
+
+  // Linked closure: one leg cannot close alone; both must be ready; then both close in one step.
+  const U = (await pool.query(`SELECT id FROM users WHERE id = $1`, [ctx.admin.id])).rows[0].id;
+  await pool.query(`UPDATE deals SET stage = 'payment', sale_deed_execution_date = CURRENT_DATE WHERE id = $1`, [legA.dealId]);
+  const alone = await api('PUT', `/deals/${legA.dealId}/stage`, { token: A, body: { stage: 'closed_won', override: true, notes: 'try to close one leg' } });
+  assert.ok(alone.status >= 400, 'a single leg cannot be closed');
+  assert.equal((await pool.query('SELECT stage::text AS s FROM deals WHERE id = $1', [legA.dealId])).rows[0].s, 'payment');
+  const early = await api('POST', `/exchange/requests/${X1}/close`, { token: A });
+  assert.equal(early.status, 400);
+  assert.match(early.body.message, /Both legs/);
+  await pool.query(`UPDATE deals SET stage = 'payment', sale_deed_execution_date = CURRENT_DATE WHERE id = $1`, [legB.dealId]);
+  const unpaid = await api('POST', `/exchange/requests/${X1}/close`, { token: A });
+  assert.equal(unpaid.status, 400, 'each leg must have its own fee instalments paid');
+  for (const [i, leg] of [legA, legB].entries()) {
+    const ids = [];
+    for (const kind of ['instalment_1', 'instalment_2']) {
+      ids.push((await pool.query(
+        `INSERT INTO invoices (invoice_number, deal_id, kind, party, gross_value, fee_rate_percent, instalment_percent, fee_amount, gst_type, total_amount, gstin, trigger_date, due_date, status, paid_at, recorded_by)
+         VALUES ($1, $2, $3, 'buyer', $4, 1, 50, $5, 'cgst_sgst', $6, '07DERPR1574G2ZY', CURRENT_DATE, CURRENT_DATE + 7, 'paid', now(), $7) RETURNING id`,
+        [`EXT-${RUN}-${i}-${kind}`, leg.dealId, kind, leg.dealValue, leg.dealValue * 0.005, leg.dealValue * 0.0059, U])).rows[0].id);
+    }
+    await pool.query('UPDATE deals SET instalment_1_invoice_id = $1, instalment_2_invoice_id = $2 WHERE id = $3', [ids[0], ids[1], leg.dealId]);
+  }
+  const closed = await api('POST', `/exchange/requests/${X1}/close`, { token: ctx.sales.token });
+  assert.equal(closed.status, 200, JSON.stringify(closed.body));
+  assert.equal(closed.data.status, 'closed');
+  assert.deepEqual((await pool.query(`SELECT stage::text AS s FROM deals WHERE id = ANY($1::uuid[])`, [[legA.dealId, legB.dealId]])).rows.map((r) => r.s), ['closed_won', 'closed_won']);
+  assert.equal((await api('GET', `/exchange/requests/${X2}`, { token: owner2.token })).data.status, 'closed');
+  assert.equal((await pool.query('SELECT exchange_intent FROM properties WHERE id = $1', [flat1])).rows[0].exchange_intent, false);
+
+  // Model B: a trade-in opens two linked legs with the builder; a declined option needs a reason; an open request can be cancelled.
+  const owner3 = await createUser('customer', 'swapthree');
+  const flat3 = await prop(owner3, 'Idle flat in Y', YCITY, 'apartment', 2, 7000000);
+  const r3 = await api('POST', '/exchange/requests', { token: owner3.token, body: { oldPropertyId: flat3, reinvestmentIntent: 'buy_another', wantedCity: YCITY, wantedPropertyType: 'villa' } });
+  const t3 = r3.data.options.find((o) => o.kind === 'trade_in');
+  assert.ok(t3 && t3.items.some((i) => i.propertyId === newUnit), JSON.stringify(r3.data.options.map((o) => o.kind)));
+  const i3 = await api('POST', `/exchange/requests/${r3.data.id}/interest`, { token: owner3.token, body: { optionKind: 'trade_in', propertyId: newUnit } });
+  assert.equal((await api('POST', `/exchange/interests/${i3.data.id}/decline`, { token: A, body: {} })).status, 422);
+  const c3 = await api('POST', `/exchange/interests/${i3.data.id}/confirm`, { token: A });
+  assert.equal(c3.status, 200, JSON.stringify(c3.body));
+  assert.equal(c3.data.exchangeType, 'trade_in');
+  assert.equal(c3.data.valueDifference, 5000000);
+  assert.equal(c3.data.legs.length, 2);
+  assert.ok(c3.data.legs.some((l) => l.dealValue === 12000000) && c3.data.legs.some((l) => l.dealValue === 7000000));
+  assert.equal((await api('POST', `/exchange/requests/${r3.data.id}/cancel`, { token: owner3.token })).status, 400, 'deals are open - goes through the representative');
+  const owner4 = await createUser('customer', 'swapfour');
+  const flat4 = await prop(owner4, 'Spare flat', YCITY, 'apartment', 1, 3000000);
+  const r4 = await api('POST', '/exchange/requests', { token: owner4.token, body: { oldPropertyId: flat4 } });
+  assert.equal((await api('POST', `/exchange/requests/${r4.data.id}/cancel`, { token: owner4.token, body: { reason: 'Changed my mind' } })).data.status, 'cancelled');
+  // Positioning rule: the module never says "distressed", "disputed" or "cheap".
+  assert.ok(!/distress|disputed|cheap/i.test(JSON.stringify([r1.data, d1.data, r3.data, c3.data])));
+  await pool.query(`UPDATE properties SET status = 'inactive' WHERE id = ANY($1::uuid[])`, [[flat1, villa2, newUnit, flat3, flat4]]);
+});
+
+// A small JPEG carrying EXIF GPS + DateTimeOriginal, for the WFH photo checks.
+function exifJpeg(lat, lng, takenAt, seed = 0) {
+  const base = Buffer.from('/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wgALCAABAAEBAREA/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxA=', 'base64');
+  const rat = (v) => { const d = Math.floor(v); const mf = (v - d) * 60; const m = Math.floor(mf); const s = Math.round((mf - m) * 60 * 10000); return [[d, 1], [m, 1], [s, 10000]]; };
+  const pad = (x) => String(x).padStart(2, '0');
+  const dt = `${takenAt.getFullYear()}:${pad(takenAt.getMonth() + 1)}:${pad(takenAt.getDate())} ${pad(takenAt.getHours())}:${pad(takenAt.getMinutes())}:${pad(takenAt.getSeconds())}\0`;
+  // TIFF (little endian): IFD0 -> ExifIFD (DateTimeOriginal) and GPS IFD.
+  const ifd0 = 8;
+  const exifIfd = ifd0 + 2 + 2 * 12 + 4;
+  const gpsIfd = exifIfd + 2 + 1 * 12 + 4;
+  const data = gpsIfd + 2 + 4 * 12 + 4;
+  const tiff = Buffer.alloc(data + 20 + 24 + 24 + 8);
+  tiff.write('II', 0); tiff.writeUInt16LE(42, 2); tiff.writeUInt32LE(ifd0, 4);
+  const entry = (off, tag, type, count, value, inline) => { tiff.writeUInt16LE(tag, off); tiff.writeUInt16LE(type, off + 2); tiff.writeUInt32LE(count, off + 4); if (inline) inline(off + 8); else tiff.writeUInt32LE(value, off + 8); };
+  tiff.writeUInt16LE(2, ifd0);
+  entry(ifd0 + 2, 0x8769, 4, 1, exifIfd);
+  entry(ifd0 + 14, 0x8825, 4, 1, gpsIfd);
+  tiff.writeUInt16LE(1, exifIfd);
+  entry(exifIfd + 2, 0x9003, 2, 20, data);
+  tiff.write(dt, data, 'ascii');
+  const latOff = data + 20;
+  const lngOff = latOff + 24;
+  tiff.writeUInt16LE(4, gpsIfd);
+  entry(gpsIfd + 2, 1, 2, 2, 0, (o) => tiff.write(lat >= 0 ? 'N\0' : 'S\0', o, 'ascii'));
+  entry(gpsIfd + 14, 2, 5, 3, latOff);
+  entry(gpsIfd + 26, 3, 2, 2, 0, (o) => tiff.write(lng >= 0 ? 'E\0' : 'W\0', o, 'ascii'));
+  entry(gpsIfd + 38, 4, 5, 3, lngOff);
+  rat(Math.abs(lat)).forEach(([a, b], i) => { tiff.writeUInt32LE(a, latOff + i * 8); tiff.writeUInt32LE(b, latOff + i * 8 + 4); });
+  rat(Math.abs(lng)).forEach(([a, b], i) => { tiff.writeUInt32LE(a, lngOff + i * 8); tiff.writeUInt32LE(b, lngOff + i * 8 + 4); });
+  tiff.writeUInt32LE(seed, tiff.length - 8); // makes each file's bytes differ
+  const body = Buffer.concat([Buffer.from('Exif\0\0', 'ascii'), tiff]);
+  const app1 = Buffer.alloc(4);
+  app1.writeUInt16BE(0xffe1, 0); app1.writeUInt16BE(body.length + 2, 2);
+  return Buffer.concat([base.subarray(0, 2), app1, body, base.subarray(2)]);
+}
+
+test('WFH citizen-sourcing: join + KYC, task board by distance, 48h lock, GPS / EXIF / phone / OTP checks, rep + staff confirmation, CRM leads, earnings, monthly payout with TDS, forfeits', async () => {
+  const A = ctx.admin.token;
+  const LAT = 28.6 + (parseInt(RUN.slice(0, 3), 16) % 1000) / 10000;
+  const LNG = 77.2 + (parseInt(RUN.slice(3), 16) % 1000) / 10000;
+  const near = (m) => LAT + m / 111320; // m metres north
+  const WCITY = `Field City ${RUN}`;
+  const worker = await createUser('customer', 'fieldone');
+  const worker2 = await createUser('customer', 'fieldtwo');
+  const mobile = () => `8${String(Math.floor(Math.random() * 1e9)).padStart(9, '0')}`;
+  const aadhaar = () => String(Math.floor(2e11 + Math.random() * 7e11));
+  const form = async (path, token, fields, photos = []) => {
+    const fd = new FormData();
+    for (const [k, v] of Object.entries(fields)) fd.append(k, String(v));
+    photos.forEach((buf, i) => fd.append('photos', new Blob([buf], { type: 'image/jpeg' }), `p${i}.jpg`));
+    const res = await fetch(`${BASE}${path}`, { method: 'POST', headers: { authorization: `Bearer ${token}` }, body: fd });
+    const json = await res.json();
+    return { status: res.status, body: json, data: json.data };
+  };
+
+  // Amounts are admin-configured, with a city override; they are copied onto a task when it is created.
+  assert.equal((await api('PUT', '/wfh/manage/config/buyer_visit_payment_default', { token: ctx.sales.token, body: { value: { amount: 1 } } })).status, 403);
+  await api('PUT', '/wfh/manage/config/buyer_visit_payment_default', { token: A, body: { value: { amount: 500, overrides: [{ city: WCITY, amount: 8000 }] } } });
+  await api('PUT', '/wfh/manage/config/seller_photo_payment_default', { token: A, body: { value: { amount: 9000 } } });
+  await api('PUT', '/wfh/manage/config/requirement_collect_payment_default', { token: A, body: { value: { amount: 300 } } });
+  await api('PUT', '/wfh/manage/config/auction_check_payment_default', { token: A, body: { value: { amount: 250 } } });
+  try {
+    const prop = (await pool.query(`INSERT INTO properties (created_by, title, property_type, transaction_type, city, locality, price, status, latitude, longitude) VALUES ($1, $2, 'apartment', 'sell', $3, 'Field Block', '1 Cr', 'approved', $4, $5) RETURNING id`, [ctx.admin.id, `Field flat ${RUN}`, WCITY, LAT, LNG])).rows[0].id;
+    assert.equal((await api('POST', '/wfh/manage/tasks', { token: worker.token, body: { taskType: 'buyer_visit', propertyId: prop } })).status, 403);
+    assert.equal((await api('POST', '/wfh/manage/tasks', { token: A, body: { taskType: 'buyer_visit' } })).status, 400, 'a buyer visit needs a listing');
+    const made = await api('POST', '/wfh/manage/tasks', { token: ctx.sales.token, body: { taskType: 'buyer_visit', propertyId: prop, count: 2 } });
+    assert.equal(made.status, 201, JSON.stringify(made.body));
+    assert.equal(made.data[0].paymentAmount, 8000, 'city override');
+    const [visitTask, visitTask2] = made.data.map((t) => t.id);
+    const photoTask = (await api('POST', '/wfh/manage/tasks', { token: A, body: { taskType: 'seller_photo', latitude: LAT, longitude: LNG, city: WCITY, locality: 'Field Block' } })).data[0].id;
+    const reqTask = (await api('POST', '/wfh/manage/tasks', { token: A, body: { taskType: 'requirement_collect', latitude: LAT, longitude: LNG, city: WCITY } })).data[0].id;
+    const farTask = (await api('POST', '/wfh/manage/tasks', { token: A, body: { taskType: 'requirement_collect', latitude: LAT + 0.2, longitude: LNG, city: WCITY } })).data[0].id;
+    await api('PUT', '/wfh/manage/config/buyer_visit_payment_default', { token: A, body: { value: { amount: 1 } } });
+    assert.equal(Number((await pool.query('SELECT payment_amount FROM wfh_tasks WHERE id = $1', [visitTask])).rows[0].payment_amount), 8000, 'a live task keeps its amount');
+    await assert.rejects(pool.query('UPDATE wfh_tasks SET payment_amount = 1 WHERE id = $1', [visitTask]), /immutable/);
+
+    // Join: agreement + KYC; details are stored encrypted; browsing is open, accepting waits for KYC.
+    const intro = await api('GET', '/wfh/me', { token: worker.token });
+    assert.ok(intro.data.joined === false && intro.data.taskTypes.length === 7 && intro.data.agreement.length >= 3);
+    const aad = aadhaar();
+    const reg = { aadhaar: aad, bankAccount: '123456789012', bankIfsc: 'HDFC0001234', bankAccountName: 'Field One', pan: 'ABCDE1234F', latitude: LAT, longitude: LNG, city: WCITY, locality: 'Field Block' };
+    assert.equal((await api('POST', '/wfh/register', { token: worker.token, body: reg })).status, 400, 'agreement must be accepted');
+    assert.equal((await api('POST', '/wfh/register', { token: ctx.sales.token, body: { ...reg, agreementAccepted: true } })).status, 400, 'staff cannot join');
+    const joined = await api('POST', '/wfh/register', { token: worker.token, body: { ...reg, agreementAccepted: true } });
+    assert.equal(joined.status, 201, JSON.stringify(joined.body));
+    assert.ok(joined.data.worker.kycStatus === 'pending' && joined.data.worker.aadhaarLast4 === aad.slice(-4) && joined.data.worker.bankAccountLast4 === '9012');
+    const stored = (await pool.query('SELECT aadhaar_number_encrypted, bank_account_encrypted FROM wfh_workers WHERE user_id = $1', [worker.id])).rows[0];
+    assert.ok(!stored.aadhaar_number_encrypted.includes(aad) && !stored.bank_account_encrypted.includes('123456789012'), 'KYC is encrypted at rest');
+    assert.equal((await api('POST', '/wfh/register', { token: worker2.token, body: { ...reg, agreementAccepted: true } })).status, 400, 'one Aadhaar, one field partner');
+    const board = await api('GET', '/wfh/board', { token: worker.token });
+    assert.ok(board.data.items.some((t) => t.id === visitTask) && !board.data.items.some((t) => t.id === farTask), 'only tasks within 5 km');
+    assert.ok(board.data.canAccept === false && /KYC/.test(board.data.blocker));
+    const card = board.data.items.find((t) => t.id === visitTask);
+    assert.ok(card.distanceKm === 0 && card.paymentAmount === 8000 && card.expiryAt && !('propertyId' in card), 'the card shows locality, pay, distance, expiry - not the property');
+    assert.equal((await api('POST', `/wfh/tasks/${visitTask}/accept`, { token: worker.token })).status, 403);
+    assert.equal((await api('POST', `/wfh/manage/workers/${worker.id}/kyc`, { token: ctx.sales.token, body: { decision: 'verify' } })).status, 403);
+    assert.equal((await api('POST', `/wfh/manage/workers/${worker.id}/kyc`, { token: A, body: { decision: 'verify' } })).data.kycStatus, 'verified');
+
+    // Accept: locked for 48 hours, nobody else can take it.
+    const acc = await api('POST', `/wfh/tasks/${visitTask}/accept`, { token: worker.token });
+    assert.equal(acc.status, 201, JSON.stringify(acc.body));
+    const hours = (new Date(acc.data.lockExpiresAt) - Date.now()) / 3600000;
+    assert.ok(hours > 47.9 && hours <= 48.01);
+    assert.equal(acc.data.property.title, `Field flat ${RUN}`, 'the property is revealed once the task is theirs');
+    await api('POST', '/wfh/register', { token: worker2.token, body: { ...reg, aadhaar: aadhaar(), agreementAccepted: true } });
+    await api('POST', `/wfh/manage/workers/${worker2.id}/kyc`, { token: A, body: { decision: 'verify' } });
+    assert.equal((await api('POST', `/wfh/tasks/${visitTask}/accept`, { token: worker2.token })).status, 400, 'already taken');
+    assert.ok(!(await api('GET', '/wfh/board', { token: worker2.token })).data.items.some((t) => t.id === visitTask));
+
+    // Buyer visit evidence: GPS within 100 m, the buyer's phone (not the worker's own), then the buyer's OTP.
+    const A1 = acc.data.id;
+    const buyerPhone = mobile();
+    const far = await form(`/wfh/assignments/${A1}/submit`, worker.token, { latitude: near(400), longitude: LNG, partyPhone: buyerPhone, partyName: 'Visit Buyer' });
+    assert.equal(far.status, 400);
+    assert.match(far.body.message, /m from the property/);
+    const ownMobile = (await pool.query('SELECT mobile FROM users WHERE id = $1', [worker.id])).rows[0].mobile;
+    assert.equal((await form(`/wfh/assignments/${A1}/submit`, worker.token, { latitude: near(40), longitude: LNG, partyPhone: ownMobile, partyName: 'Me' })).status, 400, 'own number refused');
+    const sub = await form(`/wfh/assignments/${A1}/submit`, worker.token, { latitude: near(40), longitude: LNG, partyPhone: buyerPhone, partyName: 'Visit Buyer' });
+    assert.equal(sub.status, 200, JSON.stringify(sub.body));
+    assert.ok(sub.data.state === 'submitted' && sub.data.waitingFor === 'otp' && sub.data.gpsDistanceM >= 35 && sub.data.gpsDistanceM <= 45 && sub.data.partyPhoneLast4 === buyerPhone.slice(-4));
+    const enc = (await pool.query('SELECT buyer_phone_submitted FROM wfh_task_assignments WHERE id = $1', [A1])).rows[0].buyer_phone_submitted;
+    assert.ok(enc && !enc.includes(buyerPhone), 'the buyer phone is stored encrypted');
+    // The representative cannot confirm before the buyer's OTP; a wrong OTP is refused.
+    assert.equal((await api('POST', `/wfh/manage/submissions/${A1}/rep`, { token: A, body: { happened: true } })).status, 400);
+    assert.equal((await api('POST', `/wfh/assignments/${A1}/otp`, { token: worker.token, body: { otp: '000000' } })).status, 400);
+    const otpOk = await api('POST', `/wfh/assignments/${A1}/otp`, { token: worker.token, body: { otp: sub.data.otp } });
+    assert.equal(otpOk.status, 200, JSON.stringify(otpOk.body));
+    assert.ok(otpOk.data.otpConfirmed && otpOk.data.waitingFor === 'representative' && otpOk.data.repDueAt);
+    assert.equal((await pool.query('SELECT COUNT(*)::int AS n FROM wfh_earnings WHERE assignment_id = $1', [A1])).rows[0].n, 0, 'nothing is credited before the representative confirms');
+    // Representative confirms -> verified, earning credited, CRM lead tagged WFH-BuyerVisit on the property.
+    assert.ok((await api('GET', '/wfh/manage/submissions?queue=pending', { token: ctx.sales.token })).data.some((s) => s.id === A1));
+    const repOk = await api('POST', `/wfh/manage/submissions/${A1}/rep`, { token: A, body: { happened: true } });
+    assert.equal(repOk.status, 200, JSON.stringify(repOk.body));
+    assert.equal(repOk.data.verificationStatus, 'passed');
+    const lead = (await pool.query('SELECT source_tag, property_id FROM leads WHERE id = $1', [repOk.data.leadId])).rows[0];
+    assert.ok(lead && lead.source_tag === 'WFH-BuyerVisit' && lead.property_id === prop);
+    assert.equal((await api('GET', '/wfh/earnings', { token: worker.token })).data.totals.awaitingPayout, 8000);
+
+    // The same buyer cannot be submitted again within 90 days - by anyone.
+    const acc2 = await api('POST', `/wfh/tasks/${visitTask2}/accept`, { token: worker2.token });
+    const dup = await form(`/wfh/assignments/${acc2.data.id}/submit`, worker2.token, { latitude: near(10), longitude: LNG, partyPhone: buyerPhone, partyName: 'Visit Buyer' });
+    assert.equal(dup.status, 400);
+    assert.match(dup.body.message, /already been submitted/);
+    // "Did not happen" rejects the task, raises the rejection rate and puts the task back on the board.
+    const b2 = mobile();
+    const sub2 = await form(`/wfh/assignments/${acc2.data.id}/submit`, worker2.token, { latitude: near(10), longitude: LNG, partyPhone: b2, partyName: 'Second Buyer' });
+    await api('POST', `/wfh/assignments/${acc2.data.id}/otp`, { token: worker2.token, body: { otp: sub2.data.otp } });
+    assert.equal((await api('POST', `/wfh/manage/submissions/${acc2.data.id}/rep`, { token: A, body: { happened: false } })).status, 400, 'a reason is required');
+    const no = await api('POST', `/wfh/manage/submissions/${acc2.data.id}/rep`, { token: A, body: { happened: false, reason: 'Buyer says no visit took place' } });
+    assert.equal(no.data.verificationStatus, 'failed');
+    assert.equal((await pool.query('SELECT status FROM wfh_tasks WHERE id = $1', [visitTask2])).rows[0].status, 'open');
+    assert.equal((await api('GET', '/wfh/me', { token: worker2.token })).data.performance.rejectionRate, 100);
+    assert.equal((await api('GET', '/wfh/earnings', { token: worker2.token })).data.totals.lifetime, 0);
+
+    // Seller photos: at least 5, each with its own location (within 50 m) and time (last 24 h). No EXIF = refused.
+    const pacc = await api('POST', `/wfh/tasks/${photoTask}/accept`, { token: worker.token });
+    const P1 = pacc.data.id;
+    const sellerPhone = mobile();
+    const good = (i) => exifJpeg(near(10 + i), LNG, new Date(Date.now() - 3600000), i + 1);
+    assert.equal((await form(`/wfh/assignments/${P1}/submit`, worker.token, { partyPhone: sellerPhone, partyName: 'Owner' }, [0, 1, 2].map(good))).status, 400, 'fewer than 5 photos');
+    const plain = Buffer.from('/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wgALCAABAAEBAREA/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxA=', 'base64');
+    const noExif = await form(`/wfh/assignments/${P1}/submit`, worker.token, { partyPhone: sellerPhone, partyName: 'Owner' }, [plain, plain, plain, plain, plain]);
+    assert.equal(noExif.status, 400);
+    assert.match(noExif.body.message, /no location in the photo/);
+    const wrong = await form(`/wfh/assignments/${P1}/submit`, worker.token, { partyPhone: sellerPhone, partyName: 'Owner' }, [0, 1, 2, 3].map(good).concat([exifJpeg(near(900), LNG, new Date(), 9), exifJpeg(near(5), LNG, new Date(Date.now() - 72 * 3600000), 10)]));
+    assert.equal(wrong.status, 400, 'a far photo and an old photo do not count');
+    assert.match(wrong.body.message, /4 of 6/);
+    const psub = await form(`/wfh/assignments/${P1}/submit`, worker.token, { partyPhone: sellerPhone, partyName: 'Owner' }, [0, 1, 2, 3, 4].map(good));
+    assert.equal(psub.status, 200, JSON.stringify(psub.body));
+    assert.ok(psub.data.photos.length === 5 && psub.data.photos.every((p) => p.distanceM <= 50 && !p.problems.length));
+    assert.equal((await api('POST', `/wfh/manage/submissions/${P1}/review`, { token: A, body: { decision: 'approve' } })).status, 400, 'the owner\'s OTP consent comes first');
+    await api('POST', `/wfh/assignments/${P1}/otp`, { token: worker.token, body: { otp: psub.data.otp } });
+    assert.equal((await api('POST', `/wfh/manage/submissions/${P1}/rep`, { token: A, body: { happened: true } })).status, 400, 'photo tasks go to quality review');
+    assert.equal((await api('POST', `/wfh/manage/submissions/${P1}/review`, { token: A, body: { decision: 'reject' } })).status, 400);
+    const prev = await api('POST', `/wfh/manage/submissions/${P1}/review`, { token: ctx.sales.token, body: { decision: 'approve' } });
+    assert.equal(prev.data.verificationStatus, 'passed');
+    assert.equal((await pool.query('SELECT source_tag FROM leads WHERE id = $1', [prev.data.leadId])).rows[0].source_tag, 'WFH-SellerPhoto');
+
+    // Requirement collection: consent + OTP, then verified automatically and a WFH-Requirement lead is created.
+    const racc = await api('POST', `/wfh/tasks/${reqTask}/accept`, { token: worker.token });
+    const rPhone = mobile();
+    assert.equal((await form(`/wfh/assignments/${racc.data.id}/submit`, worker.token, { partyPhone: rPhone, partyName: 'Req Person', propertyType: 'apartment', budgetMax: 9000000 })).status, 400, 'consent required');
+    const rsub = await form(`/wfh/assignments/${racc.data.id}/submit`, worker.token, { partyPhone: rPhone, partyName: 'Req Person', propertyType: 'apartment', budgetMax: 9000000, intent: 'buy', consent: true });
+    const rdone = await api('POST', `/wfh/assignments/${racc.data.id}/otp`, { token: worker.token, body: { otp: rsub.data.otp } });
+    assert.equal(rdone.data.verificationStatus, 'passed', JSON.stringify(rdone.body));
+    const rlead = (await pool.query(`SELECT l.source_tag, l.enquiry_type FROM leads l JOIN wfh_task_assignments a ON a.lead_id = l.id WHERE a.id = $1`, [racc.data.id])).rows[0];
+    assert.deepEqual([rlead.source_tag, rlead.enquiry_type], ['WFH-Requirement', 'requirement']);
+
+    // Earnings and performance.
+    const earn = await api('GET', '/wfh/earnings', { token: worker.token });
+    assert.deepEqual([earn.data.totals.lifetime, earn.data.totals.awaitingPayout, earn.data.totals.paidOut], [17300, 17300, 0]);
+    assert.equal(earn.data.ledger.length, 3);
+    const perf = (await api('GET', '/wfh/me', { token: worker.token })).data.performance;
+    assert.ok(perf.completed === 3 && perf.rejectionRate === 0 && perf.streakWeeks === 1 && perf.areas.length >= 1, JSON.stringify(perf));
+
+    // Monthly payout: TDS 5% once the year's total crosses Rs 15,000; UTR recorded; slip PDF; bank details masked.
+    assert.equal((await api('POST', '/wfh/manage/payouts/run', { token: ctx.sales.token })).status, 403);
+    const run = await api('POST', '/wfh/manage/payouts/run', { token: A, body: {} });
+    assert.equal(run.status, 200, JSON.stringify(run.body));
+    const mine = run.data.created.find((p) => p.workerId === worker.id);
+    assert.deepEqual([mine.gross, mine.tds, mine.net], [17300, 865, 16435]);
+    assert.ok(!run.data.created.some((p) => p.workerId === worker2.id), 'nothing verified, nothing paid');
+    assert.equal((await api('POST', '/wfh/manage/payouts/run', { token: A, body: {} })).data.created.filter((p) => p.workerId === worker.id).length, 0, 'not paid twice');
+    const listed = (await api('GET', '/wfh/manage/payouts?status=pending', { token: A })).data.find((p) => p.id === mine.id);
+    assert.ok(listed.bankAccountLast4 === '9012' && !JSON.stringify(listed).includes('123456789012'));
+    assert.equal((await api('GET', `/wfh/manage/payouts/${mine.id}/bank`, { token: A })).data.accountNumber, '123456789012', 'full number only on request, and logged');
+    assert.equal((await api('POST', `/wfh/manage/payouts/${mine.id}/paid`, { token: A, body: { utr: 'x' } })).status, 422);
+    const paid = await api('POST', `/wfh/manage/payouts/${mine.id}/paid`, { token: A, body: { utr: `UTR${RUN}0001` } });
+    assert.equal(paid.data.status, 'paid');
+    const after = await api('GET', '/wfh/earnings', { token: worker.token });
+    assert.deepEqual([after.data.totals.awaitingPayout, after.data.totals.paidOut, after.data.totals.tdsDeducted], [0, 16435, 865]);
+    assert.ok(after.data.payouts[0].utr === `UTR${RUN}0001` && after.data.payouts[0].bankAccountLast4 === '9012');
+    const slip = await fetch(`${BASE}/wfh/payouts/${mine.id}/slip`, { headers: { authorization: `Bearer ${worker.token}` } });
+    assert.equal(Buffer.from(await slip.arrayBuffer()).subarray(0, 4).toString(), '%PDF');
+    assert.equal((await fetch(`${BASE}/wfh/payouts/${mine.id}/slip`, { headers: { authorization: `Bearer ${worker2.token}` } })).status, 403);
+
+    // A reserved task that runs out of time is a forfeit and goes back on the board.
+    const facc = await api('POST', `/wfh/tasks/${visitTask2}/accept`, { token: worker2.token });
+    await pool.query(`UPDATE wfh_task_assignments SET lock_expires_at = now() - interval '1 minute' WHERE id = $1`, [facc.data.id]);
+    const sweep = await api('POST', '/wfh/manage/sweep', { token: A });
+    assert.ok(sweep.data.forfeited >= 1, JSON.stringify(sweep.data));
+    assert.equal((await pool.query('SELECT status FROM wfh_tasks WHERE id = $1', [visitTask2])).rows[0].status, 'open');
+    assert.ok((await api('GET', '/wfh/me', { token: worker2.token })).data.performance.forfeitRate > 0);
+    // A suspended field partner cannot take tasks.
+    await api('PUT', `/wfh/manage/workers/${worker2.id}/status`, { token: A, body: { status: 'suspended', note: 'Under review for false submissions' } });
+    assert.equal((await api('POST', `/wfh/tasks/${visitTask2}/accept`, { token: worker2.token })).status, 403);
+    const sum = await api('GET', '/wfh/manage/summary', { token: ctx.sales.token });
+    assert.ok(sum.data.workers >= 2 && sum.data.tasks.verified >= 3);
+    await pool.query(`UPDATE wfh_tasks SET status = 'cancelled' WHERE id = ANY($1::uuid[]) AND status = 'open'`, [[visitTask2, farTask]]);
+    await pool.query(`UPDATE properties SET status = 'inactive' WHERE id = $1`, [prop]);
+  } finally {
+    for (const k of ['buyer_visit', 'seller_photo', 'requirement_collect', 'auction_check']) await api('PUT', `/wfh/manage/config/${k}_payment_default`, { token: A, body: { value: { amount: 0, overrides: [] } } });
+  }
+});
+
+test('document templates: library, only-the-variables form with pre-fill, validation, computed stamp duty + amount in words, state clauses, DOCX + PDF + blank, DRAFT until advocate review, versioning, validators', async () => {
+  const zlib = require('node:zlib');
+  const A = ctx.admin.token;
+  const dl = async (path, token) => { const r = await fetch(`${BASE}${path}`, { headers: { authorization: `Bearer ${token}` } }); return { status: r.status, type: r.headers.get('content-type'), buf: Buffer.from(await r.arrayBuffer()) }; };
+  // The text of a generated .docx (first file entries are stored deflated; document.xml is the last part).
+  const docxText = (buf) => {
+    const at = buf.indexOf(Buffer.from('word/document.xml'));
+    const start = at + 'word/document.xml'.length;
+    const size = buf.readUInt32LE(at - 30 + 18);
+    return zlib.inflateRawSync(buf.subarray(start, start + size)).toString('utf8').replace(/<[^>]+>/g, ' ').replace(/&amp;/g, '&').replace(/\s+/g, ' ');
+  };
+
+  // The launch library: all 14 documents, each with its own variables.
+  const lib = await api('GET', '/templates', { token: A });
+  assert.equal(lib.status, 200, JSON.stringify(lib.body));
+  const keys = lib.data.map((t) => t.templateKey);
+  for (const k of ['agreement_to_sell', 'sale_deed', 'rent_agreement', 'leave_and_licence', 'memorandum_of_understanding', 'general_power_of_attorney', 'specific_power_of_attorney', 'joint_development_agreement', 'joint_venture_agreement', 'development_agreement', 'builder_buyer_agreement', 'nda_institutional', 'mandate_letter', 'exchange_deed']) assert.ok(keys.includes(k), `missing ${k}`);
+  const ats = lib.data.find((t) => t.templateKey === 'agreement_to_sell');
+  // Role-based: a customer sees only templates open to everyone; a broker also the professional ones; staff-only stay hidden.
+  const custKeys = (await api('GET', '/templates', { token: ctx.customer.token })).data.map((t) => t.templateKey);
+  assert.ok(custKeys.includes('rent_agreement') && !custKeys.includes('agreement_to_sell') && !custKeys.includes('nda_institutional'));
+  const brokerKeys = (await api('GET', '/templates', { token: ctx.broker.token })).data.map((t) => t.templateKey);
+  assert.ok(brokerKeys.includes('agreement_to_sell') && !brokerKeys.includes('mandate_letter'));
+
+  // A deal in a state that has stamp-duty rules: known fields arrive pre-filled.
+  const st = (await pool.query(`SELECT s.state_code, s.state_name, r.rate_percent, r.registration_fee_percent, r.registration_fee_cap, c.city_name FROM stamp_duty_rules r JOIN states s ON s.id = r.state_id JOIN cities c ON c.state_id = s.id
+    WHERE r.city_id IS NULL AND r.transaction_type = 'sale' AND r.buyer_gender = 'any' AND r.effective_from <= CURRENT_DATE AND (r.effective_until IS NULL OR r.effective_until >= CURRENT_DATE) AND (SELECT COUNT(*) FROM cities c2 WHERE lower(c2.city_name) = lower(c.city_name)) = 1 ORDER BY r.effective_from DESC, c.city_name LIMIT 1`)).rows[0];
+  assert.ok(st, 'the geographic master has a stamp-duty rule');
+  // The rule the engine must use: a city-level rule overrides the state-wide one.
+  const cityId = (await pool.query('SELECT id FROM cities WHERE lower(city_name) = lower($1)', [st.city_name])).rows[0].id;
+  const dutyRules = await require('../src/services/geo.service').getStampDutyRules({ stateCode: st.state_code, cityId, transactionType: 'sale' });
+  Object.assign(st, dutyRules.find((r) => r.buyer_gender === 'any') || dutyRules[0]);
+  const owner = await createUser('customer', 'tplowner');
+  const buyerUser = await createUser('customer', 'tplbuyer');
+  const prop = (await pool.query(`INSERT INTO properties (created_by, title, property_type, transaction_type, city, locality, address, price, status, area_sqft) VALUES ($1, $2, 'apartment', 'sell', $3, 'Template Block', '12 Template Street', '1.25 Cr', 'approved', 1200) RETURNING id`, [owner.id, `Template flat ${RUN}`, st.city_name])).rows[0].id;
+  const cust = (await pool.query('SELECT id FROM customers WHERE user_id = $1', [buyerUser.id])).rows[0]?.id || (await pool.query(`INSERT INTO customers (full_name, email, mobile, user_id) VALUES ($1, $2, $3, $4) RETURNING id`, [`Tpl Buyer ${RUN}`, buyerUser.email, `90${String(Math.floor(Math.random() * 1e8)).padStart(8, '0')}`, buyerUser.id])).rows[0].id;
+  await pool.query('UPDATE customers SET full_name = $1, mobile = $2 WHERE id = $3', [`Tpl Buyer ${RUN}`, `90${String(Math.floor(Math.random() * 1e8)).padStart(8, '0')}`, cust]);
+  const deal = (await pool.query(`INSERT INTO deals (customer_id, property_id, broker_id, stage, deal_value, assigned_rep_id) VALUES ($1, $2, $3, 'negotiation', 12500000, $4) RETURNING id`, [cust, prop, ctx.broker.id, ctx.sales.id])).rows[0].id;
+  const form = await api('GET', `/templates/${ats.id}/form?dealId=${deal}`, { token: ctx.broker.token });
+  assert.equal(form.status, 200, JSON.stringify(form.body));
+  const field = (n) => form.data.fields.find((f) => f.name === n);
+  assert.equal(field('buyer_name').value, `Tpl Buyer ${RUN}`);
+  assert.ok(field('buyer_name').prefilled && field('sale_consideration').value === 12500000 && /12 Template Street/.test(field('property_address').value));
+  assert.equal(form.data.stateCode, st.state_code);
+  assert.ok(!field('token_amount').prefilled && form.data.missing > 0 && form.data.missing < form.data.fields.length, 'only the genuinely missing ones are asked');
+  assert.ok(!form.data.fields.some((f) => f.fieldType === 'computed') && form.data.computed.some((c) => c.name === 'stamp_duty_amount'), 'computed variables are not asked');
+  // Controlled contact: nothing in the form carries a phone number or an email.
+  const buyerMobile = (await pool.query('SELECT mobile FROM customers WHERE id = $1', [cust])).rows[0].mobile;
+  assert.ok(!JSON.stringify(form.data).includes(buyerMobile) && !JSON.stringify(form.data).includes(buyerUser.email) && !JSON.stringify(form.data).includes(owner.email));
+  // State-specific variables are asked only in their state.
+  assert.equal(!!field('khata_number'), st.state_code === 'KA');
+  assert.equal((await api('GET', `/templates/${ats.id}/form?dealId=${deal}`, { token: (await createUser('broker', 'tplother')).token })).status, 403, 'not their deal');
+
+  // Per-field validation, then generation with computed figures.
+  const values = { execution_date: '2026-11-22', seller_parent_name: 'S/o Ram Kumar', seller_address: '4 Old Road', buyer_parent_name: 'D/o Shyam Lal', buyer_address: '9 New Road', token_amount: 500000, payment_mode: 'cheque', possession_date: '2027-01-15', duty_borne_by: 'Buyer' };
+  const bad = await api('POST', `/templates/${ats.id}/generate`, { token: ctx.broker.token, body: { dealId: deal, values: { ...values, token_amount: 'lots', payment_mode: 'cash in a bag', possession_date: 'soon', seller_address: '' } } });
+  assert.equal(bad.status, 422);
+  assert.deepEqual(bad.body.errors.map((e) => e.field).sort(), ['payment_mode', 'possession_date', 'seller_address', 'token_amount']);
+  const gen = await api('POST', `/templates/${ats.id}/generate`, { token: ctx.broker.token, body: { dealId: deal, values } });
+  assert.equal(gen.status, 201, JSON.stringify(gen.body));
+  assert.ok(/^DOC-\d{4}-\d{6}$/.test(gen.data.documentNumber) && gen.data.templateVersion === 1 && gen.data.draft === true);
+  const stored = (await pool.query('SELECT "values", state_code FROM generated_documents WHERE id = $1', [gen.data.id])).rows[0];
+  const expectedDuty = Math.round(12500000 * Number(st.rate_percent) / 100);
+  assert.equal(stored.values.stamp_duty_amount, expectedDuty, 'stamp duty from the state rule');
+  const fee = 12500000 * Number(st.registration_fee_percent) / 100;
+  assert.equal(stored.values.registration_fee_amount, Math.round(st.registration_fee_cap === null ? fee : Math.min(fee, Number(st.registration_fee_cap))));
+  assert.equal(stored.values.sale_consideration_words, 'Rupees One Crore Twenty Five Lakh Only');
+  assert.equal(stored.values.buyer_name, `Tpl Buyer ${RUN}`, 'known values need not be retyped');
+
+  // DOCX and PDF with every variable merged, the disclaimer, and DRAFT until advocate review.
+  const docx = await dl(`/templates/generated/${gen.data.id}/download?format=docx`, ctx.broker.token);
+  assert.ok(docx.status === 200 && /wordprocessingml/.test(docx.type) && docx.buf.subarray(0, 2).toString() === 'PK');
+  const text = docxText(docx.buf);
+  assert.ok(text.includes(`Tpl Buyer ${RUN}`) && text.includes('Rs. 1,25,00,000/-') && text.includes('Rupees One Crore Twenty Five Lakh Only') && text.includes('22nd day of November, 2026') && text.includes('S/o Ram Kumar'), text.slice(0, 600));
+  assert.ok(text.includes(`Rs. ${expectedDuty.toLocaleString('en-IN')}/-`), 'the stamp duty figure is in the document');
+  assert.ok(text.includes("Working draft for the client's chosen advocate to review, stamp, and register before execution."));
+  assert.ok(text.includes('DRAFT - NOT FOR EXECUTION') && !/\{\{/.test(text), 'no unmerged placeholders');
+  assert.ok(!text.includes(buyerMobile) && !text.includes(buyerUser.email));
+  const pdf = await dl(`/templates/generated/${gen.data.id}/download?format=pdf`, ctx.broker.token);
+  assert.ok(pdf.type === 'application/pdf' && pdf.buf.subarray(0, 4).toString() === '%PDF');
+  // Access: the counterparty and outsiders cannot fetch it.
+  assert.equal((await dl(`/templates/generated/${gen.data.id}/download`, buyerUser.token)).status, 403);
+  assert.equal((await dl(`/templates/generated/${gen.data.id}/download`, owner.token)).status, 403);
+  // Advocate review: staff only (the assigned rep or an admin); the watermark then comes off.
+  assert.equal((await api('POST', `/templates/generated/${gen.data.id}/advocate-reviewed`, { token: ctx.broker.token })).status, 403);
+  const reviewed = await api('POST', `/templates/generated/${gen.data.id}/advocate-reviewed`, { token: ctx.sales.token });
+  assert.equal(reviewed.data.draft, false, JSON.stringify(reviewed.body));
+  assert.ok(!docxText((await dl(`/templates/generated/${gen.data.id}/download?format=docx`, ctx.broker.token)).buf).includes('DRAFT - NOT FOR EXECUTION'));
+  const pdf2 = await dl(`/templates/generated/${gen.data.id}/download?format=pdf`, ctx.broker.token);
+  assert.ok(pdf2.buf.length < pdf.buf.length, 'the PDF no longer carries the watermark');
+
+  // Blank version: underlined blanks, no values needed.
+  const blank = await api('POST', `/templates/${ats.id}/generate`, { token: ctx.broker.token, body: { blank: true } });
+  assert.equal(blank.status, 201, JSON.stringify(blank.body));
+  const blankText = docxText((await dl(`/templates/generated/${blank.data.id}/download?format=docx`, ctx.broker.token)).buf);
+  assert.ok(blankText.includes('________________') && !blankText.includes(`Tpl Buyer ${RUN}`) && !/\{\{/.test(blankText));
+  // Every generation is in the immutable audit log with the template version.
+  const log = (await pool.query(`SELECT after_json FROM audit_logs WHERE action = 'template.document_generated' AND entity_id = $1`, [gen.data.id])).rows[0];
+  assert.ok(log && log.after_json.templateVersion === 1 && log.after_json.dealId === deal);
+
+  // Admin: a new document type with no code change; validators run on the text; variables must be defined.
+  assert.equal((await api('POST', '/templates', { token: ctx.broker.token, body: { name: 'x', body: 'x'.repeat(50) } })).status, 403);
+  const tplBody = `# Receipt ${RUN}\n\nReceived from {{payer_name}} a sum of {{amount}} ({{amount_words}}) on {{receipt_date}} towards {{purpose}}.`;
+  const vars = [{ name: 'payer_name', label: 'Received from', fieldType: 'text', prefill: 'deal.buyer_name' }, { name: 'amount', label: 'Amount', fieldType: 'currency', validation: { min: 1 } }, { name: 'amount_words', fieldType: 'computed', computed: { kind: 'amount_in_words', of: 'amount' } },
+    { name: 'receipt_date', label: 'Date', fieldType: 'date' }, { name: 'purpose', label: 'Towards', fieldType: 'dropdown', options: ['token amount', 'balance consideration'] }];
+  assert.equal((await api('POST', '/templates', { token: A, body: { name: `Receipt ${RUN}`, body: `${tplBody} Call me on 9876543210.`, variables: vars } })).status, 422, 'contact details in a template are refused');
+  assert.equal((await api('POST', '/templates', { token: A, body: { name: `Receipt ${RUN}`, body: `${tplBody} Sold to a distressed seller.`, variables: vars } })).status, 422, 'forbidden terms are refused');
+  const undefinedVar = await api('POST', '/templates', { token: A, body: { name: `Receipt ${RUN}`, body: tplBody, variables: vars.slice(0, 3) } });
+  assert.equal(undefinedVar.status, 400);
+  assert.match(undefinedVar.body.message, /receipt_date/);
+  const made = await api('POST', '/templates', { token: A, body: { name: `Receipt ${RUN}`, category: 'general', audience: 'professional', body: tplBody, variables: vars } });
+  assert.equal(made.status, 201, JSON.stringify(made.body));
+  assert.ok(made.data.status === 'draft' && made.data.currentVersion === 1);
+  assert.ok(!(await api('GET', '/templates', { token: ctx.broker.token })).data.some((t) => t.id === made.data.id), 'a draft is not offered yet');
+  await api('PUT', `/templates/${made.data.id}/status`, { token: A, body: { status: 'active' } });
+  const r1 = await api('POST', `/templates/${made.data.id}/generate`, { token: ctx.broker.token, body: { values: { payer_name: 'Asha Rao', amount: 250000, receipt_date: '2026-10-07', purpose: 'token amount' } } });
+  assert.equal(r1.status, 201, JSON.stringify(r1.body));
+  // An edit makes version 2; the earlier document still renders from version 1.
+  const v2 = await api('POST', '/templates', { token: A, body: { id: made.data.id, body: tplBody.replace('Received from', 'RECEIVED WITH THANKS from'), variables: vars, changeNote: 'Wording' } });
+  assert.equal(v2.data.currentVersion, 2);
+  assert.deepEqual(v2.data.history.map((h) => h.version), [2, 1]);
+  await assert.rejects(pool.query(`UPDATE document_template_versions SET body = 'x' WHERE template_id = $1`, [made.data.id]), /immutable/);
+  const r2 = await api('POST', `/templates/${made.data.id}/generate`, { token: ctx.broker.token, body: { values: { payer_name: 'Asha Rao', amount: 250000, receipt_date: '2026-10-07', purpose: 'token amount' } } });
+  assert.equal(r2.data.templateVersion, 2);
+  const oldText = docxText((await dl(`/templates/generated/${r1.data.id}/download?format=docx`, ctx.broker.token)).buf);
+  const newText = docxText((await dl(`/templates/generated/${r2.data.id}/download?format=docx`, ctx.broker.token)).buf);
+  assert.ok(oldText.includes('Received from Asha Rao') && !oldText.includes('RECEIVED WITH THANKS') && newText.includes('RECEIVED WITH THANKS from Asha Rao') && newText.includes('Rupees Two Lakh Fifty Thousand Only'));
+  // Retired: no longer offered or generated.
+  await api('PUT', `/templates/${made.data.id}/status`, { token: A, body: { status: 'retired' } });
+  assert.equal((await api('POST', `/templates/${made.data.id}/generate`, { token: ctx.broker.token, body: { blank: true } })).status, 404);
+  assert.ok((await api('GET', `/templates/generated?dealId=${deal}`, { token: ctx.sales.token })).data.some((g) => g.id === gen.data.id));
+  await pool.query(`UPDATE properties SET status = 'inactive' WHERE id = $1`, [prop]);
+});
+
+test('advanced search: full-text + typo tolerance, autocomplete, did-you-mean, geo radius + distance, area / trust / urgency / deal-type filters, facets, ranking with sponsored boost and match score, saved-search alert', async () => {
+  const A = ctx.admin.token;
+  const SCITY = `Searchpur ${RUN}`;
+  const LAT = 19.1 + (parseInt(RUN.slice(0, 3), 16) % 1000) / 10000;
+  const LNG = 72.8 + (parseInt(RUN.slice(3), 16) % 1000) / 10000;
+  const lister = await createUser('broker', 'searchlister');
+  const add = async (title, extra = {}) => {
+    const p = { locality: 'Lakeview Enclave', property_type: 'apartment', bedrooms: 2, area: 900, price: 8000000, lat: LAT, lng: LNG, verified: false, furnishing: 'furnished', description: 'A bright home', tags: '[]', badge: null, days: 0, tx: 'sell', ...extra };
+    return (await pool.query(
+      `INSERT INTO properties (created_by, broker_id, title, description, property_type, transaction_type, city, locality, price, price_value, bedrooms, area_sqft, status, latitude, longitude, is_verified, furnishing, tags, badge, created_at)
+       VALUES ($1, $1, $2, $3, $4::property_type, $5::transaction_type, $6, $7, 'x', $8, $9, $10, 'approved', $11, $12, $13, $14, $15::jsonb, $16, now() - ($17 || ' days')::interval) RETURNING id`,
+      [lister.id, `${title} ${RUN}`, p.description, p.property_type, p.tx, SCITY, p.locality, p.price, p.bedrooms, p.area, p.lat, p.lng, p.verified, p.furnishing, p.tags, p.badge, String(p.days)])).rows[0].id;
+  };
+  const near = (km) => LAT + km / 111;
+  const sunrise = await add('Sunrise Heights', { description: 'Corner flat with a jacuzzi and lake view', days: 30 });
+  const maple = await add('Maple Residency', { locality: 'Orchard Road', bedrooms: 3, area: 1500, price: 15000000, lat: near(2), verified: true, furnishing: 'semi-furnished', days: 1 });
+  const cedar = await add('Cedar Villa', { property_type: 'villa', bedrooms: 4, area: 3200, price: 42000000, lat: near(12), tags: '["Urgent sale"]', days: 10 });
+  const birch = await add('Birch Studio', { bedrooms: 1, area: 450, price: 2000000, lat: near(40), tx: 'rent', days: 5 });
+  const q = async (qs, token) => (await api('GET', `/search/properties?city=${encodeURIComponent(SCITY)}&${qs}`, { token })).data;
+  const ids = (d) => d.items.map((i) => i.id);
+
+  // Full-text across title, locality and description; typing mistakes still find it.
+  assert.deepEqual(ids(await q('q=sunrise')), [sunrise]);
+  assert.deepEqual(ids(await q('q=jacuzzi')), [sunrise], 'a word from the description');
+  assert.deepEqual(ids(await q('q=Sunrize%20Hieghts')), [sunrise], 'typo tolerant');
+  assert.deepEqual(ids(await q('q=orchrad')), [maple], 'typo in the locality');
+  assert.equal((await q('q=zzzzqqq')).items.length, 0);
+
+  // Dictionary: autocomplete with typos, and "did you mean" when nothing is found.
+  assert.equal((await api('POST', '/search/reindex', { token: ctx.broker.token })).status, 403);
+  const re = await api('POST', '/search/reindex', { token: A });
+  assert.ok(re.data.terms > 3, JSON.stringify(re.body));
+  const sug = await api('GET', `/search/suggestions?q=${encodeURIComponent(`Serchpur ${RUN}`)}`);
+  assert.ok(sug.data.some((s) => s.value === SCITY && s.type === 'city'), JSON.stringify(sug.data));
+  const sug2 = await api('GET', '/search/suggestions?q=lakevew');
+  assert.ok(sug2.data.some((s) => s.value === 'Lakeview Enclave'), JSON.stringify(sug2.data));
+  const none = (await api('GET', `/search/properties?q=${encodeURIComponent(`Mapel Residancy ${RUN}`)}&minPrice=999999999999`)).data;
+  assert.equal(none.items.length, 0);
+  assert.equal(none.didYouMean?.term, `Maple Residency ${RUN}`, JSON.stringify(none.didYouMean));
+
+  // Geo-search: radius from a point, nearest first, distance returned.
+  const geo = await q(`lat=${LAT}&lng=${LNG}&radiusKm=5`);
+  assert.deepEqual(ids(geo), [sunrise, maple], 'within 5 km, nearest first');
+  assert.ok(geo.items[0].distance_km < 0.2 && Math.abs(geo.items[1].distance_km - 2) < 0.2, JSON.stringify(geo.items.map((i) => i.distance_km)));
+  assert.equal(geo.search.sort, 'distance');
+  assert.deepEqual(ids(await q(`lat=${LAT}&lng=${LNG}&radiusKm=20`)), [sunrise, maple, cedar]);
+  assert.equal((await api('GET', `/search/properties?lat=${LAT}&lng=${LNG}&radiusKm=1&city=${encodeURIComponent(SCITY)}`)).data.items.length, 1);
+  assert.equal((await api('GET', '/search/properties?lat=200&lng=10')).status, 422);
+
+  // Smart filters: area, lister trust score, urgency, deal type, furnishing.
+  assert.deepEqual(ids(await q('minArea=1000&maxArea=2000')), [maple]);
+  assert.deepEqual(ids(await q('urgency=urgent')), [cedar]);
+  assert.deepEqual(ids(await q('dealType=rent')), [birch]);
+  assert.equal((await q('dealType=sale')).items.length, 3);
+  assert.deepEqual(ids(await q('furnishing=semi-furnished')), [maple]);
+  assert.equal((await q('minTrust=1')).items.length, 0, 'no trust score yet');
+  await pool.query(`INSERT INTO trust_scores (user_id, score, components, inputs, search_boost) VALUES ($1, 82, '{}', '{}', 8) ON CONFLICT (user_id) DO UPDATE SET score = 82, search_boost = 8`, [lister.id]);
+  assert.equal((await q('minTrust=80')).items.length, 4);
+  assert.equal((await q('minTrust=90')).items.length, 0);
+
+  // Facets: counts for the filters in force.
+  const fac = await q('facets=true&dealType=sale');
+  assert.deepEqual(fac.facets.propertyType, [{ value: 'apartment', count: 2 }, { value: 'villa', count: 1 }]);
+  assert.deepEqual(fac.facets.bedrooms.map((b) => [b.label, b.count]), [['2', 1], ['3', 1], ['4', 1]]);
+  assert.ok(fac.facets.locality.some((l) => l.value === 'Lakeview Enclave' && l.count === 2) && fac.facets.verified === 1);
+  assert.deepEqual(fac.facets.priceBand.map((b) => b.value), ['50l_1cr', '1cr_2cr', '2cr_5cr']);
+
+  // Ranking: verification level + recency put the newer verified listing first; rank scores are returned.
+  const ranked = await q('dealType=sale');
+  assert.equal(ranked.items[0].id, maple, JSON.stringify(ranked.items.map((i) => [i.title, i.rank_score])));
+  assert.ok(ranked.items.every((i, n, arr) => n === 0 || arr[n - 1].rank_score >= i.rank_score));
+  assert.equal(ranked.items[0].sponsored, null);
+
+  // Sponsored boost: a live Sponsored campaign lifts its listing to the top, labelled, and counts one impression per viewer per day.
+  const advUser = await createUser('broker', 'searchadv');
+  const adv = (await pool.query(`INSERT INTO advertisers (av_code, user_id, business_name, business_category, contact_email, source) VALUES ($1, $2, $3, 'broker_firm', $4, 'outbound') RETURNING id`, [`AV-S${RUN}`, advUser.id, `Search Ads ${RUN}`, advUser.email])).rows[0].id;
+  const camp = (await pool.query(
+    `INSERT INTO ad_campaigns (advertiser_id, name, format_key, placements, property_id, targeting, start_date, end_date, units, pricing_unit, rate, amount, status)
+     VALUES ($1, $2, 'search_sponsored', '["search_sponsored"]', $3, $4, CURRENT_DATE, CURRENT_DATE + 30, 1, 'month', 0, 0, 'approved') RETURNING id`,
+    [adv, `Boost ${RUN}`, cedar, JSON.stringify({ cities: [SCITY] })])).rows[0].id;
+  const boosted = await q('dealType=sale&viewer=viewer-1');
+  assert.equal(boosted.items[0].id, cedar, 'sponsored first');
+  assert.deepEqual([boosted.items[0].sponsored.label, boosted.items[0].sponsored.campaignId], ['Sponsored', camp]);
+  assert.equal(boosted.items[1].sponsored, null);
+  await q('dealType=sale&viewer=viewer-1');
+  assert.equal((await pool.query(`SELECT COUNT(*)::int AS n FROM ad_events WHERE campaign_id = $1 AND kind = 'impression'`, [camp])).rows[0].n, 1, 'one impression per viewer per day');
+  // Not boosted for a search it does not target, or under an explicit price sort.
+  assert.equal((await q('dealType=sale&sort=price_asc')).items[0].id, sunrise);
+  await pool.query(`UPDATE ad_campaigns SET status = 'ended' WHERE id = $1`, [camp]);
+  assert.equal((await q('dealType=sale')).items[0].id, maple);
+
+  // Match score: a signed-in buyer's own requirement match lifts that listing.
+  const buyer = await createUser('customer', 'searchbuyer');
+  const cust = (await pool.query('SELECT id FROM customers WHERE user_id = $1', [buyer.id])).rows[0]?.id || (await pool.query(`INSERT INTO customers (full_name, email, user_id) VALUES ($1, $2, $3) RETURNING id`, [`Search buyer ${RUN}`, buyer.email, buyer.id])).rows[0].id;
+  const reqId = (await pool.query(`INSERT INTO requirements (customer_id, created_by, purpose, property_type, city, budget_max, fee_consent_at) VALUES ($1, $2, 'buy', 'apartment', $3, 9000000, now()) RETURNING id`, [cust, buyer.id, SCITY])).rows[0].id;
+  await pool.query(`INSERT INTO requirement_matches (requirement_id, property_id, score, rank_score, tier, breakdown) VALUES ($1, $2, 96, 96, 'hot', '{}')`, [reqId, sunrise]);
+  const forBuyer = await q('dealType=sale', buyer.token);
+  assert.equal(forBuyer.items[0].id, sunrise, JSON.stringify(forBuyer.items.map((i) => [i.title, i.rank_score, i.match_score])));
+  assert.equal(forBuyer.items[0].match_score, 96);
+  assert.equal((await q('dealType=sale')).items[0].match_score, null, 'no match score for an anonymous visitor');
+
+  // Saved search with the new filters -> alert when a new listing fits (and not when it is outside the radius).
+  const saved = await api('POST', '/me/saved-searches', { token: buyer.token, body: { name: `Near the lake ${RUN}`, filters: { purpose: 'buy', city: SCITY, lat: LAT, lng: LNG, radiusKm: 3, minArea: 800 } } });
+  assert.ok(saved.status === 201 || saved.status === 200, JSON.stringify(saved.body));
+  const fits = await add('Willow Court', { area: 1000, lat: near(1) });
+  const far = await add('Faraway Court', { area: 1000, lat: near(30) });
+  const portal = require('../src/services/portal.service');
+  await portal.notifyNewListing(fits);
+  await portal.notifyNewListing(far);
+  const alerts = (await pool.query(`SELECT related_entity_id FROM notifications WHERE user_id = $1 AND type = 'saved_search_alert'`, [buyer.id])).rows.map((r) => r.related_entity_id);
+  assert.deepEqual(alerts, [fits]);
+  await pool.query(`UPDATE properties SET status = 'inactive' WHERE id = ANY($1::uuid[])`, [[sunrise, maple, cedar, birch, fits, far]]);
 });

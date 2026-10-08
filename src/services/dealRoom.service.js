@@ -54,6 +54,14 @@ async function getAccessRecord(propertyId, userId) {
 async function evaluate(propertyId, user) {
   if (isStaff(user)) return { verified: true, ndaSigned: true, approved: true, open: true, staff: true, record: null };
   const buyer = await getAccess(user);
+  // Institutional assets (sec. 11.3): the "verified buyer" gate is the
+  // institutional buyer qualification (buyer type + financial capacity).
+  const institutional = (await pool.query('SELECT 1 FROM institutional_listings WHERE property_id = $1', [propertyId])).rows.length > 0;
+  if (institutional) {
+    const qualified = await require('./institutional.service').isQualifiedBuyer(user.id);
+    buyer.full = qualified;
+    buyer.reason = qualified ? null : 'Complete your institutional buyer profile and wait for it to be verified before signing the NDA';
+  }
   const record = await getAccessRecord(propertyId, user.id);
   const expired = record?.access_expires_at && new Date(record.access_expires_at) < new Date();
   const approved = record?.status === 'approved' && !expired;
@@ -153,6 +161,8 @@ async function signNda(propertyId, user, { fullName, accept }, meta = {}) {
       relatedEntityId: propertyId,
     });
   }
+  // Engine 7 pipeline: NDA executed -> stage 3.
+  await require('./institutional.service').evaluateBuyerDeals(user.id, propertyId).catch(() => {});
   return getRoom(propertyId, user);
 }
 
@@ -408,6 +418,8 @@ async function decideAccess(accessId, { action, reason }, user, meta = {}) {
     relatedEntityType: 'deal',
     relatedEntityId: access.property_id,
   });
+  // Engine 7 pipeline: access approved -> stage 4 (Data Room Access).
+  await require('./institutional.service').evaluateBuyerDeals(access.user_id, access.property_id).catch(() => {});
   return access;
 }
 
@@ -452,6 +464,7 @@ async function listRooms() {
 
 module.exports = {
   isStaff,
+  evaluate,
   getRoom,
   signNda,
   getDocumentUrl,

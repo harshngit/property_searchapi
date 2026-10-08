@@ -21,6 +21,8 @@ function getTemplateIdForPurpose(purpose) {
   const id = envVar ? process.env[envVar] : undefined;
   // Guest interest can share the mobile-verification template until its own is approved on DLT.
   if (!id && purpose === 'guest_interest') return process.env.MSG91_OTP_TEMPLATE_ID_MOBILE_VERIFICATION;
+  // Module 47: buyer / seller task confirmation - its own template (MSG91_OTP_TEMPLATE_ID_WFH) or the mobile-verification one.
+  if (!id && purpose === 'wfh_confirm') return process.env.MSG91_OTP_TEMPLATE_ID_WFH || process.env.MSG91_OTP_TEMPLATE_ID_MOBILE_VERIFICATION;
   return id;
 }
 

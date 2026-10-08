@@ -13,6 +13,12 @@ async function register(req, res, next) {
     );
 
     require('../services/fraud.service').recordIp(user.id, req.ip);
+    // Module 33 (DPDP): self-registration requires accepting the terms and privacy policy - log that consent.
+    if (!req.user) {
+      await require('../services/privacy.service')
+        .recordConsent(user.id, { source: 'registration', ip: req.ip, userAgent: (req.headers['user-agent'] || '').slice(0, 500) })
+        .catch((err) => console.error('[privacy] consent log failed:', err.message));
+    }
     return success(res, 201, 'Registration successful', user);
   } catch (err) {
     next(err);

@@ -954,7 +954,8 @@ async function sendDigests() {
       userId,
       type: 'match_digest',
       title: `${list.length} new Warm match${list.length === 1 ? '' : 'es'} for you`,
-      message: top.map((t) => `${t.title} (${[t.locality, t.city].filter(Boolean).join(', ')}) - ${t.score}%`).join(' · '),
+      // Module 17: one sponsored line per digest, when a campaign has booked the slot.
+      message: [top.map((t) => `${t.title} (${[t.locality, t.city].filter(Boolean).join(', ')}) - ${t.score}%`).join(' · '), await require('./advertising.service').digestSponsor(userId)].filter(Boolean).join('\n'),
       relatedEntityType: 'matches',
       relatedEntityId: null,
     });

@@ -325,33 +325,42 @@ async function getFollowups(user, page, limit) {
 // strictly assigned to this user, linked to a lead, due today or already
 // overdue. Lives here (not broker.service.js) since this service owns all
 // tasks-table querying.
-async function getBrokerFollowups(userId) {
+async function getBrokerFollowups(userOrId) {
   await syncOverdueTasks();
+  const scope = taskScope(userOrId);
 
   const result = await pool.query(
     `SELECT * FROM tasks
-     WHERE assigned_to = $1
+     WHERE ${scope.sql}
        AND related_entity_type = 'lead'
        AND status != 'completed'
        AND due_date::date <= CURRENT_DATE
-     ORDER BY due_date ASC`,
-    [userId]
+     ORDER BY due_date ASC LIMIT 200`,
+    scope.params
   );
   return result.rows;
 }
 
 // Used by the Broker CRM dashboard summary - counts of this user's tasks
 // due today and currently overdue.
-async function getDashboardCounts(userId) {
+// Admins see every task on their dashboard; everyone else their own.
+function taskScope(userOrId) {
+  const user = typeof userOrId === 'object' && userOrId ? userOrId : { id: userOrId };
+  if (['admin', 'super_admin'].includes(user.role)) return { sql: 'TRUE', params: [] };
+  return { sql: 'assigned_to = $1', params: [user.id] };
+}
+
+async function getDashboardCounts(userOrId) {
   await syncOverdueTasks();
+  const scope = taskScope(userOrId);
 
   const result = await pool.query(
     `SELECT
        COUNT(*) FILTER (WHERE due_date::date = CURRENT_DATE AND status != 'completed') AS due_today,
        COUNT(*) FILTER (WHERE status = 'overdue') AS overdue
      FROM tasks
-     WHERE assigned_to = $1`,
-    [userId]
+     WHERE ${scope.sql}`,
+    scope.params
   );
 
   return {

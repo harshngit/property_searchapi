@@ -99,8 +99,11 @@ async function gatherInputs(userId) {
       [userId]
     ),
     pool.query(
-      `SELECT COUNT(DISTINCT d.id)::int AS n FROM deals d JOIN properties p ON p.id = d.property_id
-       WHERE d.stage = 'closed_won' AND p.listing_category = 'institutional' AND (d.broker_id = $1 OR p.created_by = $1)`,
+      // Closed institutional deals: the ordinary pipeline plus the Engine 7 nine-stage pipeline.
+      `SELECT ((SELECT COUNT(DISTINCT d.id) FROM deals d JOIN properties p ON p.id = d.property_id
+                WHERE d.stage = 'closed_won' AND p.listing_category = 'institutional' AND (d.broker_id = $1 OR p.created_by = $1))
+             + (SELECT COUNT(*) FROM institutional_deals i JOIN properties p ON p.id = i.property_id
+                WHERE i.status = 'closed_won' AND (p.broker_id = $1 OR p.created_by = $1)))::int AS n`,
       [userId]
     ),
     // First response on leads assigned to the user in the last 180 days:
@@ -453,10 +456,10 @@ async function publicForListing(propertyId) {
     activeBadges(lister),
     pool.query(
       `SELECT rv.id, rv.rating, rv.title, rv.body, rv.interaction, rv.reply, rv.replied_at, rv.created_at,
-              split_part(u.full_name, ' ', 1) AS reviewer_first_name
+              split_part(u.full_name, ' ', 1) AS reviewer_first_name, COALESCE(rv.property_id = $2, false) AS for_this_listing
        FROM reviews rv JOIN users u ON u.id = rv.reviewer_id
-       WHERE rv.subject_user_id = $1 AND rv.status = 'published' ORDER BY rv.created_at DESC LIMIT 20`,
-      [lister]
+       WHERE (rv.subject_user_id = $1 OR rv.property_id = $2) AND rv.status = 'published' ORDER BY (rv.property_id = $2) DESC NULLS LAST, rv.created_at DESC LIMIT 20`,
+      [lister, propertyId]
     ),
   ]);
   const listerType = { broker: 'broker', agency_admin: 'broker', builder: 'builder', customer: 'owner' }[p.role] || 'lister';

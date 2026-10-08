@@ -14,6 +14,9 @@ const CONTENT_ROLES = ['admin', 'super_admin'];
 const STATUSES = ['draft', 'published', 'archived'];
 const PAGE_TYPES = ['buy', 'sell', 'rent', 'school_for_sale', 'acquire_college', 'university_campus_for_sale'];
 const manage = [authenticate, authorize(...CONTENT_ROLES)];
+const testimonials = require('../services/testimonial.service');
+const asyncH = require('../utils/asyncHandler');
+const { success: ok } = require('../utils/response');
 const idParam = [param('id').isUUID().withMessage('Invalid id')];
 
 /**
@@ -111,6 +114,19 @@ router.get('/city-pages/:slug', contentController.getCityPage);
  */
 router.get('/sitemap.xml', contentController.sitemap);
 
+/**
+ * @swagger
+ * /content/testimonials:
+ *   get:
+ *     summary: Published testimonials for the home / city pages (a city's own first)
+ *     tags: [Content]
+ *     parameters:
+ *       - { in: query, name: city, schema: { type: string } }
+ *       - { in: query, name: limit, schema: { type: integer, default: 8 } }
+ *     responses: { 200: { description: Testimonials } }
+ */
+router.get('/testimonials', asyncH(async (req, res) => ok(res, 200, 'Testimonials', await testimonials.listPublished(req.query))));
+
 // ------------------------------- admin -------------------------------
 
 const articleValidators = (isCreate) => [
@@ -166,6 +182,65 @@ const articleValidators = (isCreate) => [
  *       201: { description: Created }
  *       422: { description: Duplicate slug or content validation failed }
  */
+/**
+ * @swagger
+ * /content/manage/testimonials:
+ *   get:
+ *     summary: All testimonials (content team)
+ *     tags: [Content]
+ *     security: [{ bearerAuth: [] }]
+ *     responses: { 200: { description: Testimonials } }
+ *   post:
+ *     summary: Add a testimonial (contact details and forbidden terms are blocked)
+ *     tags: [Content]
+ *     security: [{ bearerAuth: [] }]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [personName, quote]
+ *             properties:
+ *               personName: { type: string }
+ *               personRole: { type: string, example: "Home buyer, Gurugram" }
+ *               city: { type: string }
+ *               quote: { type: string }
+ *               rating: { type: integer, minimum: 1, maximum: 5 }
+ *               photoUrl: { type: string }
+ *               isPublished: { type: boolean }
+ *               sortOrder: { type: integer }
+ *     responses: { 201: { description: Created } }
+ * /content/manage/testimonials/{id}:
+ *   put:
+ *     summary: Edit / publish / unpublish a testimonial
+ *     tags: [Content]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters: [{ in: path, name: id, required: true, schema: { type: string, format: uuid } }]
+ *     responses: { 200: { description: Saved } }
+ *   delete:
+ *     summary: Delete a testimonial
+ *     tags: [Content]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters: [{ in: path, name: id, required: true, schema: { type: string, format: uuid } }]
+ *     responses: { 200: { description: Deleted } }
+ */
+const testimonialRules = (create) => [
+  create ? body('personName').isString().trim().isLength({ min: 2, max: 120 }) : body('personName').optional().isString().trim().isLength({ min: 2, max: 120 }),
+  create ? body('quote').isString().trim().isLength({ min: 10, max: 600 }) : body('quote').optional().isString().trim().isLength({ min: 10, max: 600 }),
+  body('personRole').optional({ nullable: true }).isString().isLength({ max: 160 }),
+  body('city').optional({ nullable: true }).isString().isLength({ max: 120 }),
+  body('rating').optional().isInt({ min: 1, max: 5 }).toInt(),
+  body('photoUrl').optional({ nullable: true }).isString().isLength({ max: 1000 }),
+  body('isPublished').optional().isBoolean().toBoolean(),
+  body('sortOrder').optional().isInt({ min: 0, max: 9999 }).toInt(),
+];
+const auditMeta = (req) => require('../services/audit.service').requestMeta(req);
+router.get('/manage/testimonials', manage, asyncH(async (req, res) => ok(res, 200, 'Testimonials', await testimonials.listAll())));
+router.post('/manage/testimonials', manage, testimonialRules(true), validate, asyncH(async (req, res) => ok(res, 201, 'Testimonial added', await testimonials.save(req.user, null, req.body, auditMeta(req)))));
+router.put('/manage/testimonials/:id', manage, idParam, testimonialRules(false), validate, asyncH(async (req, res) => ok(res, 200, 'Testimonial saved', await testimonials.save(req.user, req.params.id, req.body, auditMeta(req)))));
+router.delete('/manage/testimonials/:id', manage, idParam, validate, asyncH(async (req, res) => ok(res, 200, 'Testimonial deleted', await testimonials.remove(req.user, req.params.id, auditMeta(req)))));
+
 router.get('/manage/articles', manage, contentController.manageListArticles);
 router.post('/manage/articles', manage, articleValidators(true), validate, contentController.manageCreateArticle);
 

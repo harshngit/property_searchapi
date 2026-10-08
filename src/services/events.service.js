@@ -205,7 +205,8 @@ async function buildProfile(customerId) {
        (SELECT COUNT(*) FROM site_visits sv JOIN deals d ON d.id = sv.deal_id WHERE d.customer_id = $1 AND sv.status = 'completed')::int AS visits_completed,
        (SELECT COUNT(*) FROM deals WHERE customer_id = $1 AND stage = 'closed_won')::int AS deals_closed,
        (SELECT COALESCE(SUM(total_amount), 0) FROM invoices WHERE liable_customer_id = $1 AND status = 'paid')::float AS lifetime_revenue,
-       (SELECT COUNT(*) FROM deal_stage_history h JOIN deals d ON d.id = h.deal_id WHERE d.customer_id = $1 AND h.notes ILIKE 'offer%')::int AS offers_logged`
+       (SELECT COUNT(*) FROM deal_stage_history h JOIN deals d ON d.id = h.deal_id WHERE d.customer_id = $1 AND h.notes ILIKE 'offer%')::int AS offers_logged
+     WHERE $2::uuid IS NULL OR TRUE`
   );
   const behaviour = {
     properties_viewed: viewed.map((v) => ({ id: v.id, title: v.title, locality: v.locality, city: v.city, at: v.at })),

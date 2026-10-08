@@ -203,7 +203,7 @@ async function updateDeal(id, data) {
 // deal_stage_history in the same transaction. Used directly by
 // PUT /:id/stage, and reused (via a fixed toStage) by /booking and /close
 // so every stage-affecting endpoint shares one guarded code path.
-async function changeStage(id, toStage, user, notes, { orchestrated = false, override = false } = {}) {
+async function changeStage(id, toStage, user, notes, { orchestrated = false, override = false, linkedClose = false } = {}) {
   const orchestration = require('./orchestration.service');
   // Module 40 dependency enforcement: a forward move needs the target
   // stage's requirements met (admins may override with a logged reason).
@@ -222,6 +222,12 @@ async function changeStage(id, toStage, user, notes, { orchestrated = false, ove
     const current = await client.query('SELECT * FROM deals WHERE id = $1 FOR UPDATE', [id]);
     if (current.rows.length === 0) throw notFound();
     const fromStage = current.rows[0].stage;
+
+    // Module 45: the two legs of an exchange close together, from the Exchange desk.
+    if (toStage === 'closed_won' && current.rows[0].linked_deal_id && !linkedClose) {
+      const partner = await client.query('SELECT stage FROM deals WHERE id = $1', [current.rows[0].linked_deal_id]);
+      if (partner.rows[0] && partner.rows[0].stage !== 'closed_won') throw badRequest('This deal is one leg of a property exchange - close both legs together from the Exchange desk');
+    }
 
     if (toStage !== fromStage) {
       const allowed = STAGE_TRANSITIONS[fromStage] || [];
@@ -244,6 +250,12 @@ async function changeStage(id, toStage, user, notes, { orchestrated = false, ove
 
     await client.query('COMMIT');
     if (!orchestrated && !closesDeal) orchestration.safeEvaluate(id);
+    // The enquiry this deal came from follows it to Won / Lost.
+    if (closesDeal && toStage !== fromStage && deal.lead_id) {
+      await pool
+        .query(`UPDATE leads SET status = $1::lead_status WHERE id = $2 AND status NOT IN ('won', 'lost')`, [toStage === 'closed_won' ? 'won' : 'lost', deal.lead_id])
+        .catch((err) => console.error('[deal] lead status sync failed:', err.message));
+    }
     // Matching engine learning (sec. 7.4): a closed deal is a conversion of
     // the match that led to it.
     if (toStage === 'closed_won' && deal.property_id && deal.customer_id) {

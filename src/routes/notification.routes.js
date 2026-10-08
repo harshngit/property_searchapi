@@ -59,6 +59,34 @@ router.get('/unread-count', authenticate, notificationController.getUnreadCount)
  *     security: [{ bearerAuth: [] }]
  *     responses: { 200: { description: Removed } }
  */
+/**
+ * @swagger
+ * /notifications/preferences:
+ *   get:
+ *     summary: The caller's notification preferences - push on / off, topics, quiet hours and time zone
+ *     tags: [Notifications]
+ *     security: [{ bearerAuth: [] }]
+ *     responses: { 200: { description: Preferences } }
+ *   put:
+ *     summary: Update notification preferences (the in-app inbox always receives everything)
+ *     tags: [Notifications]
+ *     security: [{ bearerAuth: [] }]
+ *     requestBody:
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               pushEnabled: { type: boolean }
+ *               pushMuted: { type: array, items: { type: string, enum: [matches, enquiries, deals, rentals, account, updates] } }
+ *               quietStart: { type: string, example: "22:00", nullable: true }
+ *               quietEnd: { type: string, example: "07:00", nullable: true }
+ *               timezone: { type: string, example: "Asia/Kolkata" }
+ *     responses: { 200: { description: Saved } }
+ */
+router.get('/preferences', authenticate, asyncHandler(async (req, res) => success(res, 200, 'Notification preferences', await push.getPreferences(req.user.id))));
+router.put('/preferences', authenticate, asyncHandler(async (req, res) => success(res, 200, 'Preferences saved', await push.updatePreferences(req.user.id, req.body || {}))));
+
 router.get('/push', authenticate, asyncHandler(async (req, res) => success(res, 200, 'Push status', await push.status(req.user))));
 router.post(
   '/push',

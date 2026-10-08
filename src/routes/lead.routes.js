@@ -127,6 +127,10 @@ router.post(
     body('propertyId').optional().isUUID(),
     body('message').optional().isString().isLength({ max: 2000 }),
     body('source').optional().isIn(LEAD_SOURCES),
+    // Which desk it goes to in the CRM (derived from the topic when omitted) + the form's extra answers.
+    body('topic').optional({ checkFalsy: true }).isString().isLength({ max: 150 }),
+    body('enquiryType').optional({ checkFalsy: true }).isIn(['property', 'home_loan', 'insurance', 'legal', 'valuation', 'seller', 'nri', 'investment', 'institutional', 'requirement', 'general']),
+    body('details').optional().isObject(),
   ],
   validate,
   leadController.createPublicInquiry

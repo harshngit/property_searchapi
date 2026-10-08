@@ -145,10 +145,87 @@ async function sendToUser(userId, { title, body, url, tag, urgent = false }) {
   return { sent, removed };
 }
 
+// ------------------------------------------------------------ preferences
+// Notification preferences (Module 45): the in-app inbox always receives
+// everything; push can be switched off, muted per topic, and held back
+// during the person's quiet hours (in their own time zone).
+
+const TOPICS = {
+  matches: 'Matched properties, requirements and investment alerts',
+  enquiries: 'Enquiries, site visits and assignments',
+  deals: 'Deals, mandates, documents and invoices',
+  rentals: 'Leases, rent and maintenance',
+  account: 'Verification, reviews, trust and disputes',
+  updates: 'Other updates',
+};
+function topicOf(type) {
+  const t = String(type || '').toLowerCase();
+  if (/match|requirement|saved_search|investor_alert|opportunit|deal_alert|hot_/.test(t)) return 'matches';
+  if (/lead|visit|enquir|assign|guest|inquiry|sla_response/.test(t)) return 'enquiries';
+  if (/deal|invoice|mandate|payment|document|milestone|orchestration/.test(t)) return 'deals';
+  if (/lease|rent|maintenance|tenant/.test(t)) return 'rentals';
+  if (/trust|review|verif|dispute|fraud|reputation|kyc|badge|duplicate/.test(t)) return 'account';
+  return 'updates';
+}
+
+const DEFAULT_PREFS = { pushEnabled: true, pushMuted: [], quietStart: null, quietEnd: null, timezone: 'Asia/Kolkata' };
+
+async function getPreferences(userId) {
+  const r = (await pool.query('SELECT * FROM notification_preferences WHERE user_id = $1', [userId])).rows[0];
+  const prefs = r
+    ? { pushEnabled: r.push_enabled, pushMuted: r.push_muted || [], quietStart: r.quiet_start ? String(r.quiet_start).slice(0, 5) : null, quietEnd: r.quiet_end ? String(r.quiet_end).slice(0, 5) : null, timezone: r.timezone }
+    : { ...DEFAULT_PREFS };
+  return { ...prefs, topics: Object.entries(TOPICS).map(([key, label]) => ({ key, label, push: !prefs.pushMuted.includes(key) })) };
+}
+
+async function updatePreferences(userId, data) {
+  const cur = await getPreferences(userId);
+  const hhmm = (v) => (v === null || v === '' ? null : /^([01]\d|2[0-3]):[0-5]\d$/.test(String(v)) ? String(v) : undefined);
+  const next = {
+    pushEnabled: data.pushEnabled === undefined ? cur.pushEnabled : !!data.pushEnabled,
+    pushMuted: Array.isArray(data.pushMuted) ? [...new Set(data.pushMuted.filter((k) => TOPICS[k]))] : cur.pushMuted,
+    quietStart: data.quietStart === undefined ? cur.quietStart : hhmm(data.quietStart),
+    quietEnd: data.quietEnd === undefined ? cur.quietEnd : hhmm(data.quietEnd),
+    timezone: data.timezone === undefined ? cur.timezone : String(data.timezone).slice(0, 60),
+  };
+  if (next.quietStart === undefined || next.quietEnd === undefined) throw badRequest('Quiet hours must be HH:MM (24-hour)');
+  if (!!next.quietStart !== !!next.quietEnd) throw badRequest('Set both a start and an end for quiet hours, or neither');
+  try {
+    new Intl.DateTimeFormat('en-GB', { timeZone: next.timezone });
+  } catch {
+    throw badRequest('Unknown time zone');
+  }
+  await pool.query(
+    `INSERT INTO notification_preferences (user_id, push_enabled, push_muted, quiet_start, quiet_end, timezone, updated_at) VALUES ($1, $2, $3, $4, $5, $6, now())
+     ON CONFLICT (user_id) DO UPDATE SET push_enabled = EXCLUDED.push_enabled, push_muted = EXCLUDED.push_muted, quiet_start = EXCLUDED.quiet_start,
+       quiet_end = EXCLUDED.quiet_end, timezone = EXCLUDED.timezone, updated_at = now()`,
+    [userId, next.pushEnabled, JSON.stringify(next.pushMuted), next.quietStart, next.quietEnd, next.timezone]
+  );
+  return getPreferences(userId);
+}
+
+function inQuietHours(prefs, now = new Date()) {
+  if (!prefs.quietStart || !prefs.quietEnd) return false;
+  const local = new Intl.DateTimeFormat('en-GB', { timeZone: prefs.timezone, hour: '2-digit', minute: '2-digit', hour12: false }).format(now).replace(/^24/, '00');
+  // A window that crosses midnight (22:00 - 07:00) wraps.
+  return prefs.quietStart <= prefs.quietEnd ? local >= prefs.quietStart && local < prefs.quietEnd : local >= prefs.quietStart || local < prefs.quietEnd;
+}
+
+// Would a push of this type reach this person right now?
+async function pushAllowed(userId, type, now = new Date()) {
+  const prefs = await getPreferences(userId);
+  if (!prefs.pushEnabled) return { allowed: false, reason: 'push_off' };
+  if (prefs.pushMuted.includes(topicOf(type))) return { allowed: false, reason: 'topic_muted' };
+  if (inQuietHours(prefs, now)) return { allowed: false, reason: 'quiet_hours' };
+  return { allowed: true };
+}
+
 // Fire-and-forget from notification.service - never throws.
 function notifyUser(userId, notification) {
   if (!userId || !keys()) return;
-  sendToUser(userId, { title: notification.title, body: notification.message, tag: notification.type }).catch((err) => console.error('[push] send failed:', err.message));
+  pushAllowed(userId, notification.type)
+    .then((p) => (p.allowed ? sendToUser(userId, { title: notification.title, body: notification.message, tag: notification.type }) : null))
+    .catch((err) => console.error('[push] send failed:', err.message));
 }
 
-module.exports = { subscribe, unsubscribe, status, sendToUser, notifyUser, generateVapidKeys, encrypt, vapidAuthorization };
+module.exports = { subscribe, unsubscribe, status, sendToUser, notifyUser, generateVapidKeys, encrypt, vapidAuthorization, getPreferences, updatePreferences, pushAllowed, topicOf, inQuietHours };

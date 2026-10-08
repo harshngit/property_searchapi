@@ -31,16 +31,24 @@ async function searchProperties(req, res, next) {
       amenities: req.query.amenities
         ? String(req.query.amenities).split(',').map((a) => a.trim())
         : undefined,
+      // Module 28: area, lister trust, urgency, deal type, geo-radius.
+      minArea: req.query.minArea,
+      maxArea: req.query.maxArea,
+      minTrust: req.query.minTrust,
+      urgency: req.query.urgency,
+      dealType: req.query.dealType,
+      lat: req.query.lat !== undefined && req.query.lat !== '' ? Number(req.query.lat) : undefined,
+      lng: req.query.lng !== undefined && req.query.lng !== '' ? Number(req.query.lng) : undefined,
+      radiusKm: req.query.radiusKm,
     };
 
-    const { items, pagination, disclaimers } = await searchService.searchProperties(
-      filters,
-      page,
-      limit,
-      req.query.sort
-    );
+    const result = await searchService.searchProperties(filters, page, limit, req.query.sort, {
+      userId: req.user?.id || null,
+      viewerKey: req.query.viewer ? String(req.query.viewer).slice(0, 80) : null,
+      facets: req.query.facets === 'true',
+    });
 
-    return success(res, 200, 'Properties fetched successfully', { items, pagination, disclaimers });
+    return success(res, 200, 'Properties fetched successfully', result);
   } catch (err) {
     next(err);
   }

@@ -4,6 +4,7 @@ const router = express.Router();
 
 const searchController = require('../controllers/search.controller');
 const validate = require('../middlewares/validate');
+const { optionalAuthenticate } = require('../middlewares/auth');
 
 const PROPERTY_TYPES = ['apartment', 'villa', 'independent_house', 'plot', 'commercial', 'farmhouse', 'other'];
 const TRANSACTION_TYPES = ['buy', 'sell', 'rent'];
@@ -123,6 +124,7 @@ const TRANSACTION_TYPES = ['buy', 'sell', 'rent'];
  */
 router.get(
   '/properties',
+  optionalAuthenticate,
   [
     query('propertyType')
       .optional()
@@ -142,7 +144,18 @@ router.get(
     query('maxBedrooms').optional().isInt({ min: 0 }),
     query('tag').optional().isString().isLength({ max: 50 }),
     query('verified').optional().isBoolean(),
-    query('sort').optional().isIn(['rate_asc', 'rate_desc', 'price_asc', 'price_desc', 'newest', 'verified', 'recommended']),
+    query('sort').optional().isIn(['rate_asc', 'rate_desc', 'price_asc', 'price_desc', 'newest', 'verified', 'recommended', 'relevance', 'distance']),
+    // Module 28 (sec. 21.1): area, lister trust score, urgency, deal type, geo-radius, facets.
+    query('minArea').optional().isFloat({ min: 0 }),
+    query('maxArea').optional().isFloat({ min: 0 }),
+    query('minTrust').optional().isInt({ min: 0, max: 100 }),
+    query('urgency').optional().isIn(['urgent']),
+    query('dealType').optional().isIn(['sale', 'rent', 'lease', 'new_launch', 'resale']),
+    query('lat').optional().isFloat({ min: -90, max: 90 }),
+    query('lng').optional().isFloat({ min: -180, max: 180 }),
+    query('radiusKm').optional().isFloat({ min: 0.1, max: 500 }),
+    query('facets').optional().isBoolean(),
+    query('viewer').optional().isString().isLength({ max: 80 }),
     query('page').optional().isInt({ min: 1 }),
     query('limit').optional().isInt({ min: 1, max: 100 }),
   ],
@@ -224,5 +237,22 @@ router.get(
   validate,
   searchController.getSuggestions
 );
+
+/**
+ * @swagger
+ * /search/reindex:
+ *   post:
+ *     summary: Rebuild the search dictionary used by autocomplete and "did you mean" (admin; also runs every 30 minutes)
+ *     tags: [Search]
+ *     security: [{ bearerAuth: [] }]
+ *     responses: { 200: { description: Number of search terms } }
+ */
+router.post('/reindex', require('../middlewares/auth').authenticate, require('../middlewares/auth').authorize('admin', 'super_admin'), async (req, res, next) => {
+  try {
+    res.json({ success: true, message: 'Search dictionary rebuilt', data: { terms: await require('../services/search.service').refreshSearchTerms() } });
+  } catch (err) {
+    next(err);
+  }
+});
 
 module.exports = router;

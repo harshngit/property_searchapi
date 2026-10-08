@@ -355,6 +355,11 @@ async function validatePassword(user, password) {
 
 async function updateLastLogin(userId) {
   await pool.query('UPDATE users SET last_login_at = now() WHERE id = $1', [userId]);
+  // Module 29: the daily sign-in point and weekly streak (never blocks the login).
+  const u = (await pool.query('SELECT u.id, r.name AS role FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = $1', [userId])).rows[0];
+  if (u) require('./gamification.service').recordLogin(u).catch(() => {});
+  // Module 33: signing in ends an inactivity notice.
+  require('./privacy.service').touch(userId).catch(() => {});
 }
 
 async function createOtp(identifier, purpose, userId = null) {

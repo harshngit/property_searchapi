@@ -40,4 +40,19 @@ app.listen(PORT, () => {
   if (process.env.INGESTION_JOBS_DISABLED !== 'true') require('./services/ingestion/ingestion.service').startScheduler();
   // Module 48/49: event partitions, WARM digest / NURTURE summary, score recency.
   if (process.env.EVENTS_JOBS_DISABLED !== 'true') require('./services/events.service').startScheduler();
+  // Module 17: end finished ad campaigns and send renewal reminders (hourly).
+  if (process.env.ADS_JOBS_DISABLED !== 'true') require('./services/advertising.service').startScheduler();
+  // Module 29: hourly points sync from platform activity.
+  if (process.env.GAMIFICATION_JOBS_DISABLED !== 'true') require('./services/gamification.service').startScheduler();
+  // Module 28: keep the search dictionary (autocomplete, did-you-mean) fresh.
+  if (process.env.SEARCH_JOBS_DISABLED !== 'true') require('./services/search.service').startScheduler();
+  // Module 47: WFH task locks, expiry, representative escalation, listing-assist payment (every 15 minutes).
+  if (process.env.WFH_JOBS_DISABLED !== 'true') require('./services/wfh.service').startScheduler();
+  // Module 35: webhook event scanner and delivery (every minute).
+  if (process.env.WEBHOOK_JOBS_DISABLED !== 'true') require('./services/webhook.service').startScheduler();
+  // Modules 32 / 33: hourly compliance checks; DPDP deletion requests whose 30-day notice has ended.
+  if (process.env.COMPLIANCE_JOBS_DISABLED !== 'true') {
+    require('./services/compliance.service').startScheduler();
+    require('./services/privacy.service').startScheduler();
+  }
 });

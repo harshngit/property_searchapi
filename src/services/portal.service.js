@@ -499,7 +499,7 @@ async function getMatches(user, { requirementId } = {}) {
 // fits. Best-effort - never blocks the approval.
 async function notifyNewListing(propertyId) {
   try {
-    const listingResult = await pool.query(`SELECT ${LISTING_CARD_COLUMNS}, p.created_by FROM properties p WHERE p.id = $1`, [propertyId]);
+    const listingResult = await pool.query(`SELECT ${LISTING_CARD_COLUMNS}, p.created_by, p.furnishing, p.latitude, p.longitude, p.is_verified, p.area_sqft FROM properties p WHERE p.id = $1`, [propertyId]);
     const listing = listingResult.rows[0];
     if (!listing || listing.listing_category !== 'residential') return;
     const purpose = listing.transaction_type === 'rent' ? 'rent' : 'buy';
@@ -527,6 +527,20 @@ async function notifyNewListing(propertyId) {
       if (f.bedrooms && (listing.bedrooms == null || listing.bedrooms < Number(f.bedrooms))) continue;
       if (f.maxPrice && price != null && price > Number(f.maxPrice)) continue;
       if (f.minPrice && price != null && price < Number(f.minPrice)) continue;
+      // Module 28 filters saved with the search.
+      if (f.locality && String(f.locality).toLowerCase() !== String(listing.locality || '').toLowerCase()) continue;
+      if (f.furnishing && String(f.furnishing).toLowerCase() !== String(listing.furnishing || '').toLowerCase()) continue;
+      const area = listing.area_sqft != null ? Number(listing.area_sqft) : null;
+      if (f.minArea && (area == null || area < Number(f.minArea))) continue;
+      if (f.maxArea && area != null && area > Number(f.maxArea)) continue;
+      if ((f.verified === true || f.verified === 'true') && !listing.is_verified) continue;
+      if (f.lat != null && f.lng != null && f.lat !== '' && f.lng !== '') {
+        if (listing.latitude == null || listing.longitude == null) continue;
+        const rad = (d) => (Number(d) * Math.PI) / 180;
+        const h = Math.sin(rad(listing.latitude - f.lat) / 2) ** 2 + Math.cos(rad(f.lat)) * Math.cos(rad(listing.latitude)) * Math.sin(rad(listing.longitude - f.lng) / 2) ** 2;
+        if (6371 * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h)) > (Number(f.radiusKm) || 5)) continue;
+      }
+      if (f.q && ![listing.title, listing.locality, listing.city].some((t) => String(t || '').toLowerCase().includes(String(f.q).toLowerCase()))) continue;
       notified.add(search.user_id);
       await pool.query('UPDATE saved_searches SET last_alerted_at = now() WHERE id = $1', [search.id]);
       await notificationService.createNotification({
@@ -568,7 +582,7 @@ async function listSavedSearches(user) {
   return result.rows;
 }
 
-const SAVED_SEARCH_FILTER_KEYS = ['purpose', 'city', 'q', 'propertyType', 'minPrice', 'maxPrice', 'bedrooms'];
+const SAVED_SEARCH_FILTER_KEYS = ['purpose', 'city', 'q', 'propertyType', 'minPrice', 'maxPrice', 'bedrooms', 'locality', 'furnishing', 'minArea', 'maxArea', 'verified', 'lat', 'lng', 'radiusKm'];
 
 async function createSavedSearch(user, { name, filters, alertsEnabled = true }) {
   const customer = await resolveCustomer(user);
@@ -657,21 +671,8 @@ async function requestVisit(user, leadId, { preferredAt, note }) {
   if (!lead.rows[0]) throw notFound('Enquiry not found');
   const when = new Date(preferredAt);
   if (Number.isNaN(when.getTime()) || when.getTime() < Date.now()) throw badRequest('Pick a date and time in the future');
-  const text = `Customer requested a site visit${lead.rows[0].title ? ` for ${lead.rows[0].title}` : ''} on ${when.toLocaleString('en-IN', {
-    timeZone: 'Asia/Kolkata',
-  })}${note ? `. Note: ${note}` : ''}`;
-  await pool.query('INSERT INTO lead_notes (lead_id, user_id, note) VALUES ($1, $2, $3)', [leadId, user.id, text]);
-  if (lead.rows[0].assigned_to) {
-    await notificationService.createNotification({
-      userId: lead.rows[0].assigned_to,
-      type: 'visit_request',
-      title: 'Site visit requested',
-      message: text,
-      relatedEntityType: 'lead',
-      relatedEntityId: leadId,
-    });
-  }
-  return { requested: true, preferredAt: when };
+  const request = await require('./enquiry.service').createVisitRequest({ leadId, customerId: customer.id, userId: user.id, preferredAt: when, note });
+  return { requested: true, preferredAt: when, requestId: request.id };
 }
 
 // ---------------------------------------------------------------- listings

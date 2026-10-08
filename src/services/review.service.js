@@ -260,6 +260,65 @@ async function forUser(userId) {
   return r.rows.map((x) => publicReview(x, { staff: true }));
 }
 
+// Admin "Reviews" desk: every review in any status, with the totals the
+// page shows on top. Filters narrow the list only - the totals stay whole.
+async function adminList({ status, rating, q, propertyId, subjectId, reported, page = 1, limit = 25 } = {}) {
+  const where = [];
+  const params = [];
+  const add = (sql, value) => {
+    params.push(value);
+    where.push(sql.replace('?', `$${params.length}`));
+  };
+  if (status) add('rv.status = ?::varchar', status);
+  if (rating) add('rv.rating = ?::int', Number(rating));
+  if (propertyId) add('rv.property_id = ?::uuid', propertyId);
+  if (subjectId) add('rv.subject_user_id = ?::uuid', subjectId);
+  if (reported) where.push('rv.reported_at IS NOT NULL AND (rv.moderated_at IS NULL OR rv.moderated_at < rv.reported_at)');
+  if (q) add(`(rv.title ILIKE ? OR rv.body ILIKE $${params.length + 1} OR ur.full_name ILIKE $${params.length + 1} OR us.full_name ILIKE $${params.length + 1} OR p.title ILIKE $${params.length + 1})`, `%${q}%`);
+  const filter = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const size = Math.min(Math.max(Number(limit) || 25, 1), 100);
+  const offset = (Math.max(Number(page) || 1, 1) - 1) * size;
+  const [rows, total, stats] = await Promise.all([
+    pool.query(
+      `${LIST_SELECT} ${filter} ORDER BY rv.created_at DESC LIMIT ${size} OFFSET ${offset}`,
+      params
+    ),
+    pool.query(`SELECT COUNT(*)::int AS n FROM reviews rv JOIN users ur ON ur.id = rv.reviewer_id JOIN users us ON us.id = rv.subject_user_id LEFT JOIN properties p ON p.id = rv.property_id ${filter}`, params),
+    pool.query(
+      `SELECT COUNT(*)::int AS total,
+              COUNT(*) FILTER (WHERE status = 'published')::int AS published,
+              COUNT(*) FILTER (WHERE status = 'pending_moderation')::int AS pending,
+              COUNT(*) FILTER (WHERE status = 'hidden')::int AS hidden,
+              COUNT(*) FILTER (WHERE status = 'rejected')::int AS rejected,
+              COUNT(*) FILTER (WHERE reported_at IS NOT NULL AND (moderated_at IS NULL OR moderated_at < reported_at))::int AS reported,
+              ROUND(AVG(rating) FILTER (WHERE status = 'published'), 1)::float AS average
+       FROM reviews`
+    ),
+  ]);
+  return {
+    items: rows.rows.map((x) => ({ ...publicReview(x, { staff: true }), propertyId: x.property_id, dealId: x.deal_id, leaseId: x.lease_id })),
+    pagination: { page: Math.max(Number(page) || 1, 1), limit: size, total: total.rows[0].n },
+    stats: stats.rows[0],
+  };
+}
+
+// Public: the published reviews written about one listing (the property the
+// deal, visit or lease was for), with their average. No identities.
+async function forProperty(propertyId) {
+  const r = await pool.query(
+    `SELECT rv.id, rv.rating, rv.title, rv.body, rv.interaction, rv.reply, rv.replied_at, rv.created_at,
+            split_part(u.full_name, ' ', 1) AS reviewer_first_name
+     FROM reviews rv JOIN users u ON u.id = rv.reviewer_id
+     WHERE rv.property_id = $1 AND rv.status = 'published' ORDER BY rv.created_at DESC LIMIT 50`,
+    [propertyId]
+  );
+  const count = r.rows.length;
+  return {
+    rating: { average: count ? Math.round((r.rows.reduce((s, x) => s + x.rating, 0) / count) * 10) / 10 : null, count },
+    reviews: r.rows,
+  };
+}
+
 async function reply(user, id, text, meta = {}) {
   await assertCleanContent({ reply: text }, { blockContact: true });
   const r = await pool.query(
@@ -306,6 +365,16 @@ async function moderate(user, id, action, note, meta = {}) {
       type: 'review_received',
       title: `New ${before.rating}-star review`,
       message: before.title || 'A customer reviewed your service.',
+      relatedEntityType: 'review',
+      relatedEntityId: id,
+    });
+  }
+  if (status !== before.status) {
+    await notificationService.createNotification({
+      userId: before.reviewer_id,
+      type: 'review_moderated',
+      title: status === 'published' ? 'Your review is live' : 'Your review is not shown',
+      message: status === 'published' ? 'It now shows on the property page.' : 'Our team reviewed it and it is not shown on the website.',
       relatedEntityType: 'review',
       relatedEntityId: id,
     });
@@ -384,6 +453,8 @@ module.exports = {
   mine,
   aboutMe,
   forUser,
+  adminList,
+  forProperty,
   reply,
   report,
   moderationQueue,

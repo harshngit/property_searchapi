@@ -14,7 +14,7 @@ router.use(authenticate);
 
 const STAFF = ['internal_sales', 'admin', 'super_admin'];
 const ADMINS = ['admin', 'super_admin'];
-const DOC_TYPES = ['auction_notice', 'sale_notice', 'emd_receipt', 'title_documents', 'valuation_report', 'legal_opinion', 'inspection_report', 'term_sheet', 'financials', 'photos', 'other'];
+const DOC_TYPES = ['auction_notice', 'sale_notice', 'emd_receipt', 'title_documents', 'valuation_report', 'legal_opinion', 'inspection_report', 'term_sheet', 'financials', 'photos', 'other', 'noc', 'affiliation_certificate', 'land_records', 'fire_noc', 'trust_deed', 'enrollment_records', 'audited_financials', 'municipal_approval', 'regulatory_approval', 'encumbrance_certificate'];
 const meta = (req) => auditService.requestMeta(req);
 
 /**
