@@ -120,6 +120,8 @@ function buildOpportunitySet(data, params, set) {
 // Restricts a listing query to the caller's own tenant/records unless
 // they are admin/super_admin, per the module's tenant-isolation rule.
 function applyTenantScope(user, where, params) {
+  // Section 35: listings of a suspended / removed account are for the Super Admin's eyes only.
+  if (user.role !== 'super_admin') where.push(`NOT EXISTS (SELECT 1 FROM users su WHERE su.id = p.created_by AND su.status IN ('suspended', 'removed'))`);
   if (isAdmin(user.role)) return;
   params.push(user.tenant_id || null, user.id);
   where.push(`(p.tenant_id = $${params.length - 1} OR p.created_by = $${params.length})`);

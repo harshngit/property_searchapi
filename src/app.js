@@ -178,6 +178,7 @@ app.use('/api/market', marketRoutes);
 app.use('/api/market-digest', require('./routes/marketDigest.routes'));
 app.use('/api/fields', require('./routes/field.routes'));
 app.use('/api/coupons', require('./routes/coupon.routes'));
+app.use('/api/suspensions', require('./routes/suspension.routes'));
 app.use('/api/mandates', mandateRoutes);
 app.use('/api/representatives', representativeRoutes);
 app.use('/api/lead-sources', leadSourceRoutes);

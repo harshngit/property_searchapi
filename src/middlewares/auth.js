@@ -1,6 +1,7 @@
 const { verifyAccessToken } = require('../utils/jwt');
 const { error } = require('../utils/response');
 const suspension = require('../utils/suspension');
+const userBlock = require('../utils/userBlock');
 
 // Sec. 14.7 Level 3 - Full Suspension: the franchisee's brokers are blocked
 // until the overdue invoice is paid. The Franchisee Admin stays able to sign
@@ -35,6 +36,12 @@ function authenticate(req, res, next) {
   try {
     const decoded = verifyAccessToken(token);
     req.user = decoded; // { id, role, tenant_id }
+    // Section 35: a suspended or removed account is turned away at once, except for
+    // signing out and the DPDP routes (download my data / ask for deletion).
+    const blockedAs = userBlock.stateOf(decoded.id);
+    if (blockedAs && !/^\/api\/(auth\/(logout|me)|user)(\/|\?|$)/.test(req.originalUrl || '')) {
+      return error(res, 403, blockedAs === 'removed' ? 'This account has been removed from the platform.' : 'This account has been suspended. Reinstatement is at the discretion of the platform.');
+    }
     if (suspended(decoded) && !/^\/api\/(auth|notifications)\b/.test(req.originalUrl || '')) {
       return error(res, 403, 'Service suspended due to non-payment by your franchise. Access returns as soon as the overdue invoice is paid.');
     }

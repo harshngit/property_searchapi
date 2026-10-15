@@ -3,6 +3,14 @@ const { generateAccessToken, generateRefreshToken, verifyRefreshToken } = requir
 const { success, error } = require('../utils/response');
 
 // POST /api/auth/register
+// Section 35: a suspended / removed person is told so, and where their DPDP rights still apply.
+function inactiveMessage(status) {
+  if (status === 'suspended' || status === 'removed') {
+    return `This account has been ${status} by the platform. You can still ask for a copy of your data or its deletion through the privacy request on the sign-in page.`;
+  }
+  return `Account is ${String(status).replace('_', ' ')}. Please contact admin.`;
+}
+
 async function register(req, res, next) {
   try {
     const { fullName, email, mobile, password, role, tenantId, referralCode } = req.body;
@@ -36,7 +44,7 @@ async function login(req, res, next) {
     }
 
     if (user.status !== 'active') {
-      return error(res, 403, `Account is ${user.status.replace('_', ' ')}. Please contact admin.`);
+      return error(res, 403, inactiveMessage(user.status));
     }
 
     const isValid = await authService.validatePassword(user, password);
@@ -141,6 +149,7 @@ async function verifyOtp(req, res, next) {
     }
 
     // For OTP-based login, issue tokens directly after verification
+    if (purpose === 'login' && user && user.status !== 'active') return error(res, 403, inactiveMessage(user.status));
     if (purpose === 'login' && user) {
       const payload = { id: user.id, role: user.role_name, tenant_id: user.tenant_id };
       const accessToken = generateAccessToken(payload);

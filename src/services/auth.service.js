@@ -340,7 +340,7 @@ async function loginWithGoogle(googlePayload, allowSelfRegister, role, tenantId)
     await referralService.recordReferral(user.id, null);
     await referralService.ensureReferralCode(user.id, targetRole);
   } else if (user.status !== 'active') {
-    const err = new Error(`Account is ${user.status.replace('_', ' ')}. Please contact admin.`);
+    const err = new Error(['suspended', 'removed'].includes(user.status) ? `This account has been ${user.status} by the platform. You can still ask for a copy of your data or its deletion through the privacy request on the sign-in page.` : `Account is ${user.status.replace('_', ' ')}. Please contact admin.`);
     err.statusCode = 403;
     throw err;
   }

@@ -6094,3 +6094,130 @@ test('scheme coupons: COU- codes by admin only, validity / caps / category / sta
   assert.equal((await api('GET', `/coupons/manage/redemptions?couponId=${fee.data.id}`, { token: A })).data[0].userName, `coupbuyer ${RUN}`);
   assert.ok((await pool.query(`SELECT 1 FROM audit_logs WHERE action = 'coupon.applied' AND entity_id = $1`, [fee.data.id])).rows.length);
 });
+
+test('section 35 suspension: one atomic public erasure (listings, requirements, share links, trust, reviews, referral code), sessions cut, Super Admin-only visibility, frozen commission, active deals, DPDP request, reinstatement with fresh review', async () => {
+  const S = ctx.superAdmin.token;
+  const A = ctx.admin.token;
+  const SCITY = `Suspend City ${RUN}`;
+  const b = await createUser('broker', 'suspbroker');
+  const other = await createUser('broker', 'suspother');
+  const buyer = await createUser('customer', 'suspbuyer');
+  const listing = (title, status) => pool.query(`INSERT INTO properties (created_by, broker_id, title, property_type, transaction_type, city, locality, price, status) VALUES ($1, $1, $2, 'apartment', 'sell', $3, 'Erase Nagar', '1 Cr', $4) RETURNING id`, [b.id, title, SCITY, status]).then((r) => r.rows[0].id);
+  const live = await listing(`Suspended live ${RUN}`, 'approved');
+  const pending = await listing(`Suspended pending ${RUN}`, 'pending_approval');
+  const sold = await listing(`Suspended sold ${RUN}`, 'inactive');
+  const custB = (await pool.query(`INSERT INTO customers (full_name, user_id, email) VALUES ($1, $2, $3) RETURNING id`, [`Susp Broker Cust ${RUN}`, b.id, b.email])).rows[0].id;
+  const req = (await pool.query(`INSERT INTO requirements (customer_id, created_by, purpose, property_type, city, status, fee_consent_at) VALUES ($1, $2, 'buy', 'apartment', $3, 'active', now()) RETURNING id`, [custB, b.id, SCITY])).rows[0].id;
+  const share = (await pool.query(`INSERT INTO requirement_shares (requirement_id, shared_by, shared_with) VALUES ($1, $2, $3) RETURNING id`, [req, b.id, other.id])).rows[0].id;
+  const custBuyer = (await pool.query(`INSERT INTO customers (full_name, user_id, email) VALUES ($1, $2, $3) RETURNING id`, [`Susp Buyer ${RUN}`, buyer.id, buyer.email])).rows[0].id;
+  const deal = (await pool.query(`INSERT INTO deals (customer_id, broker_id, property_id, stage, deal_value, assigned_rep_id) VALUES ($1, $2, $3, 'negotiation', 10000000, $4) RETURNING id`, [custBuyer, b.id, live, ctx.sales.id])).rows[0].id;
+  // A published review the broker wrote about someone else's listing.
+  const reviewed = (await pool.query(`INSERT INTO properties (created_by, title, property_type, transaction_type, city, price, status) VALUES ($1, $2, 'apartment', 'sell', $3, '90 Lac', 'approved') RETURNING id`, [other.id, `Reviewed by suspended ${RUN}`, SCITY])).rows[0].id;
+  await pool.query(`INSERT INTO reviews (reviewer_id, subject_user_id, property_id, interaction, rating, body, status) VALUES ($1, $2, $3, 'site_visit', 5, 'Very helpful visit', 'published')`, [b.id, other.id, reviewed]);
+  // A franchise commission with a share due to the broker.
+  const fr = (await pool.query('SELECT id FROM franchisees LIMIT 1')).rows[0];
+  const commission = fr ? (await pool.query(
+    `INSERT INTO franchisee_commissions (franchisee_id, deal_id, deal_value, pool_amount, scenario, shares, status) VALUES ($1, $2, 10000000, 200000, 'with_broker', $3, 'releasable') RETURNING id`,
+    [fr.id, deal, JSON.stringify([{ userId: b.id, name: 'Susp Broker', party: 'broker', total: 66666.67 }, { userId: null, party: 'arb', total: 33333.33 }])]
+  )).rows[0].id : null;
+  const referralService = require('../src/services/referral.service');
+  await referralService.ensureReferralCode(b.id, 'broker');
+  const referral = (await pool.query('SELECT referral_code FROM users WHERE id = $1', [b.id])).rows[0].referral_code;
+  assert.equal(await referralService.validateCode(referral), true);
+  assert.equal((await api('GET', `/search/properties/${live}`)).status, 200);
+  assert.equal((await api('GET', `/trust/public/properties/${reviewed}/reviews`)).data.reviews.length, 1);
+
+  // ---- who may act, and never by a plain status edit
+  const impact = await api('GET', `/suspensions/users/${b.id}/impact`, { token: A });
+  assert.deepEqual(impact.data, { listings: 2, requirements: 1, shareLinks: 1, activeDeals: 1, commissionsToFreeze: commission ? 1 : 0 });
+  assert.equal((await api('POST', `/suspensions/users/${b.id}`, { token: ctx.sales.token, body: { action: 'suspended' } })).status, 403);
+  assert.equal((await api('POST', `/suspensions/users/${ctx.admin.id}`, { token: A, body: { action: 'suspended' } })).status, 400, 'not yourself');
+  assert.equal((await api('PUT', `/users/${b.id}`, { token: A, body: { status: 'suspended' } })).status, 400, 'a plain status change is refused');
+
+  // ---- suspend: one atomic action
+  const done = await api('POST', `/suspensions/users/${b.id}`, { token: A, body: { action: 'suspended', reason: 'Repeated contact sharing with buyers', note: 'Third warning' } });
+  assert.equal(done.status, 200, JSON.stringify(done.body));
+  assert.deepEqual(done.data, { id: b.id, status: 'suspended', remark: 'SUSPENDED', visibleToSuperAdminOnly: true }, 'an admin sees only the remark');
+  const st = async (table, id) => (await pool.query(`SELECT status::text AS s FROM ${table} WHERE id = $1`, [id])).rows[0].s;
+  assert.deepEqual([await st('users', b.id), await st('properties', live), await st('properties', pending), await st('properties', sold), await st('requirements', req), await st('requirement_shares', share)], ['suspended', 'inactive', 'inactive', 'inactive', 'paused', 'revoked']);
+  // Public view: listing, trust card, reviews written by them, referral code.
+  assert.equal((await api('GET', `/search/properties/${live}`)).status, 404);
+  assert.ok(!(await api('GET', `/search/properties?city=${encodeURIComponent(SCITY)}`)).data.items.some((i) => i.id === live));
+  assert.equal((await api('GET', `/trust/public/listings/${live}`)).status, 404);
+  assert.equal((await api('GET', `/trust/public/properties/${reviewed}/reviews`)).data.reviews.length, 0, 'their review leaves public view');
+  assert.equal(await referralService.validateCode(referral), false);
+  // Sessions end; DPDP routes stay open.
+  assert.equal((await api('GET', '/properties', { token: b.token })).status, 403);
+  assert.match((await api('GET', '/properties', { token: b.token })).body.message, /suspended/);
+  assert.equal((await api('GET', '/user/privacy', { token: b.token })).status, 200);
+  const login = await api('POST', '/auth/login', { body: { identifier: b.email, password: PASSWORD } });
+  assert.equal(login.status, 403);
+  assert.match(login.body.message, /privacy request/);
+  // Super Admin-only visibility.
+  assert.equal((await api('GET', `/users/${b.id}`, { token: A })).status, 404);
+  assert.ok(!(await api('GET', `/users?search=${encodeURIComponent(`suspbroker ${RUN}`)}`, { token: A })).data.items?.some?.((u) => u.id === b.id));
+  assert.ok(!(await api('GET', `/properties?city=${encodeURIComponent(SCITY)}`, { token: A })).data.items.some((p) => p.id === live), 'not in the CRM for an admin');
+  assert.ok((await api('GET', `/properties?city=${encodeURIComponent(SCITY)}`, { token: S })).data.items.some((p) => p.id === live), 'the Super Admin still sees it');
+  assert.equal((await api('GET', '/suspensions', { token: A })).status, 403);
+  const all = await api('GET', '/suspensions', { token: S });
+  const row = all.data.find((x) => x.id === b.id);
+  assert.ok(row && row.remark === 'SUSPENDED' && row.reason === 'Repeated contact sharing with buyers' && row.actedBy);
+  // Active deal: the representative and the buyer are told, never the reason.
+  let told = [];
+  for (let i = 0; i < 30 && told.length < 2; i += 1) {
+    told = (await pool.query(`SELECT user_id, message FROM notifications WHERE related_entity_id = $1 AND type = 'deal_participant_suspended'`, [deal])).rows;
+    if (told.length < 2) await new Promise((r) => setTimeout(r, 200));
+  }
+  assert.deepEqual(new Set(told.map((t) => t.user_id)), new Set([ctx.sales.id, buyer.id]));
+  assert.ok(told.every((t) => !/contact sharing/.test(t.message)));
+  // The record is append-only.
+  await assert.rejects(pool.query(`UPDATE user_suspensions SET reason = 'edited' WHERE user_id = $1`, [b.id]), /append-only/);
+  await assert.rejects(pool.query(`DELETE FROM user_suspensions WHERE user_id = $1`, [b.id]), /append-only/);
+  const record = await api('GET', `/suspensions/users/${b.id}`, { token: S });
+  assert.equal(record.data.events[0].action, 'suspended');
+  assert.equal(record.data.events[0].internalNote, 'Third warning');
+  assert.equal(record.data.events[0].snapshot.listings.length, 2, 'the sold listing was not part of it');
+
+  // ---- frozen commission and the deal: the Super Admin decides
+  if (commission) {
+    const rel = await api('POST', `/franchise/commissions/${commission}/release`, { token: S, body: { payoutReference: 'UTR123456' } });
+    assert.equal(rel.status, 400);
+    assert.match(rel.body.message, /Frozen/);
+    const freeze = record.data.frozenCommissions[0];
+    assert.equal(freeze.amount, 66666.67);
+    assert.equal((await api('POST', `/suspensions/commissions/${freeze.id}`, { token: A, body: { decision: 'release' } })).status, 403);
+    assert.equal((await api('POST', `/suspensions/commissions/${freeze.id}`, { token: S, body: { decision: 'forfeit', note: 'Breach of terms' } })).data.frozenCommissions[0].decision, 'forfeit');
+  }
+  assert.equal((await api('POST', `/suspensions/users/${b.id}/deals/${deal}`, { token: S, body: { decision: 'reassign', newBrokerId: b.id } })).status, 400, 'not to the suspended broker');
+  const moved = await api('POST', `/suspensions/users/${b.id}/deals/${deal}`, { token: S, body: { decision: 'reassign', newBrokerId: other.id, note: 'Other broker takes over' } });
+  assert.equal(moved.status, 200, JSON.stringify(moved.body));
+  assert.equal((await pool.query('SELECT broker_id FROM deals WHERE id = $1', [deal])).rows[0].broker_id, other.id);
+
+  // ---- DPDP: the person can still ask for deletion, proving who they are
+  assert.equal((await api('POST', '/auth/suspended-privacy-request', { body: { identifier: b.email, password: 'wrong-pass', kind: 'deletion' } })).status, 400);
+  assert.equal((await api('POST', '/auth/suspended-privacy-request', { body: { identifier: ctx.broker.email, password: PASSWORD, kind: 'export' } })).status, 400, 'only for suspended accounts');
+  const dpdp = await api('POST', '/auth/suspended-privacy-request', { body: { identifier: b.email, password: PASSWORD, kind: 'deletion', reason: 'Please erase my data' } });
+  assert.equal(dpdp.status, 201, JSON.stringify(dpdp.body));
+
+  // ---- reinstatement: Super Admin only, on a clarification; content comes back after review
+  assert.equal((await api('POST', `/suspensions/users/${b.id}/reinstate`, { token: A, body: { clarification: 'Explained' } })).status, 403);
+  assert.equal((await api('POST', `/suspensions/users/${b.id}/reinstate`, { token: S, body: { clarification: 'x' } })).status, 400);
+  const back = await api('POST', `/suspensions/users/${b.id}/reinstate`, { token: S, body: { clarification: 'Written undertaking received; buyer contacts were shared by mistake.' } });
+  assert.equal(back.status, 200, JSON.stringify(back.body));
+  assert.deepEqual([await st('users', b.id), await st('properties', live), await st('properties', pending), await st('properties', sold), await st('requirements', req)], ['active', 'pending_approval', 'pending_approval', 'inactive', 'paused']);
+  assert.equal(await referralService.validateCode(referral), true, 'the same referral code works again');
+  assert.equal((await api('GET', '/properties', { token: b.token })).status, 200, 'the session works again');
+  const queue = await api('GET', '/suspensions/review-queue', { token: ctx.sales.token });
+  assert.ok(queue.data.some((r) => r.id === req));
+  assert.equal((await api('POST', `/suspensions/requirements/${req}/republish`, { token: ctx.sales.token })).data.republished, true);
+  assert.equal(await st('requirements', req), 'active');
+  assert.deepEqual((await api('GET', `/suspensions/users/${b.id}`, { token: S })).data.events.map((e) => e.action).slice(0, 2), ['republished', 'reinstated']);
+
+  // ---- removal works the same way and reads REMOVED
+  const gone = await createUser('customer', 'suspgone');
+  const rm = await api('POST', `/suspensions/users/${gone.id}`, { token: A, body: { action: 'removed' } });
+  assert.equal(rm.data.remark, 'REMOVED', 'no reason needed');
+  assert.match((await api('GET', '/user/my-data', { token: gone.token })).status === 200 ? 'ok' : 'blocked', /ok/);
+  assert.match((await api('GET', '/me/profile', { token: gone.token })).body.message, /removed/);
+  await pool.query(`UPDATE properties SET status = 'inactive' WHERE city = $1`, [SCITY]);
+});

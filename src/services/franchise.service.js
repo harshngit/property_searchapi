@@ -609,6 +609,9 @@ async function releaseCommission(admin, id, payoutReference, meta = {}) {
   if (!c) throw notFound('Commission calculation not found');
   if (c.status === 'released') throw badRequest('This commission has already been released');
   if (c.status !== 'releasable') throw badRequest('Not released yet: A R Buildwel has not collected the client invoices for this deal');
+  // Section 35: a share due to a suspended person waits for the Super Admin's decision.
+  const frozen = await require('./userSuspension.service').frozenFor(id);
+  if (frozen.length) throw badRequest(`Frozen: the share of ${frozen.map((f) => f.full_name).join(', ')} is held while the account is suspended. The Super Admin decides first.`);
   if (!payoutReference || String(payoutReference).trim().length < 3) throw badRequest('Enter the payout reference (UTR)');
   const u = (await pool.query(`UPDATE franchisee_commissions SET status = 'released', released_at = now(), released_by = $2, payout_reference = $3 WHERE id = $1 RETURNING *`, [id, admin.id, String(payoutReference).trim()])).rows[0];
   await auditService.log({ actor: admin, action: 'franchise.commission_released', entityType: 'franchisee_commission', entityId: id, after: { payoutReference }, ...meta });

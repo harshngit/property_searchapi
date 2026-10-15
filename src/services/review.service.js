@@ -309,7 +309,7 @@ async function forProperty(propertyId) {
     `SELECT rv.id, rv.rating, rv.title, rv.body, rv.interaction, rv.reply, rv.replied_at, rv.created_at,
             split_part(u.full_name, ' ', 1) AS reviewer_first_name
      FROM reviews rv JOIN users u ON u.id = rv.reviewer_id
-     WHERE rv.property_id = $1 AND rv.status = 'published' ORDER BY rv.created_at DESC LIMIT 50`,
+     WHERE rv.property_id = $1 AND rv.status = 'published' AND u.status = 'active' ORDER BY rv.created_at DESC LIMIT 50`,
     [propertyId]
   );
   const count = r.rows.length;

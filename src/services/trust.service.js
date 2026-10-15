@@ -445,7 +445,7 @@ async function publicForListing(propertyId) {
       `SELECT p.id, p.created_at, p.created_by, p.broker_id, p.builder_id, r.name AS role
        FROM properties p LEFT JOIN users u ON u.id = COALESCE(p.broker_id, p.builder_id, p.created_by)
        LEFT JOIN roles r ON r.id = u.role_id
-       WHERE p.id = $1 AND p.status IN ('approved', 'inactive')`,
+       WHERE p.id = $1 AND p.status IN ('approved', 'inactive') AND COALESCE(u.status::text, 'active') = 'active'`,
       [propertyId]
     )
   ).rows[0];

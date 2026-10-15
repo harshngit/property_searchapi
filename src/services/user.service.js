@@ -45,6 +45,8 @@ async function fetchUserRow(actingUser, id) {
   );
   const user = result.rows[0];
   if (!user) throw notFound();
+  // Section 35: a suspended or removed account is visible to the Super Admin only.
+  if (['suspended', 'removed'].includes(user.status) && actingUser.role !== 'super_admin' && actingUser.id !== user.id) throw notFound();
 
   assertOwnerOrAdmin(actingUser, user, { allowTenantManagers: ['agency_admin'], ownerFields: ['id'] });
   return user;
@@ -61,6 +63,9 @@ async function getUserById(actingUser, id) {
 async function listUsers(actingUser, filters, page, limit) {
   const where = [];
   const params = [];
+
+  // Section 35: suspended and removed accounts are listed for the Super Admin only.
+  if (actingUser.role !== 'super_admin') where.push(`u.status NOT IN ('suspended', 'removed')`);
 
   if (!isAdmin(actingUser.role)) {
     // agency_admin (the only other role permitted to reach this endpoint,
@@ -142,7 +147,12 @@ async function applyProfileUpdate(id, updates, allowedFields) {
 }
 
 async function updateUser(actingUser, id, updates) {
-  await fetchUserRow(actingUser, id);
+  const current = await fetchUserRow(actingUser, id);
+  // Section 35: suspension, removal and reinstatement are one atomic action
+  // with public erasure and a legal-grade record - never a plain status edit.
+  if (updates.status !== undefined && updates.status !== current.status && (['suspended', 'removed'].includes(updates.status) || ['suspended', 'removed'].includes(current.status))) {
+    throw badRequest('Use Suspend / Remove (or Reinstate) on the account - a suspension is never a plain status change');
+  }
   await applyProfileUpdate(id, updates, [
     'fullName',
     'email',

@@ -84,7 +84,8 @@ async function recordReferral(referredUserId, referralCode) {
 async function validateCode(referralCode) {
   const code = String(referralCode || '').trim().toUpperCase();
   if (!code || code === ORGANIC_CODE) return true;
-  const result = await pool.query('SELECT 1 FROM users WHERE referral_code = $1', [code]);
+  // Section 35: the code is inactive while its owner is suspended / removed, and the same code returns on reinstatement.
+  const result = await pool.query(`SELECT 1 FROM users WHERE referral_code = $1 AND status NOT IN ('suspended', 'removed')`, [code]);
   return result.rows.length > 0;
 }
 

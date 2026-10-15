@@ -34,6 +34,8 @@ async function listCustomers(user, filters, page, limit) {
   const params = [];
 
   applyTenantScope(user, where, params);
+  // Section 35: a suspended / removed customer is for the Super Admin only.
+  if (user.role !== 'super_admin') where.push(`NOT EXISTS (SELECT 1 FROM users su WHERE su.id = c.user_id AND su.status IN ('suspended', 'removed'))`);
 
   if (filters.search) {
     params.push(`%${filters.search}%`);

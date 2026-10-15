@@ -384,6 +384,41 @@ router.post('/logout', authenticate, authController.logout);
 
 /**
  * @swagger
+ * /auth/suspended-privacy-request:
+ *   post:
+ *     summary: A suspended or removed person asks for a copy of their data or its deletion (DPDP rights stay). Identity proved by password.
+ *     tags: [Auth]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [identifier, password, kind]
+ *             properties:
+ *               identifier: { type: string }
+ *               password: { type: string }
+ *               kind: { type: string, enum: [export, deletion] }
+ *               reason: { type: string }
+ *     responses:
+ *       201: { description: Request recorded }
+ */
+router.post(
+  '/suspended-privacy-request',
+  [body('identifier').isString().isLength({ min: 3, max: 150 }), body('password').isString().isLength({ min: 1, max: 200 }), body('kind').isIn(['export', 'deletion'])],
+  validate,
+  async (req, res, next) => {
+    try {
+      const data = await require('../services/userSuspension.service').privacyRequest(req.body, require('../services/audit.service').requestMeta(req));
+      return require('../utils/response').success(res, 201, 'Request recorded', data);
+    } catch (err) {
+      return next(err);
+    }
+  }
+);
+
+/**
+ * @swagger
  * /auth/forgot-password:
  *   post:
  *     summary: Request a password reset link/token

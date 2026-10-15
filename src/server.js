@@ -54,6 +54,8 @@ app.listen(PORT, () => {
   if (process.env.NOTIFICATION_JOBS_DISABLED !== 'true') require('./services/notificationIntel.service').startScheduler();
   // Daily market digest for brokers (sec. 20.4): compiled and sent in its posting windows.
   if (process.env.MARKET_DIGEST_JOBS_DISABLED !== 'true') require('./services/marketDigest.service').startScheduler();
+  // Section 35: load the suspended / removed accounts the auth middleware turns away.
+  require('./services/userSuspension.service').refreshBlocks().catch((err) => console.error('[suspension] block list not loaded:', err.message));
   // Engine 8: expired scheme coupons are switched off (never deleted), hourly.
   setInterval(() => require('./services/coupon.service').sweep().catch((err) => console.error('[coupons] sweep failed:', err.message)), 60 * 60 * 1000).unref();
   // Sec. 14.7 franchisee payment ladder and suspension levels (hourly). The suspension cache loads either way.
