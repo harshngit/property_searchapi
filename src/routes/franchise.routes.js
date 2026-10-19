@@ -27,6 +27,10 @@ const ok = (res, message, data, code = 200) => success(res, code, message, data)
  */
 
 // ------------------------------------------------------------------ public
+const extras = require('../services/franchiseExtras.service');
+const taxService = require('../services/tax.service');
+const multer = require('multer');
+const invoiceUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 const brandingRouter = express.Router();
 /**
  * @swagger
@@ -39,6 +43,20 @@ const brandingRouter = express.Router();
  *       - { in: query, name: preview, schema: { type: boolean }, description: Franchisee Admin only - returns the unpublished draft }
  *     responses: { 200: { description: Branding or null } }
  */
+/**
+ * @swagger
+ * /branding/tls-allowed:
+ *   get:
+ *     summary: For the edge server's on-demand TLS - 200 only for a host mapped to an active franchisee with its domain switched on
+ *     tags: [Franchisee]
+ *     parameters:
+ *       - { in: query, name: domain, required: true, schema: { type: string } }
+ *     responses:
+ *       200: { description: Allowed }
+ *       404: { description: Not a franchisee domain }
+ */
+brandingRouter.get('/tls-allowed', asyncHandler(async (req, res) => ((await extras.tlsAllowed(req.query.domain)) ? res.status(200).send('ok') : res.status(404).send('unknown host'))));
+
 brandingRouter.get(
   '/',
   optionalAuthenticate,
@@ -54,6 +72,11 @@ brandingRouter.get(
 // --------------------------------------------------------------- franchisee
 const franchiseeRouter = express.Router();
 franchiseeRouter.use(authenticate, authorize('franchisee_admin'));
+// Every query a franchisee request makes runs under Row-Level Security for that franchisee.
+franchiseeRouter.use(asyncHandler(async (req, res, next) => {
+  const f = await franchise.mine(req.user);
+  require('../config/db').franchiseScope.run({ franchiseeId: f.id, tenantId: f.tenant_id }, () => next());
+}));
 
 /**
  * @swagger
@@ -179,6 +202,45 @@ franchiseeRouter.post('/branding/publish', asyncHandler(async (req, res) => ok(r
  *     security: [{ bearerAuth: [] }]
  *     responses: { 201: { description: Broker created } }
  */
+/**
+ * @swagger
+ * /franchisee/shares:
+ *   get:
+ *     summary: The franchisee's commission shares - GST invoice needed / sent / approved, and what was paid after TDS
+ *     tags: [Franchisee]
+ *     security: [{ bearerAuth: [] }]
+ *     responses: { 200: { description: Shares } }
+ * /franchisee/shares/{commissionId}/invoice:
+ *   post:
+ *     summary: Upload the franchisee's GST invoice to A R Buildwel for its share (PDF / JPG / PNG)
+ *     tags: [Franchisee]
+ *     security: [{ bearerAuth: [] }]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         multipart/form-data:
+ *           schema:
+ *             type: object
+ *             required: [file, invoiceNumber, invoiceDate, supplierGstin, taxableAmount, gstAmount]
+ *             properties:
+ *               file: { type: string, format: binary }
+ *               invoiceNumber: { type: string }
+ *               invoiceDate: { type: string, format: date }
+ *               supplierGstin: { type: string }
+ *               taxableAmount: { type: number }
+ *               gstAmount: { type: number }
+ *     responses: { 201: { description: Invoice } }
+ * /franchisee/email-preview:
+ *   get:
+ *     summary: How the franchisee's branded email looks (HTML)
+ *     tags: [Franchisee]
+ *     security: [{ bearerAuth: [] }]
+ *     responses: { 200: { description: Brand and HTML } }
+ */
+franchiseeRouter.get('/shares', asyncHandler(async (req, res) => ok(res, 'Commission shares', await extras.myShares(req.user))));
+franchiseeRouter.post('/shares/:commissionId/invoice', invoiceUpload.single('file'), [param('commissionId').isUUID()], validate, asyncHandler(async (req, res) => ok(res, 'Invoice sent', await extras.uploadInvoice(req.user, req.params.commissionId, req.file, req.body, meta(req)), 201)));
+franchiseeRouter.get('/email-preview', asyncHandler(async (req, res) => ok(res, 'Email preview', await extras.emailPreview(req.user))));
+
 franchiseeRouter.get('/brokers', asyncHandler(async (req, res) => ok(res, 'Brokers', await franchise.myBrokers(req.user))));
 franchiseeRouter.post(
   '/brokers',
@@ -397,6 +459,51 @@ adminRouter.post('/tickets/:id/reply', authorize(...ADMIN), [param('id').isUUID(
  *     parameters: [{ in: path, name: id, required: true, schema: { type: string, format: uuid } }]
  *     responses: { 200: { description: Franchisee } }
  */
+/**
+ * @swagger
+ * /franchise/commission-invoices:
+ *   get:
+ *     summary: GST invoices from franchisees and brokers for their commission shares (staff)
+ *     tags: [Franchise]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters: [{ in: query, name: status, schema: { type: string, enum: [submitted, approved, rejected] } }]
+ *     responses: { 200: { description: Invoices } }
+ * /franchise/commission-invoices/{id}/review:
+ *   post:
+ *     summary: Approve or reject a commission GST invoice (admin)
+ *     tags: [Franchise]
+ *     security: [{ bearerAuth: [] }]
+ *     responses: { 200: { description: Invoice } }
+ * /franchise/commissions/{id}/release-plan:
+ *   get:
+ *     summary: Before releasing - invoices still missing, and each person's gross, TDS and net (staff)
+ *     tags: [Franchise]
+ *     security: [{ bearerAuth: [] }]
+ *     responses: { 200: { description: Plan } }
+ * /franchise/{id}/domain/check:
+ *   post:
+ *     summary: Check the franchisee domain now - DNS record and live certificate (admin)
+ *     tags: [Franchise]
+ *     security: [{ bearerAuth: [] }]
+ *     responses: { 200: { description: Domain status } }
+ * /franchise/{id}/email-sender:
+ *   put:
+ *     summary: Set the branded email sending address and reply-to (admin; on a domain the email provider has verified)
+ *     tags: [Franchise]
+ *     security: [{ bearerAuth: [] }]
+ *     responses: { 200: { description: Sender } }
+ */
+adminRouter.get('/commission-invoices', authorize(...STAFF), [query('status').optional().isIn(['submitted', 'approved', 'rejected'])], validate, asyncHandler(async (req, res) => ok(res, 'Commission invoices', await extras.listInvoices(req.query))));
+adminRouter.post('/commission-invoices/:id/review', authorize(...ADMIN), [param('id').isUUID(), body('decision').isIn(['approve', 'reject'])], validate, asyncHandler(async (req, res) => ok(res, 'Invoice reviewed', await extras.reviewInvoice(req.user, req.params.id, req.body, meta(req)))));
+adminRouter.get('/commissions/:id/release-plan', authorize(...STAFF), [param('id').isUUID()], validate, asyncHandler(async (req, res) => {
+  const c = (await require('../config/db').query('SELECT * FROM franchisee_commissions WHERE id = $1', [req.params.id])).rows[0];
+  if (!c) return res.status(404).json({ success: false, message: 'Commission not found' });
+  const plan = await extras.releasePlan(c);
+  return ok(res, 'Release plan', { missingInvoices: plan.missingInvoices, lines: plan.lines.map(({ panHash, ...l }) => l) });
+}));
+adminRouter.post('/:id/domain/check', authorize(...ADMIN), [param('id').isUUID()], validate, asyncHandler(async (req, res) => ok(res, 'Domain checked', await extras.checkDomain(req.params.id, { actor: req.user }))));
+adminRouter.put('/:id/email-sender', authorize(...ADMIN), [param('id').isUUID()], validate, asyncHandler(async (req, res) => ok(res, 'Sender saved', await extras.setEmailSender(req.user, req.params.id, req.body, meta(req)))));
+
 adminRouter.get('/:id', authorize(...STAFF), [param('id').isUUID()], validate, asyncHandler(async (req, res) => ok(res, 'Franchisee', await franchise.get(req.params.id))));
 adminRouter.put('/:id', authorize(...ADMIN), [param('id').isUUID(), body('managerUserId').optional({ nullable: true }).isUUID(), body('status').optional().isIn(['pending', 'active', 'terminated'])], validate, asyncHandler(async (req, res) => ok(res, 'Franchisee updated', await franchise.update(req.user, req.params.id, req.body, meta(req)))));
 /**

@@ -7,6 +7,7 @@ const asyncHandler = require('../utils/asyncHandler');
 const { success } = require('../utils/response');
 const auditService = require('../services/audit.service');
 const dd = require('../services/dueDiligence.service');
+const fields = require('../services/dynamicFields.service');
 
 // Module 20 Document Repository + Module 21 Due Diligence Engine.
 // Mounted at /api/due-diligence.
@@ -132,6 +133,8 @@ router.put(
   authorize(...STAFF),
   [param('id').isUUID(), body('notes').optional().isString().isLength({ max: 4000 })],
   validate,
+  // The due-diligence form's added fields are completed with the review.
+  fields.capture('due_diligence', { complete: true }),
   asyncHandler(async (req, res) => success(res, 200, 'Reviewed', await dd.review(req.user, req.params.id, req.body, meta(req))))
 );
 

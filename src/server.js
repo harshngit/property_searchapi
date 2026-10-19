@@ -59,13 +59,18 @@ app.listen(PORT, () => {
   // Engine 8: expired scheme coupons are switched off (never deleted), hourly.
   setInterval(() => require('./services/coupon.service').sweep().catch((err) => console.error('[coupons] sweep failed:', err.message)), 60 * 60 * 1000).unref();
   // Sec. 14.7 franchisee payment ladder and suspension levels (hourly). The suspension cache loads either way.
-  if (process.env.FRANCHISE_JOBS_DISABLED !== 'true') require('./services/franchise.service').startScheduler();
+  if (process.env.FRANCHISE_JOBS_DISABLED !== 'true') {
+    require('./services/franchise.service').startScheduler();
+    // Franchisee domains: DNS record and certificate, every 6 hours.
+    require('./services/franchiseExtras.service').startScheduler();
+  }
   else require('./services/franchise.service').refreshSuspensionCache().catch(() => {});
   // Module 35: webhook event scanner and delivery (every minute).
   if (process.env.WEBHOOK_JOBS_DISABLED !== 'true') require('./services/webhook.service').startScheduler();
   // Modules 32 / 33: hourly compliance checks; DPDP deletion requests whose 30-day notice has ended.
   if (process.env.COMPLIANCE_JOBS_DISABLED !== 'true') {
     require('./services/compliance.service').startScheduler();
+    require('./services/relatedParty.service').startScheduler();
     require('./services/privacy.service').startScheduler();
   }
 });

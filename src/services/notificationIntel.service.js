@@ -166,9 +166,13 @@ async function send(channel, ctx, msg, cfg) {
   } else if (channel === 'sms') {
     await msg91('https://control.msg91.com/api/v5/flow/', { template_id: process.env.MSG91_NOTIFY_TEMPLATE_ID, short_url: '0', recipients: [{ mobiles: mobileOf(ctx.mobile), TITLE: title.slice(0, 60), BODY: body.slice(0, 100) }] });
   } else if (channel === 'email') {
+    // Franchisee-branded where the person belongs to a white-label franchise (Section 14).
+    const extras = require('./franchiseExtras.service');
+    const brand = await extras.brandFor(ctx.id);
     await msg91('https://control.msg91.com/api/v5/email/send', {
-      recipients: [{ to: [{ email: ctx.email, name: ctx.full_name || undefined }], variables: { title, body: body || title } }],
-      from: { email: process.env.MSG91_EMAIL_FROM },
+      recipients: [{ to: [{ email: ctx.email, name: ctx.full_name || undefined }], variables: { title, body: body || title, brand_name: brand.brandName, logo_url: brand.logoUrl || '', primary_color: brand.primaryColor, footer: brand.footer, html: extras.renderEmail(brand, { title, body: body || title }) } }],
+      from: { email: brand.fromAddress || process.env.MSG91_EMAIL_FROM, name: brand.fromName },
+      ...(brand.replyTo ? { reply_to: [{ email: brand.replyTo }] } : {}),
       domain: process.env.MSG91_EMAIL_DOMAIN,
       template_id: process.env.MSG91_EMAIL_TEMPLATE_ID,
     });

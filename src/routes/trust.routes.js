@@ -8,6 +8,10 @@ const { success } = require('../utils/response');
 const { forbidden } = require('../utils/httpError');
 const auditService = require('../services/audit.service');
 const trustService = require('../services/trust.service');
+const fields = require('../services/dynamicFields.service');
+
+// The KYC form's added fields (Dynamic Field Manager) are filled in with a KYC submission, against the user.
+const kycFields = fields.capture('kyc', { recordId: (req) => req.user.id, complete: true });
 const reviewService = require('../services/review.service');
 
 // Module 6 / sec. 8 - Trust & Reputation: trust score, badges, user
@@ -129,6 +133,7 @@ router.post(
   uploadDocumentFile.single('file'),
   [body('kind').isIn(['kyc', 'rera', 'gst', 'company', 'institutional_cert']), body('reference').optional().isString().isLength({ max: 120 })],
   validate,
+  (req, res, next) => (req.body.kind === 'kyc' ? kycFields(req, res, next) : next()),
   asyncHandler(async (req, res) => {
     let documentPath = null;
     if (req.file) {

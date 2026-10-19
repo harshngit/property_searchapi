@@ -613,11 +613,29 @@ async function releaseCommission(admin, id, payoutReference, meta = {}) {
   const frozen = await require('./userSuspension.service').frozenFor(id);
   if (frozen.length) throw badRequest(`Frozen: the share of ${frozen.map((f) => f.full_name).join(', ')} is held while the account is suspended. The Super Admin decides first.`);
   if (!payoutReference || String(payoutReference).trim().length < 3) throw badRequest('Enter the payout reference (UTR)');
-  const u = (await pool.query(`UPDATE franchisee_commissions SET status = 'released', released_at = now(), released_by = $2, payout_reference = $3 WHERE id = $1 RETURNING *`, [id, admin.id, String(payoutReference).trim()])).rows[0];
-  await auditService.log({ actor: admin, action: 'franchise.commission_released', entityType: 'franchisee_commission', entityId: id, after: { payoutReference }, ...meta });
-  const f = await row(c.franchisee_id);
-  await notify([f.admin_user_id], { type: 'franchise_commission', title: 'Commission released', message: `Your share ₹${Number(c.franchisee_base).toLocaleString('en-IN')} was paid. Reference ${String(payoutReference).trim()}.` });
-  return commissionView(u);
+  // Each GST-registered recipient's invoice to A R Buildwel must be approved; each share is paid net of TDS (unified per-PAN ledger).
+  const extras = require('./franchiseExtras.service');
+  const plan = await extras.releasePlan(c);
+  if (plan.missingInvoices.length) throw badRequest(`Waiting for an approved GST invoice from ${plan.missingInvoices.join(', ')}`);
+  const client = await pool.connect();
+  let u;
+  try {
+    await client.query('BEGIN');
+    u = (await client.query(`UPDATE franchisee_commissions SET status = 'released', released_at = now(), released_by = $2, payout_reference = $3 WHERE id = $1 AND status = 'releasable' RETURNING *`, [id, admin.id, String(payoutReference).trim()])).rows[0];
+    if (!u) throw badRequest('This commission has just been released');
+    await extras.recordRelease(client, c, plan.lines);
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+  await auditService.log({ actor: admin, action: 'franchise.commission_released', entityType: 'franchisee_commission', entityId: id, after: { payoutReference, lines: plan.lines.map((l) => ({ party: l.party, gross: l.base + l.gst, tds: l.tds, net: l.net })) }, ...meta });
+  for (const l of plan.lines) {
+    await notify([l.userId], { type: 'franchise_commission', title: 'Commission share paid', message: `₹${l.net.toLocaleString('en-IN')} paid${l.tds ? ` after TDS of ₹${l.tds.toLocaleString('en-IN')} (${l.tdsRate}%)` : ''}. Reference ${String(payoutReference).trim()}.` });
+  }
+  return { ...commissionView(u), payoutLines: await extras.payoutLines(id) };
 }
 
 // Correction of a settled calculation: Super Admin deletes it; the audit log keeps the record.
@@ -971,6 +989,8 @@ async function setDomain(admin, franchiseeId, { domainModel, host, domainActive,
     [franchiseeId, cleanHost ? domainModel : null, cleanHost, !!cleanHost && domainActive === true, brandMode || null]
   );
   await auditService.log({ actor: admin, action: 'franchise.domain_set', entityType: 'franchisee', entityId: franchiseeId, after: { host: cleanHost, domainModel, domainActive: !!domainActive, brandMode }, ...meta });
+  // DNS and certificate status is checked straight away (and every 6 hours after).
+  require('./franchiseExtras.service').checkDomain(franchiseeId).catch(() => {});
   return get(franchiseeId);
 }
 

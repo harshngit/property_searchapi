@@ -24,9 +24,11 @@ const ENTITIES = {
   crm_lead: { label: 'CRM lead', table: 'leads' },
   institution: { label: 'Institutional listing', table: 'properties', city: 'city', owner: 'created_by' },
   user_profile: { label: 'User profile', table: 'users' },
-  kyc: { label: 'KYC' },
-  due_diligence: { label: 'Due diligence' },
-  agreement: { label: 'Agreement' },
+  // Filled in on their own forms: the KYC submission, the due-diligence review
+  // of a listing and the agreement generated for a deal.
+  kyc: { label: 'KYC', form: 'The KYC submission (website profile and dashboard Trust page)' },
+  due_diligence: { label: 'Due diligence', form: 'The due-diligence review on a listing', table: 'properties', city: 'city' },
+  agreement: { label: 'Agreement', form: 'Generating an agreement document for a deal' },
   dashboard_widget: { label: 'Dashboard widget' },
 };
 const ROLES = ['customer', 'broker', 'agency_admin', 'builder', 'internal_sales', 'admin', 'super_admin', 'advertiser', 'franchisee_admin'];
@@ -191,7 +193,8 @@ const view = (f) => ({
   id: f.id, entityType: f.entity_type, section: f.section, module: f.module, name: f.field_name, label: f.field_label, type: f.field_type, helpText: f.help_text, placeholder: f.placeholder,
   validation: f.validation_rules || {}, required: f.is_required, displayOrder: f.display_order, defaultValue: f.default_value, options: f.options_json || [], conditionalLogic: f.conditional_logic,
   applicableStates: f.applicable_states || [], applicableCities: f.applicable_cities || [], applicableRoles: f.applicable_roles || [], visiblePublicly: f.is_visible_publicly, searchable: f.is_searchable, active: f.is_active,
-  system: f.is_system, locked: f.is_locked, coreKey: f.core_key, defaultLabel: f.default_label, optionsSource: f.options_source, moved: f.is_system && f.default_order !== null && f.display_order !== f.default_order,
+  system: f.is_system, locked: f.is_locked, coreKey: f.core_key, defaultLabel: f.default_label, optionsSource: f.options_source, defaultSection: f.default_section || null,
+  moved: f.is_system && ((f.default_order !== null && f.display_order !== f.default_order) || (!!f.default_section && f.section !== f.default_section)),
   createdAt: f.created_at, updatedAt: f.updated_at,
 });
 
@@ -317,7 +320,7 @@ async function listFields({ entityType, includeHidden = true } = {}) {
 
 function meta() {
   return {
-    entities: Object.entries(ENTITIES).map(([key, e]) => ({ key, label: e.label, inForms: !!e.table })),
+    entities: Object.entries(ENTITIES).map(([key, e]) => ({ key, label: e.label, inForms: !!e.table || !!e.form, form: e.form || null })),
     types: Object.entries(TYPES).map(([key, t]) => ({ key, label: t.label, hasOptions: !!t.options, isUpload: !!t.upload, neverPublic: PRIVATE_TYPES.includes(key) })),
     roles: ROLES, operators: OPERATORS, validationRules: RULE_KEYS,
     optionSources: Object.entries(SOURCES).map(([key, v]) => ({ key, label: v.label })),
@@ -361,15 +364,16 @@ async function createField(admin, data, meta_ = {}) {
 async function updateField(admin, id, data, meta_ = {}) {
   const current = (await pool.query('SELECT * FROM metadata_fields WHERE id = $1', [id])).rows[0];
   if (!current) throw notFound('Field not found');
-  // A built-in field: only how it is presented can change.
+  // A built-in field: how it is presented, and which section of its own form it sits in.
   if (current.is_system) {
     if (data.active === false && current.is_locked) throw badRequest('This field is needed on every record and cannot be hidden');
+    const place_ = await systemPlace(current, data);
     const label = data.label === undefined ? current.field_label : String(data.label).trim();
     if (label.length < 2 || label.length > 150) throw badRequest('Give the field a label (2 to 150 characters)');
     const sys = (await pool.query(
-      `UPDATE metadata_fields SET field_label = $1, help_text = $2, placeholder = $3, is_required = $4, is_active = $5, updated_by = $6, updated_at = now() WHERE id = $7 RETURNING *`,
+      `UPDATE metadata_fields SET field_label = $1, help_text = $2, placeholder = $3, is_required = $4, is_active = $5, updated_by = $6, updated_at = now(), section = $8, display_order = $9 WHERE id = $7 RETURNING *`,
       [label, data.helpText === undefined ? current.help_text : data.helpText ? String(data.helpText).slice(0, 300) : null, data.placeholder === undefined ? current.placeholder : data.placeholder ? String(data.placeholder).slice(0, 150) : null,
-        current.is_locked ? true : data.required === undefined ? current.is_required : !!data.required, data.active === undefined ? current.is_active : !!data.active, admin.id, id]
+        current.is_locked ? true : data.required === undefined ? current.is_required : !!data.required, data.active === undefined ? current.is_active : !!data.active, admin.id, id, place_.section, place_.displayOrder]
     )).rows[0];
     invalidate();
     await catalogue(sys);
@@ -392,12 +396,36 @@ async function updateField(admin, id, data, meta_ = {}) {
   return view(updated);
 }
 
+// The sections a built-in field can move to: those its form draws.
+async function homeSections(entityType) {
+  return [...new Set((await systemFields(entityType)).map((f) => f.default_section || f.section))];
+}
+
+// Where a built-in field goes: `putBack` returns it to the form's own place;
+// a new `section` must be one of its form's sections, and the field goes last there.
+async function systemPlace(current, data) {
+  if (data.putBack) return { section: current.default_section || current.section, displayOrder: current.default_order ?? current.display_order };
+  const section = data.section === undefined ? current.section : String(data.section).trim();
+  if (section === current.section) return { section, displayOrder: current.display_order };
+  const homes = await homeSections(current.entity_type);
+  if (!homes.includes(section)) throw badRequest(`A built-in field can move only to a section of its form: ${homes.join(', ')}`);
+  const last = (await pool.query('SELECT MAX(display_order) AS m FROM metadata_fields WHERE entity_type = $1 AND is_system AND section = $2', [current.entity_type, section])).rows[0].m;
+  return { section, displayOrder: last === null ? current.display_order : Number(last) + 1 };
+}
+
 // Drag-and-drop order: [{ id, displayOrder, section? }].
 async function reorder(admin, items, meta_ = {}) {
   if (!Array.isArray(items) || !items.length || items.length > 500) throw badRequest('Send the fields in their new order');
   for (const it of items) {
-    // A built-in field can change place inside its section, never its section.
-    await pool.query('UPDATE metadata_fields SET display_order = $1, section = CASE WHEN is_system THEN section ELSE COALESCE($2, section) END, updated_by = $3, updated_at = now() WHERE id = $4', [Number(it.displayOrder) || 0, it.section ? String(it.section).trim().slice(0, 80) : null, admin.id, it.id]);
+    // A built-in field can move only among the sections its form draws.
+    await pool.query(
+      `UPDATE metadata_fields f SET display_order = $1, updated_by = $3, updated_at = now(),
+         section = CASE WHEN NOT f.is_system THEN COALESCE($2, f.section)
+                        WHEN $2 IN (SELECT COALESCE(h.default_section, h.section) FROM metadata_fields h WHERE h.entity_type = f.entity_type AND h.is_system) THEN $2
+                        ELSE f.section END
+       WHERE f.id = $4`,
+      [Number(it.displayOrder) || 0, it.section ? String(it.section).trim().slice(0, 80) : null, admin.id, it.id]
+    );
   }
   invalidate();
   await auditService.log({ actor: admin, action: 'field.reordered', entityType: 'metadata_field', entityId: null, after: { fields: items.length }, ...meta_ });
@@ -494,9 +522,13 @@ async function form({ entityType, module, city, state, role } = {}) {
   // forms then lay their built-in fields out in that order.
   const core = {};
   const system = await systemFields(entityType);
-  const moved = system.some((f) => f.default_order !== null && f.display_order !== f.default_order);
+  // `section` is set only for a field moved out of the section its form draws it in.
+  const moved = system.some((f) => (f.default_order !== null && f.display_order !== f.default_order) || (f.default_section && f.section !== f.default_section));
   for (const f of system) {
-    core[f.core_key] = { label: f.field_label, relabelled: f.field_label !== f.default_label, helpText: f.help_text, placeholder: f.placeholder, required: f.is_required, hidden: !f.is_active, locked: f.is_locked, order: moved ? f.display_order : null };
+    core[f.core_key] = {
+      label: f.field_label, relabelled: f.field_label !== f.default_label, helpText: f.help_text, placeholder: f.placeholder, required: f.is_required, hidden: !f.is_active, locked: f.is_locked,
+      order: moved ? f.display_order : null, section: f.default_section && f.section !== f.default_section ? f.section : null,
+    };
   }
   return { entityType, stateCode: ctx.stateCode, sections, count: fields.length, core };
 }
@@ -690,21 +722,34 @@ async function recordPlace(entityType, id, body) {
 
 // On a route that creates or edits a record: validates body.customFields before
 // the handler runs, stores them once it has succeeded, and adds them to the reply.
-const capture = (entityType, { create = false, idFrom = (data) => data?.id } = {}) => async (req, res, next) => {
+//   recordId(req)  the record a form fills in, when it is not req.params.id
+//                  (e.g. the user for KYC, the deal for an agreement)
+//   complete       every required field must be filled in, as on a new record
+// A multipart form sends customFields as a JSON string.
+const capture = (entityType, { create = false, idFrom = (data) => data?.id, recordId, complete = false } = {}) => async (req, res, next) => {
   try {
+    if (typeof req.body?.customFields === 'string') {
+      try {
+        req.body.customFields = JSON.parse(req.body.customFields || '{}');
+      } catch {
+        throw badRequest('customFields must be JSON');
+      }
+    }
+    const whole = create || complete;
     const builtInRules = create && (await systemFields(entityType)).some((f) => f.is_active && f.is_required && !f.is_locked);
     if (!(await activeFields(entityType)).length && !builtInRules) return next();
-    if (req.body?.customFields === undefined && !create) return next();
-    const id = create ? null : req.params.id;
+    if (req.body?.customFields === undefined && !whole) return next();
+    const id = create ? null : recordId ? recordId(req) : req.params.id;
+    if (!create && !id) return next();
     const where = await recordPlace(entityType, id, req.body);
     const role = req.user?.role || null;
-    const cleaned = await validate(entityType, req.body?.customFields, { ...where, role, core: req.body || {}, partial: !create, existing: id ? await stored(entityType, id) : {} });
+    const cleaned = await validate(entityType, req.body?.customFields, { ...where, role, core: req.body || {}, partial: !whole, existing: id ? await stored(entityType, id) : {} });
     const json = res.json.bind(res);
     res.json = (payload) => {
-      const recordId = id || idFrom(payload?.data);
-      if (res.statusCode >= 400 || !recordId || !payload?.data) return json(payload);
-      save(entityType, recordId, cleaned, req.user?.id)
-        .then(() => read(entityType, recordId, { mode: 'full', role, ...where }))
+      const targetId = id || idFrom(payload?.data);
+      if (res.statusCode >= 400 || !targetId || !payload?.data) return json(payload);
+      save(entityType, targetId, cleaned, req.user?.id)
+        .then(() => read(entityType, targetId, { mode: 'full', role, ...where }))
         .then((cf) => json({ ...payload, data: { ...payload.data, customFields: cf.values, customFieldList: cf.list } }))
         .catch((err) => {
           console.error('[fields] values not saved:', err.message);
@@ -764,6 +809,6 @@ async function setValues(user, entityType, entityId, body = {}, meta_ = {}) {
 }
 
 module.exports = {
-  ENTITIES, TYPES, ROLES, registerType, meta, listFields, createField, updateField, reorder, deleteField,
+  ENTITIES, TYPES, ROLES, registerType, meta, homeSections, listFields, createField, updateField, reorder, deleteField,
   form, validate, missing, save, read, stored, searchProbes, searchSql, uploadFile, capture, expose, getValues, setValues, invalidate,
 };

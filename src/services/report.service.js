@@ -99,7 +99,8 @@ async function getPropertiesReport(user, { from, to } = {}) {
 }
 
 async function getBrokersReport(user, { from, to } = {}, forcedBrokerId) {
-  const leadsWhere = ['assigned_to IS NOT NULL'];
+  // Sec. 33.12: a related-party inquiry never scores for the employee it is linked to.
+  const leadsWhere = ['assigned_to IS NOT NULL', 'NOT (assigned_to = ANY(related_party_employee_ids))'];
   const leadsParams = [];
   tenantClause(user, '', leadsWhere, leadsParams);
   dateRangeClause('created_at', from, to, leadsWhere, leadsParams);

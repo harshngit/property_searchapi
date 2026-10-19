@@ -6,6 +6,11 @@ const asyncHandler = require('../utils/asyncHandler');
 const { success } = require('../utils/response');
 const auditService = require('../services/audit.service');
 const templates = require('../services/template.service');
+const fields = require('../services/dynamicFields.service');
+
+// A document generated for a deal carries the agreement form's added fields
+// (Dynamic Field Manager), saved against the deal.
+const agreementFields = fields.capture('agreement', { recordId: (req) => req.body?.dealId, complete: true });
 
 // Module 50 - Document Template Engine. Mounted at /api/templates.
 
@@ -79,6 +84,6 @@ router.post('/', authorize(...ADMIN), [body('body').isString().isLength({ min: 4
 router.get('/:id', idp, validate, h(async (req, res) => ok(res, 'Template', await templates.templateDetail(req.user, req.params.id))));
 router.put('/:id/status', authorize(...ADMIN), [...idp, body('status').isIn(['draft', 'active', 'retired'])], validate, h(async (req, res) => ok(res, 'Template updated', await templates.setStatus(req.user, req.params.id, req.body.status, meta(req)))));
 router.get('/:id/form', idp, validate, h(async (req, res) => ok(res, 'Template form', await templates.form(req.user, req.params.id, req.query))));
-router.post('/:id/generate', idp, validate, h(async (req, res) => ok(res, 'Document generated', await templates.generate(req.user, req.params.id, req.body, meta(req)), 201)));
+router.post('/:id/generate', [...idp, body('dealId').optional({ nullable: true }).isUUID()], validate, (req, res, next) => (req.body?.dealId && !req.body.blank ? agreementFields(req, res, next) : next()), h(async (req, res) => ok(res, 'Document generated', await templates.generate(req.user, req.params.id, req.body, meta(req)), 201)));
 
 module.exports = router;

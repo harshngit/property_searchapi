@@ -18,6 +18,9 @@ const ADMIN = ['admin', 'super_admin'];
 const meta = (req) => auditService.requestMeta(req);
 const ok = (res, message, data, code = 200) => success(res, code, message, data);
 router.use(authenticate);
+// Panel partners (advocates, loan and insurance officers) work their cases from /partner-desk only,
+// where each step they may take is checked - never through the client or staff routes here.
+router.use((req, res, next) => (['legal_professional', 'loan_officer', 'insurance_officer'].includes(req.user.role) ? res.status(403).json({ success: false, message: 'Use your partner desk for your cases', errors: null }) : next()));
 
 /**
  * @swagger

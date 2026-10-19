@@ -70,7 +70,9 @@ function analyseTrack(samples, task, c) {
   if (inside.length > 1 && maxGap > 4 * 60000) issues.push('gaps');
   if (fast) issues.push('impossible_speed');
   if (pts.length >= minSamples && new Set(pts.map((p) => `${Number(p.lat).toFixed(6)},${Number(p.lng).toFixed(6)}`)).size === 1) issues.push('no_gps_jitter');
-  return { ok: !issues.length, samples: pts.length, minutes: r1(minutes), need, issues, pathM: Math.round(path), arrived: pts[0].d !== null && pts[0].d > radius && inside.length > 0, maxGapSeconds: Math.round(maxGap / 1000) };
+  // Where it was recorded: the Field app (keeps going with the screen off) or a browser.
+  const sources = [...new Set(pts.map((p) => p.src || 'web'))];
+  return { ok: !issues.length, samples: pts.length, minutes: r1(minutes), need, issues, pathM: Math.round(path), arrived: pts[0].d !== null && pts[0].d > radius && inside.length > 0, maxGapSeconds: Math.round(maxGap / 1000), sources };
 }
 
 async function trackOf(assignmentId) {
@@ -93,7 +95,7 @@ async function recordTrack(user, assignmentId, points) {
     const lng = Number(p.longitude);
     if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) throw badRequest('Not a valid position');
     const t = p.at ? new Date(p.at) : null;
-    return { lat: Number(lat.toFixed(7)), lng: Number(lng.toFixed(7)), acc: Number.isFinite(Number(p.accuracy)) ? Math.round(Number(p.accuracy)) : null, t: t && !Number.isNaN(t.getTime()) ? t.toISOString() : now.toISOString(), r: now.toISOString(), mock: p.mocked === true || p.mocked === 'true' };
+    return { lat: Number(lat.toFixed(7)), lng: Number(lng.toFixed(7)), acc: Number.isFinite(Number(p.accuracy)) ? Math.round(Number(p.accuracy)) : null, t: t && !Number.isNaN(t.getTime()) ? t.toISOString() : now.toISOString(), r: now.toISOString(), mock: p.mocked === true || p.mocked === 'true', src: ['android', 'ios'].includes(p.source) ? p.source : 'web' };
   });
   // A track is capped: ten minutes needs a few dozen reports, not thousands.
   await pool.query(
@@ -104,7 +106,7 @@ async function recordTrack(user, assignmentId, points) {
   );
   const c = await wfh().cfg();
   const result = analyseTrack(await trackOf(assignmentId), a, c);
-  return { samples: result.samples, minutes: result.minutes, need: result.need, ok: result.ok, issues: result.issues.map((k) => TRACK_ISSUES[k]) };
+  return { samples: result.samples, minutes: result.minutes, need: result.need, ok: result.ok, issues: result.issues.map((k) => TRACK_ISSUES[k]), sources: result.sources || [] };
 }
 
 // ------------------------------------------------------------ photos

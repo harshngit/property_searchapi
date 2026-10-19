@@ -6,6 +6,7 @@ const auditService = require('./audit.service');
 const { getReadUrl } = require('../utils/storage');
 const { assertCleanContent } = require('../utils/contentGuard');
 const { badRequest, forbidden, notFound } = require('../utils/httpError');
+const userBlock = require('../utils/userBlock');
 
 // Module 24 - Legal Integration.
 //   Panel : empanelled advocates and registered valuers. The LP code is
@@ -74,7 +75,7 @@ async function newLpCode(client) {
 
 const proView = (p, { staff = false } = {}) => ({
   id: p.id, lpCode: p.lp_code, kind: p.kind, fullName: p.full_name, firmName: p.firm_name, states: p.states, cities: p.cities, specialities: p.specialities, status: p.status,
-  ...(staff ? { enrolmentNumber: p.enrolment_number, enrolmentBody: p.enrolment_body, email: p.email, mobile: p.mobile, verifiedAt: p.verified_at, verificationNote: p.verification_note, notes: p.notes, openCases: p.open_cases, completedCases: p.completed_cases, createdAt: p.created_at } : {}),
+  ...(staff ? { enrolmentNumber: p.enrolment_number, enrolmentBody: p.enrolment_body, email: p.email, mobile: p.mobile, verifiedAt: p.verified_at, verificationNote: p.verification_note, notes: p.notes, openCases: p.open_cases, completedCases: p.completed_cases, createdAt: p.created_at, hasLogin: !!p.user_id } : {}),
 });
 
 async function listProfessionals({ status = null, kind = null, city = null, q = null } = {}) {
@@ -126,6 +127,17 @@ async function saveProfessional(user, data, meta = {}) {
 }
 
 // Empanelment: the LP code is issued here, with what was checked recorded against it.
+// A partner's login follows their panel status: suspended locks it at once (sessions cut), reinstated opens it again.
+async function syncPartnerLogin(userId, panelActive) {
+  if (!userId) return;
+  await pool.query(`UPDATE users SET status = $2 WHERE id = $1 AND status IN ('active', 'suspended')`, [userId, panelActive ? 'active' : 'suspended']);
+  if (panelActive) userBlock.unblock(userId);
+  else {
+    userBlock.block(userId, 'suspended');
+    await pool.query('UPDATE refresh_tokens SET is_revoked = true WHERE user_id = $1', [userId]);
+  }
+}
+
 async function decideProfessional(user, id, { action, note }, meta = {}) {
   const p = (await pool.query('SELECT * FROM legal_professionals WHERE id = $1', [id])).rows[0];
   if (!p) throw notFound('Legal professional not found');
@@ -145,6 +157,7 @@ async function decideProfessional(user, id, { action, note }, meta = {}) {
       u = (await client.query(`UPDATE legal_professionals SET status = 'empanelled', lp_code = $2, verified_by = $3, verified_at = now(), verification_note = $4 WHERE id = $1 RETURNING *`, [id, code, user.id, String(note).trim()])).rows[0];
     }
     await client.query('COMMIT');
+    await syncPartnerLogin(u.user_id, u.status === 'empanelled');
     await auditService.log({ actor: user, action: `legal.professional_${action}`, entityType: 'legal_professional', entityId: id, before: { status: p.status }, after: { status: u.status, lpCode: u.lp_code, note }, ...meta });
     return proView(u, { staff: true });
   } catch (err) {
@@ -286,6 +299,12 @@ async function onMandateActivated(mandate) {
 async function caseRow(user, id) {
   const c = (await pool.query(`${CASE_SELECT} WHERE c.id = $1`, [id])).rows[0];
   if (!c) throw notFound('Legal case not found');
+  // An empanelled professional reaches only the cases assigned to them.
+  if (user.role === 'legal_professional') {
+    const mine = c.professional_id && (await pool.query(`SELECT 1 FROM legal_professionals WHERE id = $1 AND user_id = $2 AND status = 'empanelled'`, [c.professional_id, user.id])).rows.length;
+    if (!mine) throw notFound('Legal case not found');
+    return c;
+  }
   if (!isStaff(user) && c.requested_by !== user.id) {
     const own = (await pool.query('SELECT 1 FROM customers WHERE id = $1 AND user_id = $2', [c.customer_id, user.id])).rows.length;
     if (!own) throw notFound('Legal case not found');
@@ -446,7 +465,7 @@ async function forDeal(dealId) {
 }
 
 module.exports = {
-  SERVICES, SPECIALITIES, settings, addWorkingDays,
+  SERVICES, SERVICE_LABEL, SPECIALITIES, settings, addWorkingDays,
   listProfessionals, saveProfessional, decideProfessional,
   requestCase, openCase, onLegalEnquiry, onMandateActivated, getCase, myCases, listCases, assign, handoff, setStatus, cancelMine, linkDocument, forDeal,
 };

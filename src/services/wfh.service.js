@@ -82,7 +82,9 @@ async function amountFor(type, { city, propertyType } = {}) {
 
 async function getConfig() {
   const rows = (await pool.query('SELECT config_key, value, description, effective_from, updated_at FROM wfh_task_config ORDER BY (config_key LIKE \'%payment_default\') DESC, config_key')).rows;
-  const [rate, threshold, noPan] = await Promise.all([configService.getConfig('tax.payout_tds_percent', 5), configService.getConfig('tax.payout_tds_threshold', 15000), configService.getConfig('tax.payout_tds_no_pan_percent', 20)]);
+  // Statutory parameters in force today (Super Admin, with legal basis - tax.service).
+  const sp = await require('./tax.service').params();
+  const [rate, threshold, noPan] = [sp.rate, sp.threshold, sp.noPanRate];
   return { items: rows.map((r) => ({ key: r.config_key, value: r.value, description: r.description, isPayment: r.config_key.endsWith('_payment_default'), updatedAt: r.updated_at })), statutory: { tdsPercent: Number(rate), tdsThreshold: Number(threshold), tdsNoPanPercent: Number(noPan) }, taskTypes: Object.entries(TYPES).map(([key, t]) => ({ key, label: t.label })) };
 }
 
@@ -824,20 +826,21 @@ async function runPayouts(admin, { period } = {}, meta = {}) {
   if (!ADMIN.includes(admin.role)) throw forbidden('Only an admin runs payouts');
   const c = await cfg();
   const label = /^\d{4}-\d{2}$/.test(String(period || '')) ? period : new Date().toISOString().slice(0, 7);
-  const [rate, threshold, noPan] = (await Promise.all([configService.getConfig('tax.payout_tds_percent', 5), configService.getConfig('tax.payout_tds_threshold', 15000), configService.getConfig('tax.payout_tds_no_pan_percent', 20)])).map(Number);
+  const tax = require('./tax.service');
   const due = (await pool.query(
-    `SELECT e.worker_id, SUM(e.gross_amount)::float AS gross, w.bank_account_last4, w.pan_hash,
+    `SELECT e.worker_id, SUM(e.gross_amount)::float AS gross, w.bank_account_last4, w.pan_hash, u.full_name,
             (SELECT COALESCE(SUM(p.gross_amount), 0)::float FROM wfh_payouts p WHERE p.worker_id = e.worker_id AND p.created_at >= $1::date) AS fy_paid
-     FROM wfh_earnings e JOIN wfh_workers w ON w.user_id = e.worker_id
-     WHERE e.status = 'credited' AND e.payout_id IS NULL AND w.kyc_status = 'verified' AND w.status <> 'banned' GROUP BY e.worker_id, w.bank_account_last4, w.pan_hash HAVING SUM(e.gross_amount) >= $2`,
+     FROM wfh_earnings e JOIN wfh_workers w ON w.user_id = e.worker_id JOIN users u ON u.id = e.worker_id
+     WHERE e.status = 'credited' AND e.payout_id IS NULL AND w.kyc_status = 'verified' AND w.status <> 'banned' GROUP BY e.worker_id, w.bank_account_last4, w.pan_hash, u.full_name HAVING SUM(e.gross_amount) >= $2`,
     [fyStart(), n(c, 'min_payout', 500)]
   )).rows;
   const created = [];
   for (const d of due) {
-    // TDS applies once the year's total crosses the threshold - on this payout in full from then on.
-    const crosses = d.fy_paid + d.gross > threshold;
-    const pct = crosses ? (d.pan_hash ? rate : noPan) : 0;
-    const tds = r2((d.gross * pct) / 100);
+    // TDS from the unified per-PAN ledger: the threshold counts everything A R
+    // Buildwel has paid this PAN this year, commission settlements included.
+    const t = await tax.compute({ panHash: d.pan_hash, userId: d.worker_id, gross: d.gross });
+    const pct = t.rate;
+    const tds = t.tds;
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -847,6 +850,7 @@ async function runPayouts(admin, { period } = {}, meta = {}) {
         [`WFH/${label}/${String(seq).padStart(5, '0')}`, d.worker_id, label, d.gross, tds, r2(d.gross - tds), pct, d.bank_account_last4]
       )).rows[0];
       await client.query(`UPDATE wfh_earnings SET payout_id = $1, tds_amount = round(gross_amount * $2 / 100.0, 2), net_amount = gross_amount - round(gross_amount * $2 / 100.0, 2) WHERE worker_id = $3 AND status = 'credited' AND payout_id IS NULL`, [p.id, pct, d.worker_id]);
+      await tax.record({ panHash: d.pan_hash, userId: d.worker_id, payeeName: d.full_name, source: 'wfh', sourceRef: p.id, fy: t.fy, gross: d.gross, rate: pct, tds }, client);
       await client.query('COMMIT');
       created.push({ id: p.id, payoutNumber: p.payout_number, workerId: d.worker_id, gross: d.gross, tds, net: r2(d.gross - tds) });
       const gstFlag = n(c, 'gst_flag_amount', 2000000);

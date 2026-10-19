@@ -281,8 +281,12 @@ test('opportunity listing: scores computed, approval alerts matched verified inv
 
   const approve = await api('PUT', `/properties/${ctx.auctionId}/approve`, { token: ctx.admin.token });
   assert.equal(approve.status, 200);
-  await new Promise((r) => setTimeout(r, 400)); // alerts are fire-and-forget
-  const alerts = await pool.query('SELECT * FROM opportunity_alert_log WHERE property_id = $1 AND user_id = $2', [ctx.auctionId, ctx.customer.id]);
+  // Alerts are fire-and-forget: wait for them (up to 5 seconds).
+  let alerts = { rows: [] };
+  for (let i = 0; i < 25 && !alerts.rows.length; i += 1) {
+    await new Promise((r) => setTimeout(r, 200));
+    alerts = await pool.query('SELECT * FROM opportunity_alert_log WHERE property_id = $1 AND user_id = $2', [ctx.auctionId, ctx.customer.id]);
+  }
   assert.equal(alerts.rows.length, 1, 'matched verified investor alerted once');
   const again = await api('POST', `/opportunities/${ctx.auctionId}/send-alerts`, { token: ctx.admin.token });
   assert.equal(again.data.sent, 0, 'no duplicate alert');
@@ -4494,6 +4498,14 @@ test('franchise: organisation + FR code, pincode territories, territory step bef
   // Payment gating, release, and Super Admin correction.
   assert.equal((await api('POST', `/franchise/commissions/${calcA.data.id}/release`, { token: A, body: { payoutReference: 'UTR-A' } })).status, 400, 'nothing released before the client pays');
   await pool.query(`UPDATE invoices SET status = 'paid', paid_at = now() WHERE deal_id = $1`, [dealA]);
+  // Each GST-registered recipient's invoice for their share has been approved (franchise extras test covers the upload).
+  const relShares = (await pool.query('SELECT shares FROM franchisee_commissions WHERE id = $1', [calcA.data.id])).rows[0].shares;
+  for (const sh of relShares.filter((x) => x.userId && x.gstRegistered && ['franchisee', 'broker'].includes(x.party))) {
+    await pool.query(
+      `INSERT INTO commission_invoices (commission_id, user_id, party, invoice_number, invoice_date, supplier_gstin, taxable_amount, gst_amount, total_amount, file_path, status) VALUES ($1, $2, $3, $4, CURRENT_DATE, '07AAAAA0000A1Z5', $5, $6, $7, 'not-stored/test.pdf', 'approved')`,
+      [calcA.data.id, sh.userId, sh.party, `T-${sh.party}`, sh.base, sh.gst, sh.total]
+    );
+  }
   const rel = await api('POST', `/franchise/commissions/${calcA.data.id}/release`, { token: A, body: { payoutReference: 'UTR-A' } });
   assert.equal(rel.status, 200, JSON.stringify(rel.body));
   assert.equal(rel.data.status, 'released');
@@ -5428,6 +5440,10 @@ test('WFH fraud layers: declared family + Aadhaar / bank / team cross-check, 10-
     const t1 = await api('POST', `/wfh/assignments/${V1}/track`, { token: w1.token, body: { points: [{ latitude: near(300), longitude: LNG, accuracy: 12 }, { latitude: near(20), longitude: LNG, accuracy: 9 }] } });
     assert.equal(t1.status, 200, JSON.stringify(t1.body));
     assert.deepEqual([t1.data.samples, t1.data.need, t1.data.ok], [2, 10, false]);
+    assert.deepEqual(t1.data.sources, ['web']);
+    // The Field app reports in the background; where each report came from is kept for the reviewer.
+    const t1b = await api('POST', `/wfh/assignments/${V1}/track`, { token: w1.token, body: { points: [{ latitude: near(15), longitude: LNG, accuracy: 8, source: 'android' }, { latitude: near(12), longitude: LNG, accuracy: 8, source: 'not-a-platform' }] } });
+    assert.deepEqual(t1b.data.sources.sort(), ['android', 'web']);
     // The family number is refused whatever else is right.
     const famTry = await form(`/wfh/assignments/${V1}/submit`, w1.token, { latitude: near(20), longitude: LNG, partyPhone: famPhone, partyName: 'Spouse' });
     assert.equal(famTry.status, 400);
@@ -5897,7 +5913,7 @@ test('dynamic field manager: Super Admin adds fields without code - 17 types, va
       assert.deepEqual([re.data.label, re.data.required, re.data.type], ['Direction it faces', true, 'text'], 'only the presentation changes');
       await api('PUT', `/fields/${furnishing.id}`, { token: SA, body: { active: false } });
       const core = (await api('GET', `/fields/form?entityType=property&city=${encodeURIComponent(TG)}`)).data.core;
-      assert.deepEqual(core.facing, { label: 'Direction it faces', relabelled: true, helpText: 'As per the sale deed', placeholder: null, required: true, hidden: false, locked: false, order: null });
+      assert.deepEqual(core.facing, { label: 'Direction it faces', relabelled: true, helpText: 'As per the sale deed', placeholder: null, required: true, hidden: false, locked: false, order: null, section: null });
       assert.ok(core.furnishing.hidden && core.title.locked && !core.title.relabelled);
       const noFacing = await api('POST', '/properties', { token: B, body: listing() });
       assert.equal(noFacing.status, 422);
@@ -6220,4 +6236,517 @@ test('section 35 suspension: one atomic public erasure (listings, requirements, 
   assert.match((await api('GET', '/user/my-data', { token: gone.token })).status === 200 ? 'ok' : 'blocked', /ok/);
   assert.match((await api('GET', '/me/profile', { token: gone.token })).body.message, /removed/);
   await pool.query(`UPDATE properties SET status = 'inactive' WHERE city = $1`, [SCITY]);
+});
+
+test('franchise extras: statutory TDS versions, unified per-PAN ledger, GST invoices gate commission payout, net-of-TDS payout lines, branded email, domain DNS / SSL status and TLS ask, row-level security for franchisee sessions', async () => {
+  const tax = require('../src/services/tax.service');
+  const extras = require('../src/services/franchiseExtras.service');
+  const A = ctx.admin.token;
+  const S = ctx.superAdmin.token;
+  const R = RUN.toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const loginAs = async (email) => (await api('POST', '/auth/login', { body: { identifier: email, password: PASSWORD } })).data.accessToken;
+  const fr = await api('POST', '/franchise', { token: A, body: { legalName: `Extras Realty ${RUN}`, slug: `extras-${RUN}`, adminEmail: `extras.${RUN}@e2e.test`, adminPassword: PASSWORD, gstin: `07ABCDE${R.slice(0, 4).replace(/[^0-9]/g, '1').padEnd(4, '1')}F1Z5`.slice(0, 15) } });
+  assert.equal(fr.status, 201, JSON.stringify(fr.body));
+  const F = (await pool.query('SELECT * FROM franchisees WHERE id = $1', [fr.data.id])).rows[0];
+  const FT = await loginAs(`extras.${RUN}@e2e.test`);
+  const broker = await createUser('broker', 'extrasbroker');
+  const panB = `BRKPA${String(Math.floor(1000 + Math.random() * 8999))}Z`;
+
+  // ---- statutory parameters: Super Admin only, never backdated, never edited
+  const st = await api('GET', '/tax/statutory', { token: ctx.sales.token });
+  assert.ok(st.data.inForce.rate > 0 && st.data.versions.length >= 3);
+  const tomorrow = new Date(Date.now() + 86400000).toISOString().slice(0, 10);
+  assert.equal((await api('POST', '/tax/statutory', { token: A, body: { key: 'tds_commission_percent', value: 2, effectiveFrom: tomorrow, legalBasis: 'Finance Act test amendment' } })).status, 403);
+  assert.equal((await api('POST', '/tax/statutory', { token: S, body: { key: 'tds_commission_percent', value: 2, effectiveFrom: '2020-01-01', legalBasis: 'Finance Act test amendment' } })).status, 400, 'never backdated');
+  assert.equal((await api('POST', '/tax/statutory', { token: S, body: { key: 'tds_commission_percent', value: 2, effectiveFrom: tomorrow, legalBasis: 'x' } })).status, 400, 'legal basis required');
+  const far = `2099-0${1 + Math.floor(Math.random() * 8)}-${String(10 + Math.floor(Math.random() * 18))}`;
+  const added = await api('POST', '/tax/statutory', { token: S, body: { key: 'tds_commission_percent', value: 2, effectiveFrom: far, legalBasis: 'Test: Finance Act amendment to s. 194H, CBDT notification' } });
+  assert.equal(added.status, 201, JSON.stringify(added.body));
+  const today = await tax.params();
+  assert.equal((await tax.params(new Date(`${far}T12:00:00Z`))).rate, 2, 'the new rate applies from its date');
+  assert.notEqual(today.rate, 2, 'not before');
+  await assert.rejects(pool.query(`UPDATE statutory_parameters SET value = 9 WHERE effective_from = $1`, [far]), /never edited/);
+
+  // ---- tax profile: PAN / GSTIN checks
+  assert.equal((await api('PUT', '/tax/profile', { token: broker.token, body: { pan: 'NOTAPAN' } })).status, 400);
+  assert.equal((await api('PUT', '/tax/profile', { token: broker.token, body: { pan: panB, gstin: '07AAAAA0000A1Z5' } })).status, 400, 'GSTIN must carry the PAN');
+  const prof = await api('PUT', '/tax/profile', { token: broker.token, body: { legalName: 'Extras Broker Proprietor', pan: panB, gstin: `07${panB}1Z5` } });
+  assert.equal(prof.status, 200, JSON.stringify(prof.body));
+  assert.deepEqual([prof.data.panLast4, prof.data.hasPan, prof.data.panVerified], [panB.slice(-4), true, false]);
+  assert.ok(!('pan' in prof.data) && !('panEncrypted' in prof.data), 'the PAN itself is never returned (the GSTIN is a public business number)');
+  assert.equal((await api('POST', `/tax/profiles/${broker.id}/verify`, { token: ctx.sales.token })).data.panVerified, true);
+
+  // ---- a commission: the broker is GST-registered, the franchisee has a GSTIN
+  const deal = (await pool.query(`INSERT INTO deals (customer_id, broker_id, stage, deal_value) VALUES ((SELECT id FROM customers LIMIT 1), $1, 'closed_won', 10000000) RETURNING id`, [broker.id])).rows[0].id;
+  const shares = [
+    { party: 'franchisee', userId: F.admin_user_id, name: `Extras Realty ${RUN}`, roles: ['Broker (buyer side)'], base: 100000, gstRegistered: true, gst: 18000, total: 118000 },
+    { party: 'broker', userId: broker.id, name: `extrasbroker ${RUN}`, roles: ['Broker (seller side)'], base: 60000, gstRegistered: true, gst: 10800, total: 70800 },
+    { party: 'arb', userId: null, name: 'A R Buildwel', roles: ['Central share'], base: 40000, gstRegistered: false, gst: 0, total: 40000 },
+  ];
+  const C = (await pool.query(`INSERT INTO franchisee_commissions (franchisee_id, deal_id, deal_value, pool_amount, scenario, shares, status, franchisee_base) VALUES ($1, $2, 10000000, 200000, 'with_broker', $3, 'releasable', 100000) RETURNING id`, [F.id, deal, JSON.stringify(shares)])).rows[0].id;
+
+  // Release waits for both GST invoices.
+  const early = await api('POST', `/franchise/commissions/${C}/release`, { token: A, body: { payoutReference: 'UTR-EXTRA-1' } });
+  assert.equal(early.status, 400);
+  assert.match(early.body.message, /approved GST invoice from .*Extras Realty.*extrasbroker/);
+  const send = async (path, token, fields) => {
+    const fd = new FormData();
+    for (const [k, v] of Object.entries(fields)) fd.append(k, String(v));
+    fd.append('file', new Blob([Buffer.from('%PDF-1.4 invoice')], { type: 'application/pdf' }), 'invoice.pdf');
+    const res = await fetch(`${BASE}${path}`, { method: 'POST', headers: { authorization: `Bearer ${token}` }, body: fd });
+    return { status: res.status, body: await res.json() };
+  };
+  const brokerInv = { invoiceNumber: `BRK/${R}/1`, invoiceDate: new Date().toISOString().slice(0, 10), supplierGstin: `07${panB}1Z5`, taxableAmount: 60000, gstAmount: 10800 };
+  assert.match((await send(`/tax/commission-shares/${C}/invoice`, broker.token, { ...brokerInv, taxableAmount: 65000 })).body.message, /must be your share/);
+  assert.equal((await send(`/tax/commission-shares/${C}/invoice`, ctx.broker.token, brokerInv)).status, 403, 'not their share');
+  const bi = await send(`/tax/commission-shares/${C}/invoice`, broker.token, brokerInv);
+  assert.equal(bi.status, 201, JSON.stringify(bi.body));
+  assert.equal((await send(`/tax/commission-shares/${C}/invoice`, broker.token, brokerInv)).status, 400, 'one live invoice per share');
+  const fi = await send(`/franchisee/shares/${C}/invoice`, FT, { invoiceNumber: `FR/${R}/1`, invoiceDate: new Date().toISOString().slice(0, 10), supplierGstin: F.gstin, taxableAmount: 100000, gstAmount: 18000 });
+  assert.equal(fi.status, 201, JSON.stringify(fi.body));
+  const queue = await api('GET', '/franchise/commission-invoices?status=submitted', { token: ctx.sales.token });
+  assert.ok(queue.data.filter((i) => i.commissionId === C).length === 2);
+  assert.equal((await api('POST', `/franchise/commission-invoices/${fi.body.data.id}/review`, { token: A, body: { decision: 'reject' } })).status, 400, 'a rejection needs a reason');
+  await api('POST', `/franchise/commission-invoices/${fi.body.data.id}/review`, { token: A, body: { decision: 'reject', note: 'Wrong place of supply' } });
+  const fi2 = await send(`/franchisee/shares/${C}/invoice`, FT, { invoiceNumber: `FR/${R}/2`, invoiceDate: new Date().toISOString().slice(0, 10), supplierGstin: F.gstin, taxableAmount: 100000, gstAmount: 18000 });
+  assert.equal(fi2.status, 201, 'a rejected invoice can be replaced');
+  for (const id of [bi.body.data.id, fi2.body.data.id]) assert.equal((await api('POST', `/franchise/commission-invoices/${id}/review`, { token: A, body: { decision: 'approve' } })).data.status, 'approved');
+
+  // ---- payout: net of TDS, using the unified ledger (a WFH payout to the same PAN counts)
+  await tax.record({ panHash: tax.panHash(panB), panLast4: panB.slice(-4), userId: broker.id, payeeName: 'earlier field payout', source: 'wfh', sourceRef: deal, fy: tax.fyOf(), gross: 1000, rate: 0, tds: 0 });
+  const plan = await api('GET', `/franchise/commissions/${C}/release-plan`, { token: ctx.sales.token });
+  assert.deepEqual(plan.data.missingInvoices, []);
+  const rate = today.rate;
+  const bLine = plan.data.lines.find((l) => l.party === 'broker');
+  assert.deepEqual([bLine.base, bLine.gst, bLine.tdsRate, bLine.tds, bLine.net], [60000, 10800, rate, Math.round(60000 * rate) / 100, 70800 - Math.round(60000 * rate) / 100], 'TDS on the amount before GST');
+  assert.ok(!('panHash' in bLine));
+  const rel = await api('POST', `/franchise/commissions/${C}/release`, { token: A, body: { payoutReference: 'UTR-EXTRA-1' } });
+  assert.equal(rel.status, 200, JSON.stringify(rel.body));
+  assert.equal(rel.data.payoutLines.length, 2, 'one line per person; A R Buildwel keeps its own share');
+  const total = await tax.yearTotal({ panHash: tax.panHash(panB), fy: tax.fyOf() });
+  assert.equal(total, 61000, 'commission and field payouts to one PAN are counted together');
+  await assert.rejects(pool.query(`DELETE FROM tds_ledger WHERE user_id = $1`, [broker.id]), /append-only/);
+  const mine = await api('GET', '/tax/commission-shares', { token: broker.token });
+  const s1 = mine.data.shares.find((x) => x.commissionId === C);
+  assert.deepEqual([s1.invoice.status, s1.paid.tds, s1.paid.net], ['approved', bLine.tds, bLine.net]);
+  assert.ok((await pool.query(`SELECT 1 FROM notifications WHERE user_id = $1 AND title = 'Commission share paid'`, [broker.id])).rows.length);
+  const led = await api('GET', `/tax/ledger?fy=${tax.fyOf()}&q=${panB.slice(-4)}`, { token: ctx.sales.token });
+  assert.ok(led.data.payees.some((p) => p.panLast4 === panB.slice(-4) && p.commissionPayouts === 1 && p.wfhPayouts === 1));
+  assert.equal((await api('GET', '/tax/ledger', { token: broker.token })).status, 403);
+
+  // ---- branded email
+  await pool.query(`UPDATE franchisee_branding SET brand_mode = 'white_label', brand_name = $2, primary_color = '#0055aa', published_at = now(), email_from_name = 'Extras Homes' WHERE franchisee_id = $1`, [F.id, `Extras Homes ${RUN}`]);
+  await pool.query(`UPDATE franchisees SET status = 'active' WHERE id = $1`, [F.id]);
+  const fBroker = await createUser('broker', 'extrasfbroker');
+  await pool.query('UPDATE users SET tenant_id = $1 WHERE id = $2', [F.tenant_id, fBroker.id]);
+  const brand = await extras.brandFor(fBroker.id);
+  assert.deepEqual([brand.franchise, brand.brandName, brand.primaryColor, brand.fromName], [true, `Extras Homes ${RUN}`, '#0055aa', 'Extras Homes']);
+  assert.equal((await extras.brandFor(ctx.customer.id)).brandName, 'PropertySerch');
+  const html = extras.renderEmail(brand, { title: 'Visit <confirmed>', body: 'See you there' });
+  assert.ok(html.includes(`Extras Homes ${RUN}`) && html.includes('#0055aa') && html.includes('Visit &lt;confirmed&gt;'), 'branded and escaped');
+  assert.equal((await api('PUT', `/franchise/${F.id}/email-sender`, { token: A, body: { fromAddress: 'not an email' } })).status, 400);
+  assert.equal((await api('PUT', `/franchise/${F.id}/email-sender`, { token: A, body: { fromAddress: 'hello@extrashomes.example', replyTo: 'care@extrashomes.example' } })).data.fromAddress, 'hello@extrashomes.example');
+  assert.equal((await api('GET', '/franchisee/email-preview', { token: FT })).data.brand.fromAddress, 'hello@extrashomes.example');
+
+  // ---- domains: DNS / certificate states, the live checker, and the TLS ask endpoint
+  const st1 = extras.domainState({ host: 'a.example.com', target: 'partners.propertyserch.com', cnames: [], addresses: [] });
+  assert.equal(st1.status, 'pending_dns');
+  assert.equal(extras.domainState({ host: 'a.example.com', target: 'partners.propertyserch.com', cnames: ['partners.propertyserch.com.'] }).status, 'ssl_pending');
+  const cert = { validTo: new Date(Date.now() + 60 * 86400000).toUTCString(), issuer: "Let's Encrypt", subjectCN: 'a.example.com', altNames: ['a.example.com'] };
+  assert.equal(extras.domainState({ host: 'a.example.com', target: '10.0.0.5', addresses: ['10.0.0.5'], cert }).status, 'live');
+  assert.equal(extras.domainState({ host: 'a.example.com', target: '10.0.0.5', addresses: ['10.0.0.5'], cert: { ...cert, subjectCN: 'other.com', altNames: [] } }).status, 'error');
+  assert.equal(extras.domainState({ host: 'x.propertyserch.com', target: 'p.propertyserch.com', cnames: ['p.propertyserch.com'], cert: { ...cert, subjectCN: '*.propertyserch.com', altNames: [] } }).status, 'live', 'a wildcard covers subdomains');
+  const host = `extras-${RUN.toLowerCase()}.invalid`;
+  await pool.query(`UPDATE franchisee_branding SET host = $2, domain_model = 'own_domain', domain_active = true WHERE franchisee_id = $1`, [F.id, host]);
+  const chk = await api('POST', `/franchise/${F.id}/domain/check`, { token: A });
+  assert.equal(chk.status, 200, JSON.stringify(chk.body));
+  assert.equal(chk.data.status, 'pending_dns');
+  assert.match(chk.data.detail, /does not resolve yet/);
+  assert.equal((await fetch(`${BASE}/branding/tls-allowed?domain=${host}`)).status, 200);
+  assert.equal((await fetch(`${BASE}/branding/tls-allowed?domain=evil-${RUN}.example`)).status, 404);
+  await pool.query('UPDATE franchisee_branding SET domain_active = false WHERE franchisee_id = $1', [F.id]);
+  assert.equal((await fetch(`${BASE}/branding/tls-allowed?domain=${host}`)).status, 404, 'switched off - no certificate');
+
+  // ---- row-level security: a franchisee session sees only its own rows, even without a WHERE clause
+  const role = 'ps_rls_check';
+  await pool.query(`DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${role}') THEN CREATE ROLE ${role} NOLOGIN; END IF; END $$`);
+  await pool.query(`GRANT SELECT ON leads, franchisee_commissions, franchisee_tickets TO ${role}`);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`SET LOCAL ROLE ${role}`);
+    const all = (await client.query('SELECT COUNT(*)::int AS n FROM franchisee_commissions')).rows[0].n;
+    await client.query(`SELECT set_config('app.franchisee_id', $1, true), set_config('app.franchise_tenant_id', $2, true)`, [F.id, F.tenant_id]);
+    const scoped = (await client.query('SELECT DISTINCT franchisee_id FROM franchisee_commissions')).rows;
+    assert.ok(all > 1);
+    assert.deepEqual(scoped.map((r) => r.franchisee_id), [F.id], 'only its own commissions');
+    assert.equal((await client.query('SELECT COUNT(*)::int AS n FROM leads WHERE franchisee_id IS DISTINCT FROM $1 AND tenant_id IS DISTINCT FROM $2', [F.id, F.tenant_id])).rows[0].n, 0, 'no other franchise\'s leads');
+    await client.query('ROLLBACK');
+  } finally {
+    client.release();
+  }
+  // And through the API, a franchisee request runs under that scope.
+  assert.equal((await api('GET', '/franchisee/dashboard', { token: FT })).status, 200);
+  assert.ok((await api('GET', '/franchisee/shares', { token: FT })).data.shares.every((x) => x.commissionId === C));
+});
+
+test('site configuration: super admin edits dropdown lists and content; fixed lists keep their values; public read reflects changes', async () => {
+  const root = await createUser('super_admin', 'siteconf-root');
+  const admin = await createUser('admin', 'siteconf-admin');
+  const LIST = 'dashboard.transaction_type';
+  const OPEN = 'dashboard.furnishing';
+  const before = (await api('GET', '/site-config/manage', { token: root.token })).data;
+  const orig = (k) => before.lists.find((l) => l.key === k).options;
+  try {
+    // Public read: visible options and content, no sign-in.
+    const pub = await api('GET', '/site-config?app=website');
+    assert.equal(pub.status, 200);
+    assert.ok(pub.data.options.deal_ticket_band.every((o) => o.value && o.label));
+    assert.equal(typeof pub.data.content.hero_title_line1, 'string');
+    assert.equal((await api('GET', '/site-config?app=nope')).status, 422);
+
+    // Only the Super Admin manages it.
+    assert.equal((await api('GET', '/site-config/manage', { token: admin.token })).status, 403);
+    assert.equal((await api('PUT', `/site-config/manage/lists/${LIST}`, { token: admin.token, body: { options: orig(LIST) } })).status, 403);
+
+    // A fixed list: rename / reorder / hide, never add or remove.
+    const add = await api('PUT', `/site-config/manage/lists/${LIST}`, { token: root.token, body: { options: [...orig(LIST), { value: 'lease', label: 'Lease' }] } });
+    assert.equal(add.status, 400);
+    assert.match(add.body.message, /not added or removed/);
+    assert.equal((await api('PUT', `/site-config/manage/lists/${LIST}`, { token: root.token, body: { options: [orig(LIST)[0]] } })).status, 400, 'cannot drop a value');
+    assert.equal((await api('PUT', `/site-config/manage/lists/${LIST}`, { token: root.token, body: { options: orig(LIST).map((o) => ({ ...o, active: false })) } })).status, 400, 'one option stays visible');
+    const renamed = await api('PUT', `/site-config/manage/lists/${LIST}`, {
+      token: root.token,
+      body: { options: [{ value: 'rent', label: `Rent ${RUN}` }, { value: 'sell', label: 'Sale', active: false }] },
+    });
+    assert.equal(renamed.status, 200, JSON.stringify(renamed.body));
+    assert.equal(renamed.data.customised, true);
+    const dash = (await api('GET', '/site-config?app=dashboard')).data;
+    assert.deepEqual(dash.options.transaction_type, [{ value: 'rent', label: `Rent ${RUN}` }], 'hidden option left out, new order and label');
+
+    // An editable list takes new options; duplicates are refused.
+    assert.equal((await api('PUT', `/site-config/manage/lists/${OPEN}`, { token: root.token, body: { options: [{ value: 'A', label: 'A' }, { value: 'A', label: 'B' }] } })).status, 400);
+    const grown = await api('PUT', `/site-config/manage/lists/${OPEN}`, { token: root.token, body: { options: [...orig(OPEN), { value: `Bare shell ${RUN}`, label: 'Bare shell' }] } });
+    assert.equal(grown.status, 200, JSON.stringify(grown.body));
+    assert.ok((await api('GET', '/site-config?app=dashboard')).data.options.furnishing.some((o) => o.value === `Bare shell ${RUN}`));
+
+    // Reset puts the original back.
+    const reset = await api('POST', `/site-config/manage/lists/${LIST}/reset`, { token: root.token });
+    assert.deepEqual(reset.data.options.map((o) => [o.value, o.label]), [['sell', 'For Sale'], ['rent', 'For Rent / Lease']]);
+    assert.equal(reset.data.customised, false);
+
+    // Content: validated by kind; empty = back to the default.
+    assert.equal((await api('PUT', '/site-config/manage/content/website.contact_email', { token: root.token, body: { value: 'not-an-email' } })).status, 400);
+    assert.equal((await api('PUT', '/site-config/manage/content/website.social_x', { token: root.token, body: { value: 'javascript:alert(1)' } })).status, 400);
+    assert.equal((await api('PUT', '/site-config/manage/content/website.hero_title_line1', { token: root.token, body: { value: 'x'.repeat(81) } })).status, 400, 'too long');
+    const set = await api('PUT', '/site-config/manage/content/website.hero_title_line1', { token: root.token, body: { value: `Headline ${RUN}` } });
+    assert.equal(set.status, 200, JSON.stringify(set.body));
+    assert.equal((await api('GET', '/site-config?app=website')).data.content.hero_title_line1, `Headline ${RUN}`);
+    await api('PUT', '/site-config/manage/content/website.hero_title_line1', { token: root.token, body: { value: '' } });
+    assert.equal((await api('GET', '/site-config?app=website')).data.content.hero_title_line1, before.content.find((c) => c.key === 'website.hero_title_line1').defaultValue);
+
+    // Every change is audit-logged.
+    const logs = await pool.query(`SELECT action FROM audit_logs WHERE actor_id = $1 AND action LIKE 'site_config.%'`, [root.id]);
+    assert.ok(logs.rows.length >= 5);
+  } finally {
+    for (const k of [LIST, OPEN]) await api('PUT', `/site-config/manage/lists/${k}`, { token: root.token, body: { options: orig(k) } });
+    const h = before.content.find((c) => c.key === 'website.hero_title_line1');
+    await api('PUT', '/site-config/manage/content/website.hero_title_line1', { token: root.token, body: { value: h.value || '' } });
+  }
+});
+
+test('field manager extras: built-in fields move between their form\'s sections and back; KYC, due diligence and agreement fields are filled on their own forms', async () => {
+  const root = await createUser('super_admin', 'fmx-root');
+  const R = root.token;
+  const made = [];
+  try {
+    // ---- a built-in field moves only among the sections its form draws, and can be put back
+    const facing = (await api('GET', '/fields?entityType=property', { token: R })).data.find((f) => f.coreKey === 'facing');
+    const home = { section: facing.section, order: facing.displayOrder };
+    const nowhere = await api('PUT', `/fields/${facing.id}`, { token: R, body: { section: 'Nowhere' } });
+    assert.equal(nowhere.status, 400);
+    assert.match(nowhere.body.message, /only to a section of its form/);
+    const moved = await api('PUT', `/fields/${facing.id}`, { token: R, body: { section: 'Property details' } });
+    assert.equal(moved.status, 200, JSON.stringify(moved.body));
+    assert.equal(moved.data.section, 'Property details');
+    assert.equal(moved.data.defaultSection, home.section);
+    assert.equal(moved.data.moved, true);
+    const core = (await api('GET', '/fields/form?entityType=property')).data.core;
+    assert.equal(core.facing.section, 'Property details', 'the forms are told where to draw it');
+    assert.equal(core.city.section, null, 'fields left alone stay put');
+    // Drag-and-drop cannot carry a built-in field out of its form's sections.
+    await api('PUT', '/fields/reorder', { token: R, body: { items: [{ id: facing.id, displayOrder: moved.data.displayOrder, section: 'Somewhere else' }] } });
+    assert.equal((await api('GET', '/fields?entityType=property', { token: R })).data.find((f) => f.id === facing.id).section, 'Property details');
+    const back = await api('PUT', `/fields/${facing.id}`, { token: R, body: { putBack: true } });
+    assert.deepEqual([back.data.section, back.data.displayOrder, back.data.moved], [home.section, home.order, false]);
+
+    const addField = async (entityType, label) => {
+      const r = await api('POST', '/fields', { token: R, body: { entityType, label: `${label} ${RUN}`, type: 'text', section: 'Details', required: true } });
+      assert.equal(r.status, 201, JSON.stringify(r.body));
+      made.push(r.data.id);
+      return r.data.name;
+    };
+
+    // ---- KYC: the added fields go with the KYC submission (multipart), saved against the user
+    const kycName = await addField('kyc', 'Name on ID');
+    const person = await createUser('customer', 'fmx-kyc');
+    const submit = (customFields) => {
+      const form = new FormData();
+      form.append('kind', 'kyc');
+      form.append('reference', 'ABCDE1234F');
+      if (customFields) form.append('customFields', JSON.stringify(customFields));
+      return fetch(`${BASE}/trust/verifications`, { method: 'POST', headers: { authorization: `Bearer ${person.token}` }, body: form }).then(async (r) => ({ status: r.status, body: await r.json() }));
+    };
+    const noKyc = await submit(null);
+    assert.equal(noKyc.status, 422, JSON.stringify(noKyc.body));
+    assert.ok(noKyc.body.errors.some((e) => e.field === kycName), 'the required KYC field is asked for');
+    const kyc = await submit({ [kycName]: 'Asha Verma' });
+    assert.equal(kyc.status, 201, JSON.stringify(kyc.body));
+    assert.equal(kyc.body.data.customFields[kycName], 'Asha Verma');
+    assert.equal((await api('GET', `/fields/values/kyc/${person.id}`, { token: R })).data.values[kycName], 'Asha Verma', 'staff see it on the user');
+
+    // ---- due diligence: completed with the review of a listing
+    const ddName = await addField('due_diligence', 'Encumbrance certificate number');
+    const prop = (await pool.query(`INSERT INTO properties (created_by, title, property_type, transaction_type, city, price, status) VALUES ($1, $2, 'apartment', 'sell', $3, '90 Lakh', 'approved') RETURNING id`, [root.id, `FMX DD ${RUN}`, CITY])).rows[0].id;
+    const noDd = await api('PUT', `/due-diligence/properties/${prop}/review`, { token: R, body: { notes: 'Checked' } });
+    assert.equal(noDd.status, 422, JSON.stringify(noDd.body));
+    const dd = await api('PUT', `/due-diligence/properties/${prop}/review`, { token: R, body: { notes: 'Checked', customFields: { [ddName]: 'EC-2026-0042' } } });
+    assert.equal(dd.status, 200, JSON.stringify(dd.body));
+    assert.equal((await api('GET', `/fields/values/due_diligence/${prop}`, { token: R })).data.values[ddName], 'EC-2026-0042');
+
+    // ---- agreement: asked for when a document is generated for a deal (not for a blank form)
+    const agName = await addField('agreement', 'Registration office');
+    const tpl = (await api('GET', '/templates', { token: R })).data.find((t) => t.templateKey === 'agreement_to_sell');
+    const dealId = crypto.randomUUID();
+    const noAg = await api('POST', `/templates/${tpl.id}/generate`, { token: R, body: { dealId, values: {} } });
+    assert.equal(noAg.status, 422, JSON.stringify(noAg.body));
+    assert.ok(noAg.body.errors.some((e) => e.field === agName));
+    assert.equal((await api('POST', `/templates/${tpl.id}/generate`, { token: R, body: { blank: true } })).status, 201, 'a blank form is not held up');
+
+    // The Field Manager says where each of these forms is filled in.
+    const entities = (await api('GET', '/fields/meta', { token: R })).data.entities;
+    for (const k of ['kyc', 'due_diligence', 'agreement']) assert.ok(entities.find((e) => e.key === k).inForms && entities.find((e) => e.key === k).form);
+  } finally {
+    // Required test fields must not hold up other tests' KYC, reviews or documents.
+    for (const id of made) await api('PUT', `/fields/${id}`, { token: R, body: { active: false } });
+  }
+});
+
+test('partner logins: advocates, loan officers and insurance officers get their own login after the code is issued, see only their own cases with no client contact, take only their own steps, request and upload documents, record billing; suspension locks the login', async () => {
+  const A = ctx.admin.token;
+  const login = async (email, password) => (await api('POST', '/auth/login', { body: { identifier: email, password } })).data?.accessToken;
+  const PW = 'Partner#2026';
+
+  // ---- the panel
+  const adv = await api('POST', '/legal/professionals', { token: A, body: { fullName: `Adv. Desk ${RUN}`, firmName: 'Desk & Co', enrolmentNumber: `PD/${RUN}/2015`, enrolmentBody: 'Bar Council of Delhi', email: `adv.desk.${RUN}@e2e.test` } });
+  assert.equal(adv.status, 201, JSON.stringify(adv.body));
+  const noCode = await api('POST', '/partner-desk/logins', { token: A, body: { kind: 'legal', id: adv.data.id, password: PW } });
+  assert.equal(noCode.status, 400, 'no login before the LP code is issued');
+  await api('POST', `/legal/professionals/${adv.data.id}/decision`, { token: A, body: { action: 'empanel', note: 'Enrolment certificate verified' } });
+  assert.equal((await api('POST', '/partner-desk/logins', { token: ctx.sales.token, body: { kind: 'legal', id: adv.data.id, password: PW } })).status, 403, 'admins create logins');
+  const advLogin = await api('POST', '/partner-desk/logins', { token: A, body: { kind: 'legal', id: adv.data.id, password: PW } });
+  assert.equal(advLogin.status, 201, JSON.stringify(advLogin.body));
+  assert.equal(advLogin.data.role, 'legal_professional');
+  assert.equal((await api('POST', '/partner-desk/logins', { token: A, body: { kind: 'legal', id: adv.data.id, password: PW } })).status, 400, 'one login per partner');
+  assert.equal((await api('GET', '/legal/professionals', { token: A })).data.professionals.find((p) => p.id === adv.data.id).hasLogin, true);
+
+  const bank = await api('POST', '/finance/institutions', { token: A, body: { kind: 'bank', name: `Desk Bank ${RUN}`, loanProducts: ['home_loan'], empanelmentRef: `EMP/D/${RUN}` } });
+  await api('POST', `/finance/institutions/${bank.data.id}/decision`, { token: A, body: { action: 'empanel', note: 'Empanelment letter checked' } });
+  const lo = await api('POST', '/finance/officers', { token: A, body: { institutionId: bank.data.id, fullName: `Desk LO ${RUN}`, email: `lo.desk.${RUN}@e2e.test` } });
+  await api('POST', `/finance/officers/${lo.data.id}/decision`, { token: A, body: { action: 'verify', note: 'Employment confirmed with the bank' } });
+  const insurer = await api('POST', '/finance/institutions', { token: A, body: { kind: 'insurer', name: `Desk Shield ${RUN}`, insuranceProducts: ['home_package'], empanelmentRef: 'INS/D', irdaiRegistration: `IRDAI/D/${RUN}` } });
+  await api('POST', `/finance/institutions/${insurer.data.id}/decision`, { token: A, body: { action: 'empanel', note: 'IRDAI registration checked' } });
+  const io = await api('POST', '/finance/officers', { token: A, body: { institutionId: insurer.data.id, fullName: `Desk IO ${RUN}`, licenceNumber: `LICD${RUN}`, email: `io.desk.${RUN}@e2e.test` } });
+  await api('POST', `/finance/officers/${io.data.id}/decision`, { token: A, body: { action: 'verify', note: 'IRDAI licence verified' } });
+  for (const o of [lo, io]) assert.equal((await api('POST', '/partner-desk/logins', { token: A, body: { kind: 'officer', id: o.data.id, password: PW } })).status, 201);
+  const ADV = await login(`adv.desk.${RUN}@e2e.test`, PW);
+  const LO = await login(`lo.desk.${RUN}@e2e.test`, PW);
+  const IO = await login(`io.desk.${RUN}@e2e.test`, PW);
+  assert.ok(ADV && LO && IO, 'each partner signs in');
+
+  // ---- cases: one assigned to this advocate, one to someone else
+  const client = await createUser('customer', 'deskclient');
+  await api('GET', '/me/profile', { token: client.token });
+  const cust = (await pool.query('SELECT id FROM customers WHERE user_id = $1', [client.id])).rows[0].id;
+  const prop = (await pool.query(`INSERT INTO properties (created_by, title, property_type, transaction_type, city, price, status) VALUES ($1, $2, 'apartment', 'sell', $3, '75 Lakh', 'approved') RETURNING id`, [client.id, `Desk Flat ${RUN}`, CITY])).rows[0].id;
+  const mkCase = async (proId) => (await pool.query(
+    `INSERT INTO legal_cases (case_number, requested_by, customer_id, property_id, service_type, requirement, status, professional_id, assigned_by, assigned_at, due_on)
+     VALUES ($1, $2, $3, $4, 'registration_support', 'Help register the sale deed', 'advocate_assigned', $5, $6, now(), CURRENT_DATE + 5) RETURNING id`,
+    [`LC-D${RUN}-${Math.floor(Math.random() * 1e5)}`, client.id, cust, prop, proId, ctx.admin.id]
+  )).rows[0].id;
+  const C = await mkCase(adv.data.id);
+  const otherPro = await api('POST', '/legal/professionals', { token: A, body: { fullName: `Adv. Other ${RUN}`, enrolmentNumber: `PO/${RUN}/2016` } });
+  await api('POST', `/legal/professionals/${otherPro.data.id}/decision`, { token: A, body: { action: 'empanel', note: 'Enrolment certificate verified' } });
+  const C2 = await mkCase(otherPro.data.id);
+
+  const meAdv = await api('GET', '/partner-desk/me', { token: ADV });
+  assert.equal(meAdv.status, 200, JSON.stringify(meAdv.body));
+  assert.match(meAdv.data.code, /^LP-/);
+  assert.match(meAdv.data.nonCommission, /never carries commission/);
+  const myCases = (await api('GET', '/partner-desk/legal', { token: ADV })).data.cases;
+  assert.deepEqual(myCases.map((c) => c.id), [C], 'only their own case');
+  assert.equal((await api('GET', `/partner-desk/legal/${C2}`, { token: ADV })).status, 404);
+  const one = await api('GET', `/partner-desk/legal/${C}`, { token: ADV });
+  assert.equal(one.data.clientName.length > 0, true);
+  const clientUser = (await pool.query('SELECT email, mobile FROM users WHERE id = $1', [client.id])).rows[0];
+  assert.ok(!JSON.stringify(one.body).includes(clientUser.email) && !(clientUser.mobile && JSON.stringify(one.body).includes(clientUser.mobile)), 'no client contact details');
+  assert.deepEqual(one.data.next, ['in_progress']);
+  // Not through the client / staff routes, and not the other partner desks.
+  assert.equal((await api('GET', `/legal/cases/${C}`, { token: ADV })).status, 403);
+  assert.equal((await api('GET', '/partner-desk/loan', { token: ADV })).status, 403);
+
+  // Their own steps only.
+  assert.equal((await api('PUT', `/partner-desk/legal/${C}`, { token: ADV, body: { status: 'completed' } })).status, 403, 'A R closes the case');
+  const started = await api('PUT', `/partner-desk/legal/${C}`, { token: ADV, body: { status: 'in_progress', note: 'Drafting the deed and booking the slot.' } });
+  assert.equal(started.status, 200, JSON.stringify(started.body));
+  assert.equal(started.data.status, 'in_progress');
+  assert.equal((await api('PUT', `/partner-desk/legal/${C}`, { token: ADV, body: { status: 'report_ready' } })).status, 400, 'the report must be attached');
+  // A report document can only come from an upload - never pulled in by id.
+  const foreign = (await pool.query(`INSERT INTO documents (customer_id, document_type, document_url, uploaded_by) VALUES ($1, 'kyc', 'documents/x/secret.pdf', $2) RETURNING id`, [cust, ctx.admin.id])).rows[0].id;
+  await api('PUT', `/partner-desk/legal/${C}`, { token: ADV, body: { status: 'report_ready', reportDocumentId: foreign } });
+  assert.equal((await api('GET', `/partner-desk/legal/${C}/documents/${foreign}`, { token: ADV })).status, 404);
+
+  const ask = await api('POST', `/partner-desk/legal/${C}/document-request`, { token: ADV, body: { note: 'Copy of the society NOC and the latest tax receipt' } });
+  assert.equal(ask.status, 200, JSON.stringify(ask.body));
+  assert.ok(ask.data.timeline.some((e) => e.kind === 'document_request'));
+  assert.ok((await pool.query(`SELECT 1 FROM notifications WHERE user_id = $1 AND title LIKE '%documents requested'`, [client.id])).rows.length, 'the client is asked through the platform');
+  const fee = await api('PUT', `/partner-desk/legal/${C}/fee`, { token: ADV, body: { amount: 15000, status: 'invoiced', note: 'Drafting and registration' } });
+  assert.equal(fee.status, 200, JSON.stringify(fee.body));
+  assert.deepEqual(fee.data.fee, { amount: 15000, status: 'invoiced', note: 'Drafting and registration' });
+  assert.ok(fee.data.timeline.some((e) => e.kind === 'fee' && /takes no share/.test(e.note)));
+  // The client sees the advocate's progress on their own case.
+  const clientView = await api('GET', `/legal/cases/${C}`, { token: client.token });
+  assert.ok(clientView.data.timeline.some((e) => e.kind === 'document_request'));
+
+  // ---- loan officer: referred application, sanction and disbursement schedule
+  const L = (await pool.query(
+    `INSERT INTO loan_applications (application_number, requested_by, customer_id, property_id, loan_type, monthly_income, property_value, loan_amount_requested, tenure_years, status, institution_id, officer_id, referred_at, referred_by)
+     VALUES ($1, $2, $3, $4, 'home_loan', 120000, 7500000, 5000000, 20, 'referred', $5, $6, now(), $7) RETURNING id`,
+    [`LA-D${RUN}`, client.id, cust, prop, bank.data.id, lo.data.id, ctx.admin.id]
+  )).rows[0].id;
+  const loans = (await api('GET', '/partner-desk/loan', { token: LO })).data.applications;
+  assert.deepEqual(loans.map((a) => a.id), [L]);
+  assert.equal(loans[0].monthlyIncome, 120000, 'the figures a lender needs');
+  assert.equal((await api('PUT', `/finance/loans/${L}`, { token: LO, body: { monthlyIncome: 1 } })).status, 403, "never edits the client's application");
+  assert.equal((await api('PUT', `/partner-desk/loan/${L}`, { token: LO, body: { status: 'withdrawn', note: 'nope' } })).status, 403);
+  const sanc = await api('PUT', `/partner-desk/loan/${L}`, { token: LO, body: { status: 'sanctioned', sanctionedAmount: 4800000, sanctionedRate: 8.65, lenderReference: `HL/${RUN}`, disbursementSchedule: [{ dueOn: '2026-12-01', amount: 2400000 }, { dueOn: '2027-03-01', amount: 2400000 }] } });
+  assert.equal(sanc.status, 200, JSON.stringify(sanc.body));
+  assert.deepEqual([sanc.data.status, sanc.data.sanction.amount, sanc.data.disbursementSchedule.length], ['sanctioned', 4800000, 2]);
+  const meLo = (await api('GET', '/partner-desk/me', { token: LO })).data;
+  assert.deepEqual([meLo.summary.referrals, meLo.summary.sanctioned, meLo.summary.sanctioned_amount], [1, 1, 4800000], 'referral record, not commission');
+
+  // ---- insurance officer: issue the policy
+  const Q = (await pool.query(
+    `INSERT INTO insurance_requests (request_number, requested_by, customer_id, property_id, cover_type, sum_insured, status, institution_id, officer_id, referred_at, referred_by)
+     VALUES ($1, $2, $3, $4, 'home_package', 6000000, 'referred', $5, $6, now(), $7) RETURNING id`,
+    [`IR-D${RUN}`, client.id, cust, prop, insurer.data.id, io.data.id, ctx.admin.id]
+  )).rows[0].id;
+  assert.equal((await api('GET', `/partner-desk/insurance/${Q}`, { token: LO })).status, 403, 'a loan officer has no insurance desk');
+  const issued = await api('PUT', `/partner-desk/insurance/${Q}`, { token: IO, body: { status: 'issued', policyNumber: `POL/${RUN}`, policyStart: '2026-11-01', policyEnd: '2027-10-31', premiumAmount: 4200 } });
+  assert.equal(issued.status, 200, JSON.stringify(issued.body));
+  assert.equal(issued.data.policy.number, `POL/${RUN}`);
+
+  // ---- suspension from the panel locks the login at once
+  await api('POST', `/finance/officers/${io.data.id}/decision`, { token: A, body: { action: 'suspend', note: 'Licence under review' } });
+  assert.equal((await api('GET', '/partner-desk/me', { token: IO })).status, 403);
+  assert.equal(await login(`io.desk.${RUN}@e2e.test`, PW), undefined, 'cannot sign in while suspended');
+  await api('POST', `/finance/officers/${io.data.id}/decision`, { token: A, body: { action: 'reinstate', note: 'Licence renewed and verified' } });
+  assert.ok(await login(`io.desk.${RUN}@e2e.test`, PW), 'reinstated');
+});
+
+test('related party (sec. 33.12): family disclosure links accounts, listings / inquiries / deals are tagged and logged immutably, the cascade skips the linked employee, no self-assignment by anyone, review on the Compliance Dashboard, late disclosure re-routes', async () => {
+  const assignment = require('../src/services/assignment.service');
+  const rnd = () => `7${String(Math.floor(Math.random() * 1e9)).padStart(9, '0')}`;
+  const RCITY = `RP City ${RUN}`;
+  // Two representatives in the same city: E (who will be linked) and R2.
+  const E = await createUser('internal_sales', 'rp-emp');
+  const R2 = await createUser('internal_sales', 'rp-rep2');
+  for (const u of [E, R2]) await pool.query(`INSERT INTO arb_representatives (user_id, designation, assigned_cities) VALUES ($1, 'rm', $2) ON CONFLICT (user_id) DO UPDATE SET assigned_cities = $2, designation = 'rm', accepts_assignments = true`, [u.id, [RCITY]]);
+
+  // ---- disclosure: employees only, validated, re-checks everything
+  const outsider = await createUser('customer', 'rp-outsider');
+  assert.equal((await api('POST', '/related-party/disclosures', { token: outsider.token, body: { relation: 'spouse', fullName: 'X', mobile: rnd() } })).status, 400, 'employees only');
+  assert.equal((await api('POST', '/related-party/disclosures', { token: E.token, body: { relation: 'spouse', fullName: 'Asha', mobile: '123' } })).status, 400);
+  const spouseMobile = rnd();
+  const disc = await api('POST', '/related-party/disclosures', { token: E.token, body: { relation: 'spouse', fullName: `Asha ${RUN}`, mobile: spouseMobile } });
+  assert.equal(disc.status, 201, JSON.stringify(disc.body));
+  assert.match(disc.data.disclosure.mobile, /^••••••\d{4}$/, 'stored masked in views');
+  assert.equal((await api('GET', '/related-party/disclosures/mine', { token: E.token })).data.disclosures.length, 1);
+
+  // ---- registration: the spouse's new account is linked at once
+  const spouse = (await pool.query(
+    `INSERT INTO users (role_id, full_name, email, mobile, password_hash, status) SELECT id, $1, $2, $3, 'x', 'active' FROM roles WHERE name = 'customer' RETURNING id, employee_linked_account, employee_link_ids`,
+    [`Asha ${RUN}`, `rp.spouse.${RUN}@e2e.test`, spouseMobile]
+  )).rows[0];
+  assert.equal(spouse.employee_linked_account, true);
+  assert.deepEqual(spouse.employee_link_ids, [E.id]);
+  const spouseCust = (await pool.query(`INSERT INTO customers (full_name, mobile, user_id) VALUES ($1, $2, $3) RETURNING id`, [`Asha ${RUN}`, spouseMobile, spouse.id])).rows[0].id;
+
+  // ---- a listing by an ordinary seller is not flagged; the spouse's inquiry on it is
+  const seller = await createUser('customer', 'rp-seller');
+  const prop = (await pool.query(`INSERT INTO properties (created_by, title, property_type, transaction_type, city, price, status) VALUES ($1, $2, 'apartment', 'sell', $3, '90 Lakh', 'approved') RETURNING id, related_party_transaction`, [seller.id, `RP Flat ${RUN}`, RCITY])).rows[0];
+  assert.equal(prop.related_party_transaction, false);
+  const lead = (await pool.query(`INSERT INTO leads (customer_id, property_id, source) VALUES ($1, $2, 'website') RETURNING id, related_party_transaction, related_party_employee_ids`, [spouseCust, prop.id])).rows[0];
+  assert.equal(lead.related_party_transaction, true);
+  assert.deepEqual(lead.related_party_employee_ids, [E.id]);
+  const log = await pool.query(`SELECT * FROM related_party_log WHERE entity_type = 'lead' AND entity_id = $1`, [lead.id]);
+  assert.equal(log.rows.length, 1, 'detection logged');
+  await assert.rejects(pool.query('UPDATE related_party_log SET employee_ids = $2 WHERE id = $1', [log.rows[0].id, []]), /append-only/);
+  await assert.rejects(pool.query('DELETE FROM related_party_log WHERE id = $1', [log.rows[0].id]), /append-only/);
+
+  // ---- the cascade never gives it to E
+  const placed = await assignment.route(lead.id, { reason: 'new' });
+  assert.ok(placed && placed.userId !== E.id, 'routed to someone other than the linked employee');
+  // Nor can anyone assign it to E by hand.
+  const selfAssign = await api('PUT', `/leads/${lead.id}/assign`, { token: ctx.admin.token, body: { assignedTo: E.id } });
+  assert.equal(selfAssign.status, 403, JSON.stringify(selfAssign.body));
+  assert.match(selfAssign.body.message, /cannot be assigned to them/);
+
+  // ---- a deal with the spouse as buyer is tagged; E cannot be its representative
+  const deal = (await pool.query(`INSERT INTO deals (customer_id, property_id, broker_id, stage) VALUES ($1, $2, $3, 'negotiation') RETURNING id, related_party_transaction`, [spouseCust, prop.id, ctx.broker.id])).rows[0];
+  assert.equal(deal.related_party_transaction, true);
+  await assert.rejects(pool.query('UPDATE deals SET assigned_rep_id = $2 WHERE id = $1', [deal.id, E.id]), /related_party_self_assignment/);
+  await pool.query('UPDATE deals SET assigned_rep_id = $2 WHERE id = $1', [deal.id, R2.id]);
+
+  // ---- Compliance Dashboard: reviewers only; review is append-only; "undisclosed" goes to the Super Admin
+  assert.equal((await api('GET', '/related-party/dashboard', { token: E.token })).status, 403);
+  const dash = await api('GET', '/related-party/dashboard?review=all', { token: ctx.admin.token });
+  assert.equal(dash.status, 200, JSON.stringify(dash.body));
+  const mine = dash.data.items.filter((i) => [lead.id, deal.id].includes(i.id));
+  assert.equal(mine.length, 2);
+  assert.ok(mine.every((i) => i.employees.some((e) => e.id === E.id) && !i.selfAssigned));
+  assert.ok((await api('GET', '/related-party/linked-accounts', { token: ctx.admin.token })).data.some((a) => a.id === spouse.id && a.via.includes('spouse')));
+  assert.equal((await api('POST', `/related-party/deal/${deal.id}/review`, { token: ctx.admin.token, body: { outcome: 'disclosed_ok' } })).status, 422, 'what was checked is recorded');
+  const rev = await api('POST', `/related-party/deal/${deal.id}/review`, { token: ctx.admin.token, body: { outcome: 'disclosed_ok', note: 'Disclosed at onboarding; routed to R2.' } });
+  assert.equal(rev.status, 201, JSON.stringify(rev.body));
+  assert.equal(rev.data.reviews.length, 1);
+  await assert.rejects(pool.query(`DELETE FROM related_party_reviews WHERE entity_id = $1`, [deal.id]), /append-only/);
+  assert.ok(!(await api('GET', '/related-party/dashboard', { token: ctx.admin.token })).data.items.some((i) => i.id === deal.id), 'reviewed ones leave the open queue');
+  await api('POST', `/related-party/lead/${lead.id}/review`, { token: ctx.admin.token, body: { outcome: 'undisclosed', note: 'Family link found by the system; not disclosed in time.' } });
+  // Alerts go out in the background.
+  let alerted = 0;
+  for (let i = 0; i < 50 && !alerted; i += 1) {
+    await new Promise((r) => setTimeout(r, 200));
+    alerted = (await pool.query(`SELECT 1 FROM notifications n JOIN users u ON u.id = n.user_id JOIN roles r ON r.id = u.role_id WHERE r.name = 'super_admin' AND n.title = 'Undisclosed related-party transaction' AND n.related_entity_id = $1 LIMIT 1`, [lead.id])).rows.length;
+  }
+  assert.ok(alerted, 'the Super Admin is alerted for a Section 35 decision');
+
+  // ---- late disclosure: an inquiry already with E is moved off E
+  const parentMobile = rnd();
+  const parentCust = (await pool.query(`INSERT INTO customers (full_name, mobile) VALUES ($1, $2) RETURNING id`, [`Parent ${RUN}`, parentMobile])).rows[0].id;
+  const late = (await pool.query(`INSERT INTO leads (customer_id, property_id, source, arb_rep_id, assigned_to, assigned_at, assignment_hop) VALUES ($1, $2, 'website', $3, $3, now(), 1) RETURNING id, related_party_transaction`, [parentCust, prop.id, E.id])).rows[0];
+  assert.equal(late.related_party_transaction, false, 'not linked yet');
+  const parentDisc = await api('POST', '/related-party/disclosures', { token: E.token, body: { relation: 'parent', fullName: `Parent ${RUN}`, mobile: parentMobile } });
+  assert.equal(parentDisc.status, 201, JSON.stringify(parentDisc.body));
+  assert.ok(parentDisc.data.scan.rerouted >= 1);
+  const after = (await pool.query('SELECT arb_rep_id, related_party_transaction FROM leads WHERE id = $1', [late.id])).rows[0];
+  assert.equal(after.related_party_transaction, true);
+  assert.notEqual(after.arb_rep_id, E.id, 're-routed away from the linked employee');
+  assert.ok((await pool.query(`SELECT 1 FROM lead_assignment_events WHERE lead_id = $1 AND kind = 'rp_rerouted'`, [late.id])).rows.length);
+
+  // ---- withdrawing a disclosure unlinks the account (kept on record)
+  await api('POST', `/related-party/disclosures/${disc.data.disclosure.id}/withdraw`, { token: E.token, body: { note: 'Number transferred to the operator' } });
+  assert.equal((await pool.query('SELECT employee_linked_account FROM users WHERE id = $1', [spouse.id])).rows[0].employee_linked_account, false);
+  assert.ok((await pool.query('SELECT removed_at FROM employee_disclosures WHERE id = $1', [disc.data.disclosure.id])).rows[0].removed_at);
+  assert.ok((await pool.query(`SELECT COUNT(*)::int AS n FROM related_party_log WHERE entity_type = 'lead' AND entity_id = $1`, [lead.id])).rows[0].n >= 1, 'history stays');
 });

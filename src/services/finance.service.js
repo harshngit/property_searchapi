@@ -5,6 +5,7 @@ const notificationService = require('./notification.service');
 const auditService = require('./audit.service');
 const { getReadUrl } = require('../utils/storage');
 const { badRequest, forbidden, notFound } = require('../utils/httpError');
+const userBlock = require('../utils/userBlock');
 
 // Modules 25 (Loan / Financing) and 26 (Insurance) - referral only.
 //   Panel     : empanelled banks, NBFCs, housing finance companies and
@@ -93,6 +94,12 @@ async function linkedDocs(type, id) {
 }
 const docView = (d) => ({ id: d.id, type: d.document_type, fileName: d.file_name, status: d.status, autoLinked: d.auto_linked, addedAt: d.created_at });
 
+// A partner officer reaches only what was referred to them, while verified.
+async function isOfficerOf(user, officerId) {
+  if (!officerId) return false;
+  return (await pool.query(`SELECT 1 FROM partner_officers WHERE id = $1 AND user_id = $2 AND status = 'verified'`, [officerId, user.id])).rows.length > 0;
+}
+
 async function customerOf(user) {
   const c = (await pool.query('SELECT id FROM customers WHERE user_id = $1', [user.id])).rows[0];
   if (!c) throw badRequest('Complete your profile first');
@@ -143,7 +150,7 @@ const instView = (i, { staff = false } = {}) => ({
   ...(staff ? { empanelmentRef: i.empanelment_ref, irdaiRegistration: i.irdai_registration, minLoanAmount: num(i.min_loan_amount), maxLoanAmount: num(i.max_loan_amount), maxFoirPercent: num(i.max_foir_percent),
     cities: i.cities, states: i.states, notes: i.notes, verifiedAt: i.verified_at, verificationNote: i.verification_note, officers: i.officers, openCases: i.open_cases, referrals90d: i.referrals_90d } : {}),
 });
-const officerView = (o) => ({ id: o.id, institutionId: o.institution_id, institutionName: o.institution_name, code: o.code, role: o.role, fullName: o.full_name, designation: o.designation, licenceNumber: o.licence_number, email: o.email, mobile: o.mobile, cities: o.cities, status: o.status, verifiedAt: o.verified_at, verificationNote: o.verification_note });
+const officerView = (o) => ({ id: o.id, institutionId: o.institution_id, institutionName: o.institution_name, code: o.code, role: o.role, fullName: o.full_name, designation: o.designation, licenceNumber: o.licence_number, email: o.email, mobile: o.mobile, cities: o.cities, status: o.status, verifiedAt: o.verified_at, verificationNote: o.verification_note, hasLogin: !!o.user_id });
 
 async function listInstitutions({ kind = null, status = null } = {}) {
   const r = await pool.query(
@@ -239,6 +246,17 @@ async function saveOfficer(user, data, meta = {}) {
 }
 
 // The LO / IO code is issued here, with the check recorded against it.
+// A partner's login follows their panel status: suspended locks it at once (sessions cut), reinstated opens it again.
+async function syncPartnerLogin(userId, panelActive) {
+  if (!userId) return;
+  await pool.query(`UPDATE users SET status = $2 WHERE id = $1 AND status IN ('active', 'suspended')`, [userId, panelActive ? 'active' : 'suspended']);
+  if (panelActive) userBlock.unblock(userId);
+  else {
+    userBlock.block(userId, 'suspended');
+    await pool.query('UPDATE refresh_tokens SET is_revoked = true WHERE user_id = $1', [userId]);
+  }
+}
+
 async function decideOfficer(user, id, { action, note }, meta = {}) {
   const o = (await pool.query('SELECT o.*, i.name AS institution_name, i.status AS inst_status FROM partner_officers o JOIN partner_institutions i ON i.id = o.institution_id WHERE o.id = $1', [id])).rows[0];
   if (!o) throw notFound('Officer not found');
@@ -261,6 +279,7 @@ async function decideOfficer(user, id, { action, note }, meta = {}) {
       u = (await client.query(`UPDATE partner_officers SET status = 'verified', code = $2, verified_by = $3, verified_at = now(), verification_note = $4 WHERE id = $1 RETURNING *`, [id, code, user.id, String(note).trim()])).rows[0];
     }
     await client.query('COMMIT');
+    await syncPartnerLogin(u.user_id, u.status === 'verified');
     await auditService.log({ actor: user, action: `finance.officer_${action}`, entityType: 'partner_officer', entityId: id, before: { status: o.status }, after: { status: u.status, code: u.code, note }, ...meta });
     return officerView({ ...u, institution_name: o.institution_name });
   } catch (err) {
@@ -432,6 +451,10 @@ async function onLoanEnquiry(lead) {
 async function loanRow(user, id) {
   const a = (await pool.query(`${LOAN_SELECT} WHERE a.id = $1`, [id])).rows[0];
   if (!a) throw notFound('Loan application not found');
+  if (user.role === 'loan_officer') {
+    if (!(await isOfficerOf(user, a.officer_id))) throw notFound('Loan application not found');
+    return a;
+  }
   if (!isStaff(user) && a.requested_by !== user.id) {
     const own = (await pool.query('SELECT 1 FROM customers WHERE id = $1 AND user_id = $2', [a.customer_id, user.id])).rows.length;
     if (!own) throw notFound('Loan application not found');
@@ -747,6 +770,10 @@ async function onInsuranceEnquiry(lead) {
 async function insRow(user, id) {
   const q = (await pool.query(`${INS_SELECT} WHERE q.id = $1`, [id])).rows[0];
   if (!q) throw notFound('Insurance request not found');
+  if (user.role === 'insurance_officer') {
+    if (!(await isOfficerOf(user, q.officer_id))) throw notFound('Insurance request not found');
+    return q;
+  }
   if (!isStaff(user) && q.requested_by !== user.id) {
     const own = (await pool.query('SELECT 1 FROM customers WHERE id = $1 AND user_id = $2', [q.customer_id, user.id])).rows.length;
     if (!own) throw notFound('Insurance request not found');
@@ -902,7 +929,7 @@ async function referralVolume() {
 }
 
 module.exports = {
-  LOAN_TYPES, COVER_TYPES, settings, assess, principalFor,
+  LOAN_TYPES, LOAN_LABEL, COVER_TYPES, settings, assess, principalFor,
   listInstitutions, saveInstitution, decideInstitution, listOfficers, saveOfficer, decideOfficer,
   checkEligibility, startLoan, onLoanEnquiry, getLoan, myLoans, listLoans, updateLoan, submitLoan, referLoan, loanHandoff, updateLoanStatus, withdrawLoan,
   insurancePreview, requestInsurance, onInsuranceEnquiry, getInsurance, myInsurance, listInsurance, selectInsurer, referInsurance, insuranceHandoff, updateInsuranceStatus, cancelInsurance,

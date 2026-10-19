@@ -193,7 +193,9 @@ async function missedBy(leadId) {
 }
 
 // Who gets `hop`, and by which route. `previousRoute` drives hop 2.
-async function choose(hop, ctx, exclude, previousRoute) {
+// `never` is excluded even from the last-resort fallback (sec. 33.12: the
+// employees linked to a related-party transaction).
+async function choose(hop, ctx, exclude, previousRoute, never = []) {
   const regional = async (designations) => (await leastBusy(designations, ctx, exclude)) || null;
   const anywhere = async (designations) => leastBusy(designations, ctx, exclude, { region: false });
   if (hop <= 1) {
@@ -218,7 +220,7 @@ async function choose(hop, ctx, exclude, previousRoute) {
   }
   // Hop 3+: system pool. If everyone has already missed it, the least busy
   // of them takes it again rather than the inquiry sitting unattended.
-  const id = (await anywhere(['rm', 'dm'])) || (await leastBusy(['rm', 'dm'], ctx, [], { region: false }));
+  const id = (await anywhere(['rm', 'dm'])) || (await leastBusy(['rm', 'dm'], ctx, never, { region: false }));
   return { userId: id, route: 'system_pool' };
 }
 
@@ -250,17 +252,46 @@ async function logEvent(leadId, { hop, kind, route = null, from = null, to = nul
 
 // ------------------------------------------------------------ core
 
-// Assign (or pass on) one inquiry. `reason`: new | missed | exit.
+// The employees linked to an inquiry or its deals (sec. 33.12) - never its representative.
+async function relatedEmployees(lead) {
+  const r = await pool.query(`SELECT COALESCE(array_agg(DISTINCT x), '{}') AS ids FROM (SELECT unnest($1::uuid[]) AS x UNION SELECT unnest(related_party_employee_ids) FROM deals WHERE lead_id = $2) t`, [lead.related_party_employee_ids || [], lead.id]);
+  return r.rows[0].ids;
+}
+
+// Nobody else can take a related-party inquiry: the Team Leader(s) for the
+// area and the admins assign it by hand. Told once.
+async function escalateRelated(lead, ctx, related) {
+  const already = (await pool.query(`SELECT 1 FROM lead_assignment_events WHERE lead_id = $1 AND kind = 'rp_escalated' AND created_at > COALESCE($2, '-infinity'::timestamptz)`, [lead.id, lead.assigned_at])).rows.length;
+  if (already) return null;
+  const params = [ctx.locality || null, ctx.city || null, ctx.stateCode || null, related];
+  const tls = (await pool.query(
+    `SELECT ar.user_id FROM arb_representatives ar JOIN users u ON u.id = ar.user_id AND u.status = 'active' WHERE ar.designation = 'tl' AND NOT (ar.user_id = ANY($4::uuid[])) AND ${REGION_SQL.replace(/\$REG_LOC/g, '$1').replace(/\$REG_CITY/g, '$2').replace(/\$REG_STATE/g, '$3')}`,
+    params
+  )).rows.map((r) => r.user_id);
+  await logEvent(lead.id, { hop: lead.assignment_hop || 0, kind: 'rp_escalated', detail: { linked_employees: related, team_leaders: tls } });
+  await notify([...tls, ...(await adminIds())].filter((id) => !related.includes(id)), {
+    type: 'related_party', title: 'Related-party inquiry needs manual assignment',
+    message: `${ctx.locality ? `${ctx.locality}, ` : ''}${ctx.city || 'Location not given'} - a party is linked to an employee and no other representative is available. Assign it by hand (not to the linked employee).`, leadId: lead.id,
+  });
+  return null;
+}
+
+// Assign (or pass on) one inquiry. `reason`: new | missed | exit | related_party
+// (the current representative turned out to be linked to a party).
 async function route(leadId, { reason = 'new' } = {}) {
   const c = await cfg();
   const ctx = await leadContext(leadId);
   const { lead } = ctx;
   if (CLOSED.includes(lead.status)) return null;
+  const relatedMove = reason === 'related_party';
+  if (relatedMove) reason = 'exit';
   if (reason !== 'exit' && lead.first_contacted_at) return null; // sticky once attended
+  // Sec. 33.12: the linked employees are skipped at every hop.
+  const related = await relatedEmployees(lead);
 
   // A lead created with an assignee already (e.g. an investor's own RM) keeps
   // them as hop 1.
-  if (reason === 'new' && lead.assigned_to && !lead.assigned_at) {
+  if (reason === 'new' && lead.assigned_to && !lead.assigned_at && !related.includes(lead.assigned_to)) {
     const isRep = (await pool.query(`SELECT 1 FROM arb_representatives ar JOIN users u ON u.id = ar.user_id AND u.status = 'active' WHERE ar.user_id = $1`, [lead.assigned_to])).rows.length > 0;
     if (isRep) return place(lead, ctx, c, { userId: lead.assigned_to, route: 'preassigned_rm' }, 1, null);
   }
@@ -282,7 +313,7 @@ async function route(leadId, { reason = 'new' } = {}) {
     }
     return null;
   }
-  const exclude = await missedBy(leadId);
+  const exclude = [...(await missedBy(leadId)), ...related];
   let hop = reason === 'missed' ? lead.assignment_hop + 1 : reason === 'exit' ? 1 : Math.max(1, lead.assignment_hop || 0);
   // The rep who just missed (or left) is never handed it straight back - their
   // 'missed' event is only written in place(), after this choice.
@@ -293,13 +324,16 @@ async function route(leadId, { reason = 'new' } = {}) {
     console.error('[assignment] territory step failed:', err.message);
     return null;
   });
-  const pick = territoryPick || (await choose(hop, ctx, exclude, lead.assignment_route));
-  if (!pick.userId) return null; // no representative configured at all - picked up by the sweep later
+  let pick = territoryPick || (await choose(hop, ctx, exclude, lead.assignment_route, related));
+  if (pick.userId && related.includes(pick.userId)) pick = { userId: null };
+  if (!pick.userId) return related.length ? escalateRelated(lead, ctx, related) : null; // else no representative configured at all - picked up by the sweep later
   if (reason === 'exit') hop = Math.max(1, hop);
-  return place(lead, ctx, c, pick, hop, reason === 'new' ? null : lead.arb_rep_id, reason);
+  const placed = await place(lead, ctx, c, pick, hop, reason === 'new' ? null : lead.arb_rep_id, reason, relatedMove ? 'linked to a party of this transaction (sec. 33.12)' : undefined);
+  if (placed && relatedMove) await logEvent(lead.id, { hop, kind: 'rp_rerouted', from: lead.arb_rep_id, to: pick.userId, detail: { linked_employees: related } });
+  return placed;
 }
 
-async function place(lead, ctx, c, pick, hop, previous, reason = 'new') {
+async function place(lead, ctx, c, pick, hop, previous, reason = 'new', exitReason = 'representative no longer active') {
   const now = new Date();
   const due = windowDue(now, c.windowMinutes, c.hours);
   const firstAssignment = !lead.assigned_at;
@@ -333,7 +367,7 @@ async function place(lead, ctx, c, pick, hop, previous, reason = 'new') {
       await logEvent(lead.id, { hop: lead.assignment_hop, kind: 'missed', route: lead.assignment_route, from: previous, detail: { window_due_at: lead.assignment_due_at } }, client);
     }
     if (previous && reason === 'exit') {
-      await logEvent(lead.id, { hop, kind: 'exit_reinjected', from: previous, to: pick.userId, route: pick.route, detail: { reason: 'representative no longer active' } }, client);
+      await logEvent(lead.id, { hop, kind: 'exit_reinjected', from: previous, to: pick.userId, route: pick.route, detail: { reason: exitReason } }, client);
     }
     await logEvent(lead.id, { hop, kind: previous ? 'transferred' : 'assigned', route: pick.route, from: previous, to: pick.userId, detail: { window_due_at: due } }, client);
     if (pick.mappingGap) await logEvent(lead.id, { hop, kind: 'mapping_gap', detail: { broker_id: pick.mappingGap } }, client);
