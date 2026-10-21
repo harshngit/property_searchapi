@@ -80,7 +80,7 @@ router.post('/sweep', authorize(...ADMIN), asyncHandler(async (req, res) => succ
  * @swagger
  * /representatives/{userId}:
  *   put:
- *     summary: Configure a representative - designation (rm / dm / tl / tc), platform number, coverage, team leader, accepting assignments
+ *     summary: Configure a representative - designation (rm / dm / tl / tc / fm / ld / id, or ch City Head / ah Area Head), platform number, coverage, team leader, accepting assignments
  *     tags: [Representatives]
  *     security: [{ bearerAuth: [] }]
  *     parameters: [{ in: path, name: userId, required: true, schema: { type: string, format: uuid } }]
@@ -91,7 +91,7 @@ router.put(
   authorize(...ADMIN),
   [
     param('userId').isUUID(),
-    body('designation').optional().isIn(['rm', 'dm', 'tl', 'tc', 'fm', 'ld', 'id']),
+    body('designation').optional().isIn(['rm', 'dm', 'tl', 'tc', 'fm', 'ld', 'id', 'ch', 'ah']),
     body('platformNumber').optional({ nullable: true }).isString().isLength({ max: 20 }),
     body('assignedStates').optional().isArray({ max: 40 }),
     body('assignedCities').optional().isArray({ max: 200 }),

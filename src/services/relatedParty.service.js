@@ -3,6 +3,7 @@ const configService = require('./config.service');
 const auditService = require('./audit.service');
 const notificationService = require('./notification.service');
 const { panHash, PAN_RE } = require('./tax.service');
+const management = require('./management.service');
 const { badRequest, forbidden, notFound } = require('../utils/httpError');
 
 // Contract sec. 33.12 - Employee-as-User conflict-of-interest safeguards.
@@ -36,8 +37,28 @@ async function reviewers() {
   const roles = await configService.getConfig('compliance.related_party_reviewers', ['super_admin', 'admin']);
   return Array.isArray(roles) && roles.length ? roles : ['super_admin'];
 }
+// Central reviewers (Super Admin, and the roles in the setting) see everything;
+// a City Head their city, an Area Head their localities.
+async function reviewerScope(user) {
+  if ((await reviewers()).includes(user.role)) return { all: true };
+  const s = await management.scopeOf(user);
+  return s && !s.all ? s : null;
+}
 async function assertReviewer(user) {
-  if (!(await reviewers()).includes(user.role)) throw forbidden('The related-party dashboard is for the Super Admin and City Heads');
+  const scope = await reviewerScope(user);
+  if (!scope) throw forbidden('The related-party dashboard is for the Super Admin and City / Area Heads');
+  return scope;
+}
+async function assertCentral(user) {
+  const scope = await assertReviewer(user);
+  if (!scope.all) throw forbidden('Linked accounts and disclosures are reviewed centrally');
+}
+
+// For the CRM: may this person review, and over what.
+async function me(user) {
+  const scope = await reviewerScope(user);
+  if (!scope) return { reviewer: false };
+  return scope.all ? { reviewer: true, scope: 'all' } : { reviewer: true, scope: scope.designation === 'ch' ? 'city' : 'area', cities: scope.cities, localities: scope.localities };
 }
 
 // ---------------------------------------------------------------- re-check
@@ -120,7 +141,7 @@ async function withdrawDisclosure(user, id, { note } = {}, meta = {}) {
 }
 
 async function allDisclosures(user, { employeeId = null } = {}) {
-  await assertReviewer(user);
+  await assertCentral(user);
   const r = await pool.query(`SELECT d.*, u.full_name AS employee_name FROM employee_disclosures d JOIN users u ON u.id = d.employee_id ${employeeId ? 'WHERE d.employee_id = $1' : ''} ORDER BY u.full_name, d.created_at`, employeeId ? [employeeId] : []);
   return r.rows.map(disclosureView);
 }
@@ -128,33 +149,33 @@ async function allDisclosures(user, { employeeId = null } = {}) {
 // ---------------------------------------------------------------- dashboard
 
 const ENTITY = {
-  property: { table: 'properties', title: `COALESCE(e.title, 'Listing')`, city: 'e.city', open: `e.status::text IN ('draft', 'pending_approval', 'approved')`, rep: 'NULL::uuid', link: (id) => `/app/properties/${id}` },
-  lead: { table: 'leads', title: `'Inquiry' || COALESCE(' - ' || (SELECT title FROM properties WHERE id = e.property_id), '')`, city: '(SELECT city FROM properties WHERE id = e.property_id)', open: `e.status::text NOT IN ('won', 'lost')`, rep: 'e.arb_rep_id', link: (id) => `/app/leads/${id}` },
-  deal: { table: 'deals', title: `'Deal' || COALESCE(' - ' || (SELECT title FROM properties WHERE id = e.property_id), '')`, city: '(SELECT city FROM properties WHERE id = e.property_id)', open: `e.stage::text NOT IN ('closed_won', 'closed_lost')`, rep: 'e.assigned_rep_id', link: (id) => `/app/deals/${id}` },
+  property: { table: 'properties', title: `COALESCE(e.title, 'Listing')`, city: 'e.city', locality: 'e.locality', open: `e.status::text IN ('draft', 'pending_approval', 'approved')`, rep: 'NULL::uuid', link: (id) => `/app/properties/${id}` },
+  lead: { table: 'leads', title: `'Inquiry' || COALESCE(' - ' || (SELECT title FROM properties WHERE id = e.property_id), '')`, city: '(SELECT city FROM properties WHERE id = e.property_id)', locality: '(SELECT locality FROM properties WHERE id = e.property_id)', open: `e.status::text NOT IN ('won', 'lost')`, rep: 'e.arb_rep_id', link: (id) => `/app/leads/${id}` },
+  deal: { table: 'deals', title: `'Deal' || COALESCE(' - ' || (SELECT title FROM properties WHERE id = e.property_id), '')`, city: '(SELECT city FROM properties WHERE id = e.property_id)', locality: '(SELECT locality FROM properties WHERE id = e.property_id)', open: `e.stage::text NOT IN ('closed_won', 'closed_lost')`, rep: 'e.assigned_rep_id', link: (id) => `/app/deals/${id}` },
 };
 
 async function dashboard(user, { entityType = null, review = 'open', q = null } = {}) {
-  await assertReviewer(user);
+  const scope = await assertReviewer(user);
   const kinds = entityType ? [entityType] : Object.keys(ENTITY);
   const rows = [];
   for (const k of kinds) {
     const e = ENTITY[k];
     if (!e) throw badRequest('entityType must be property, lead or deal');
     const r = await pool.query(
-      `SELECT e.id, ${e.title} AS title, ${e.city} AS city, ${e.open} AS is_open, ${e.rep} AS rep_id, e.related_party_employee_ids AS employee_ids, e.created_at,
+      `SELECT e.id, ${e.title} AS title, ${e.city} AS city, ${e.locality} AS locality, ${e.open} AS is_open, ${e.rep} AS rep_id, e.related_party_employee_ids AS employee_ids, e.created_at,
               (SELECT MIN(detected_at) FROM related_party_log g WHERE g.entity_type = $1 AND g.entity_id = e.id) AS detected_at,
               (SELECT row_to_json(x) FROM (SELECT v.outcome, v.note, v.reviewed_at, ru.full_name AS reviewer FROM related_party_reviews v LEFT JOIN users ru ON ru.id = v.reviewed_by WHERE v.entity_type = $1 AND v.entity_id = e.id ORDER BY v.reviewed_at DESC LIMIT 1) x) AS last_review
        FROM ${e.table} e WHERE e.related_party_transaction ORDER BY e.created_at DESC LIMIT 500`,
       [k]
     );
-    for (const x of r.rows) rows.push({ ...x, entity_type: k });
+    for (const x of r.rows) if (management.covers(scope, x)) rows.push({ ...x, entity_type: k });
   }
   const empIds = [...new Set(rows.flatMap((x) => x.employee_ids))];
   const names = Object.fromEntries((await pool.query(
     `SELECT u.id, u.full_name, r.name AS role, ar.designation FROM users u JOIN roles r ON r.id = u.role_id LEFT JOIN arb_representatives ar ON ar.user_id = u.id WHERE u.id = ANY($1::uuid[])`, [empIds]
   )).rows.map((u) => [u.id, { name: u.full_name, role: u.role, designation: u.designation }]));
   let items = rows.map((x) => ({
-    entityType: x.entity_type, id: x.id, title: x.title, city: x.city, open: x.is_open, link: ENTITY[x.entity_type].link(x.id),
+    entityType: x.entity_type, id: x.id, title: x.title, city: x.city, locality: x.locality, open: x.is_open, link: ENTITY[x.entity_type].link(x.id),
     employees: x.employee_ids.map((id) => ({ id, ...(names[id] || { name: 'Former employee' }) })),
     // The one thing that must never happen: the linked employee holding it.
     selfAssigned: !!x.rep_id && x.employee_ids.includes(x.rep_id),
@@ -166,6 +187,11 @@ async function dashboard(user, { entityType = null, review = 'open', q = null } 
     items = items.filter((i) => `${i.title} ${i.city || ''} ${i.employees.map((e) => e.name).join(' ')}`.toLowerCase().includes(s));
   }
   items.sort((a, b) => Number(b.selfAssigned) - Number(a.selfAssigned) || new Date(b.detectedAt) - new Date(a.detectedAt));
+  // A City / Area Head's tiles count their own area; linked accounts and disclosures are central.
+  if (!scope.all) {
+    const count = (k) => rows.filter((x) => x.entity_type === k).length;
+    return { scope: scope.designation === 'ch' ? 'city' : 'area', summary: { listings: count('property'), inquiries: count('lead'), deals: count('deal'), awaiting_review: rows.filter((x) => !x.last_review).length }, items: items.slice(0, 300) };
+  }
   const summary = (await pool.query(
     `SELECT (SELECT COUNT(*) FROM users WHERE employee_linked_account)::int AS linked_accounts,
             (SELECT COUNT(*) FROM properties WHERE related_party_transaction)::int AS listings,
@@ -174,12 +200,12 @@ async function dashboard(user, { entityType = null, review = 'open', q = null } 
             (SELECT COUNT(*) FROM employee_disclosures WHERE removed_at IS NULL)::int AS disclosures,
             (SELECT COUNT(DISTINCT (entity_type, entity_id)) FROM related_party_log WHERE detected_at > now() - interval '30 days')::int AS detected_30d`
   )).rows[0];
-  return { summary, items: items.slice(0, 300) };
+  return { scope: 'all', summary, items: items.slice(0, 300) };
 }
 
 // Accounts linked to an employee - who and why (mobile or PAN, and the relation).
 async function linkedAccounts(user) {
-  await assertReviewer(user);
+  await assertCentral(user);
   const r = await pool.query(
     `SELECT u.id, u.full_name, r.name AS role, u.created_at, u.employee_link_ids,
             (SELECT array_agg(DISTINCT d.relation) FROM employee_disclosures d LEFT JOIN payee_tax_profiles t ON t.user_id = u.id
@@ -196,9 +222,23 @@ async function linkedAccounts(user) {
   }));
 }
 
+// The place of one flagged record, to check it is within a head's scope.
+async function placeOf(entityType, id) {
+  const e = ENTITY[entityType];
+  if (!e) throw badRequest('entityType must be property, lead or deal');
+  const r = (await pool.query(`SELECT ${e.city} AS city, ${e.locality} AS locality, e.related_party_employee_ids AS ids FROM ${e.table} e WHERE e.id = $1`, [id])).rows[0];
+  if (!r) throw notFound();
+  return r;
+}
+async function assertInScope(user, entityType, id) {
+  const scope = await assertReviewer(user);
+  const place = await placeOf(entityType, id);
+  if (!management.covers(scope, place)) throw forbidden('This transaction is outside your city / area');
+  return place;
+}
+
 async function history(user, entityType, id) {
-  await assertReviewer(user);
-  if (!ENTITY[entityType]) throw badRequest('entityType must be property, lead or deal');
+  await assertInScope(user, entityType, id);
   const [log, reviews, events] = await Promise.all([
     pool.query('SELECT employee_ids, detected_at FROM related_party_log WHERE entity_type = $1 AND entity_id = $2 ORDER BY detected_at', [entityType, id]),
     pool.query('SELECT v.outcome, v.note, v.reviewed_at, u.full_name AS reviewer FROM related_party_reviews v LEFT JOIN users u ON u.id = v.reviewed_by WHERE v.entity_type = $1 AND v.entity_id = $2 ORDER BY v.reviewed_at', [entityType, id]),
@@ -209,8 +249,7 @@ async function history(user, entityType, id) {
 
 // City Head / Super Admin review - recorded, never edited.
 async function review(user, entityType, id, { outcome, note } = {}, meta = {}) {
-  await assertReviewer(user);
-  if (!ENTITY[entityType]) throw badRequest('entityType must be property, lead or deal');
+  await assertInScope(user, entityType, id);
   if (!['disclosed_ok', 'undisclosed', 'not_related', 'noted'].includes(outcome)) throw badRequest('outcome must be disclosed_ok, undisclosed, not_related or noted');
   if (!note || String(note).trim().length < 5) throw badRequest('Record what was checked');
   const row = (await pool.query(`SELECT related_party_employee_ids AS ids FROM ${ENTITY[entityType].table} WHERE id = $1`, [id])).rows[0];
@@ -232,4 +271,4 @@ function startScheduler() {
   timer.unref?.();
 }
 
-module.exports = { RELATIONS, isEmployee, assertReviewer, rescan, myDisclosures, addDisclosure, withdrawDisclosure, allDisclosures, dashboard, linkedAccounts, history, review, startScheduler };
+module.exports = { RELATIONS, isEmployee, assertReviewer, assertCentral, me, rescan, myDisclosures, addDisclosure, withdrawDisclosure, allDisclosures, dashboard, linkedAccounts, history, review, startScheduler };

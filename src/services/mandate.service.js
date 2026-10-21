@@ -580,7 +580,14 @@ async function renew(id, user, { reason } = {}, meta = {}) {
   if (!STAFF.includes(user.role)) throw forbidden();
   const c = await cfg();
   const m = await loadMandate(id);
-  assertRepOrAdmin(m, user);
+  // The assigned representative or an admin; past the cap also the City / Area Head (checked below).
+  const headOk = async () => {
+    const place = m.listing_id ? (await pool.query('SELECT city, locality FROM properties WHERE id = $1', [m.listing_id])).rows[0] : null;
+    return require('./management.service').canOversee(user, place || {});
+  };
+  if (!(ADMIN.includes(user.role) || (user.role === 'internal_sales' && (!m.assigned_rep_id || m.assigned_rep_id === user.id)) || (m.renewal_count >= c.cap && (await headOk())))) {
+    throw forbidden('Only the assigned A R representative or an admin can do this');
+  }
   if (!isExclusive(m.mandate_type)) throw badRequest('Only an Exclusive Mandate is renewed');
   if (!['active', 'expired'].includes(m.status)) throw badRequest(`A ${m.status} mandate cannot be renewed`);
   const deals = await linkedDeals(m);
@@ -589,9 +596,16 @@ async function renew(id, user, { reason } = {}, meta = {}) {
     await logEvent(id, 'renewal_refused', { actor: user, ip: meta.ip, detail: { reason: 'no deal past Site Visit Completed' } });
     throw badRequest('Renewal needs a deal on this mandate that has moved past Site Visit Completed');
   }
+  // Past the cap: the Super Admin, or the City / Area Head of the property's place (sec. 33.3 Band B).
   if (m.renewal_count >= c.cap && user.role !== 'super_admin') {
-    await logEvent(id, 'renewal_refused', { actor: user, ip: meta.ip, stage: progressing.stage, detail: { reason: 'renewal cap reached' } });
-    throw forbidden(`This mandate has been renewed ${m.renewal_count} times - further renewal needs Super Admin approval`);
+    const place = (await pool.query(`SELECT p.city, p.locality FROM deals d JOIN properties p ON p.id = d.property_id WHERE d.id = $1`, [progressing.id])).rows[0]
+      || (m.listing_id ? (await pool.query('SELECT city, locality FROM properties WHERE id = $1', [m.listing_id])).rows[0] : null);
+    const scope = await require('./management.service').scopeOf(user);
+    const head = scope && !scope.all && require('./management.service').covers(scope, place || {});
+    if (!head) {
+      await logEvent(id, 'renewal_refused', { actor: user, ip: meta.ip, stage: progressing.stage, detail: { reason: 'renewal cap reached' } });
+      throw forbidden(`This mandate has been renewed ${m.renewal_count} times - further renewal needs the Super Admin or the City / Area Head`);
+    }
   }
   const from = m.mandate_end_date && new Date(m.mandate_end_date) > new Date() ? new Date(m.mandate_end_date).toISOString().slice(0, 10) : today();
   const end = addDays(from, isSeller(m.mandate_type) ? c.sellerDays : c.buyerDays);

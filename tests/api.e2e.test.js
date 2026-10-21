@@ -6750,3 +6750,70 @@ test('related party (sec. 33.12): family disclosure links accounts, listings / i
   assert.ok((await pool.query('SELECT removed_at FROM employee_disclosures WHERE id = $1', [disc.data.disclosure.id])).rows[0].removed_at);
   assert.ok((await pool.query(`SELECT COUNT(*)::int AS n FROM related_party_log WHERE entity_type = 'lead' AND entity_id = $1`, [lead.id])).rows[0].n >= 1, 'history stays');
 });
+
+test('city / area heads: CH and AH designations never take inquiries, review related-party transactions only in their city / localities, may override the cascade where plain staff cannot, and are the heads alerted for their place', async () => {
+  const management = require('../src/services/management.service');
+  const A = ctx.admin.token;
+  const rnd = () => `6${String(Math.floor(Math.random() * 1e9)).padStart(9, '0')}`;
+  const HX = `Head City ${RUN}`;
+  const HY = `Other City ${RUN}`;
+  const LOC = `Head Locality ${RUN}`;
+  const ch = await createUser('internal_sales', 'city-head');
+  const ah = await createUser('internal_sales', 'area-head');
+  const plain = await createUser('internal_sales', 'plain-staff');
+  const chSet = await api('PUT', `/representatives/${ch.id}`, { token: A, body: { designation: 'ch', assignedCities: [HX], acceptsAssignments: true } });
+  assert.equal(chSet.status, 200, JSON.stringify(chSet.body));
+  assert.equal((await api('PUT', `/representatives/${ah.id}`, { token: A, body: { designation: 'ah', assignedCities: [HX], coverageLocalities: [LOC] } })).status, 200);
+  assert.equal((await pool.query('SELECT accepts_assignments FROM arb_representatives WHERE user_id = $1', [ch.id])).rows[0].accepts_assignments, false, 'heads oversee, they are never routed inquiries');
+  assert.equal((await api('GET', '/auth/me', { token: ch.token })).data.designation, 'ch');
+
+  // ---- who heads a place
+  assert.ok((await management.headsFor({ city: HX, locality: LOC })).includes(ch.id));
+  assert.ok((await management.headsFor({ city: HX, locality: LOC })).includes(ah.id));
+  assert.ok(!(await management.headsFor({ city: HX, locality: 'Elsewhere' })).includes(ah.id), 'an AH only for their localities');
+  assert.ok(!(await management.headsFor({ city: HY })).includes(ch.id));
+
+  // ---- related-party review scoped to the head's place
+  const E = await createUser('internal_sales', 'head-emp');
+  const spouseMobile = rnd();
+  await api('POST', '/related-party/disclosures', { token: E.token, body: { relation: 'spouse', fullName: `Spouse ${RUN}`, mobile: spouseMobile } });
+  const spouseCust = (await pool.query(`INSERT INTO customers (full_name, mobile) VALUES ($1, $2) RETURNING id`, [`Spouse ${RUN}`, spouseMobile])).rows[0].id;
+  const seller = await createUser('customer', 'head-seller');
+  const mkProp = async (city, locality) => (await pool.query(`INSERT INTO properties (created_by, title, property_type, transaction_type, city, locality, price, status) VALUES ($1, $2, 'apartment', 'sell', $3, $4, '80 Lakh', 'approved') RETURNING id`, [seller.id, `Head Flat ${city}`, city, locality])).rows[0].id;
+  const inX = (await pool.query(`INSERT INTO leads (customer_id, property_id, source) VALUES ($1, $2, 'website') RETURNING id, related_party_transaction`, [spouseCust, await mkProp(HX, LOC)])).rows[0];
+  const inY = (await pool.query(`INSERT INTO leads (customer_id, property_id, source) VALUES ($1, $2, 'website') RETURNING id`, [spouseCust, await mkProp(HY, 'Somewhere')])).rows[0];
+  assert.equal(inX.related_party_transaction, true);
+
+  assert.deepEqual((await api('GET', '/related-party/me', { token: plain.token })).data, { reviewer: false });
+  const meCh = (await api('GET', '/related-party/me', { token: ch.token })).data;
+  assert.deepEqual([meCh.reviewer, meCh.scope], [true, 'city']);
+  const chDash = await api('GET', '/related-party/dashboard?review=all', { token: ch.token });
+  assert.equal(chDash.status, 200, JSON.stringify(chDash.body));
+  const chIds = chDash.data.items.map((i) => i.id);
+  assert.ok(chIds.includes(inX.id) && !chIds.includes(inY.id), 'only their city');
+  assert.ok(chDash.data.items.every((i) => String(i.city).toLowerCase() === HX.toLowerCase()));
+  assert.equal(chDash.data.scope, 'city');
+  const ahIds = (await api('GET', '/related-party/dashboard?review=all', { token: ah.token })).data.items.map((i) => i.id);
+  assert.ok(ahIds.includes(inX.id) && !ahIds.includes(inY.id));
+  assert.equal((await api('GET', '/related-party/dashboard', { token: plain.token })).status, 403);
+  assert.equal((await api('GET', '/related-party/linked-accounts', { token: ch.token })).status, 403, 'linked accounts are central');
+  assert.equal((await api('POST', `/related-party/lead/${inY.id}/review`, { token: ch.token, body: { outcome: 'noted', note: 'Not my city but trying.' } })).status, 403);
+  const rev = await api('POST', `/related-party/lead/${inX.id}/review`, { token: ch.token, body: { outcome: 'disclosed_ok', note: 'Disclosed at onboarding, routed away.' } });
+  assert.equal(rev.status, 201, JSON.stringify(rev.body));
+
+  // ---- cascade override: only a TL, the place's head or an admin
+  const r1 = await createUser('internal_sales', 'head-rep1');
+  const r2 = await createUser('internal_sales', 'head-rep2');
+  for (const u of [r1, r2]) await pool.query(`INSERT INTO arb_representatives (user_id, designation, assigned_cities) VALUES ($1, 'rm', $2)`, [u.id, [HX]]);
+  const cust = (await pool.query(`INSERT INTO customers (full_name, mobile) VALUES ($1, $2) RETURNING id`, [`Buyer ${RUN}`, rnd()])).rows[0].id;
+  const lead = (await pool.query(`INSERT INTO leads (customer_id, property_id, source, arb_rep_id, assigned_to, assigned_at, assignment_hop) VALUES ($1, $2, 'website', $3, $3, now(), 1) RETURNING id`, [cust, await mkProp(HX, LOC), r1.id])).rows[0].id;
+  const byPlain = await api('PUT', `/leads/${lead}/assign`, { token: plain.token, body: { assignedTo: r2.id } });
+  assert.equal(byPlain.status, 403, JSON.stringify(byPlain.body));
+  const byHead = await api('PUT', `/leads/${lead}/assign`, { token: ch.token, body: { assignedTo: r2.id } });
+  assert.equal(byHead.status, 200, JSON.stringify(byHead.body));
+  assert.equal((await pool.query('SELECT arb_rep_id FROM leads WHERE id = $1', [lead])).rows[0].arb_rep_id, r2.id);
+  // A City Head of another city cannot.
+  const otherHead = await createUser('internal_sales', 'other-head');
+  await api('PUT', `/representatives/${otherHead.id}`, { token: A, body: { designation: 'ch', assignedCities: [HY] } });
+  assert.equal((await api('PUT', `/leads/${lead}/assign`, { token: otherHead.token, body: { assignedTo: r1.id } })).status, 403);
+});

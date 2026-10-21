@@ -41,9 +41,14 @@ router.use(authenticate);
  *     summary: Withdraw a disclosure with a reason (kept on record)
  *     tags: [Related party]
  *     security: [{ bearerAuth: [] }]
+ * /related-party/me:
+ *   get:
+ *     summary: Whether the caller reviews related-party transactions - everything (Super Admin / central) or a city / area (City Head / Area Head)
+ *     tags: [Related party]
+ *     security: [{ bearerAuth: [] }]
  * /related-party/dashboard:
  *   get:
- *     summary: Related-party listings, inquiries and deals for City Head / Super Admin review
+ *     summary: Related-party listings, inquiries and deals for review - a City / Area Head sees their own city / localities
  *     tags: [Related party]
  *     security: [{ bearerAuth: [] }]
  * /related-party/linked-accounts:
@@ -67,6 +72,8 @@ router.use(authenticate);
  *     tags: [Related party]
  *     security: [{ bearerAuth: [] }]
  */
+// Whether the signed-in person reviews related-party transactions, and over what (for the CRM).
+router.get('/me', h(async (req, res) => ok(res, 'Reviewer', await rp.me(req.user))));
 router.get('/disclosures/mine', h(async (req, res) => ok(res, 'Disclosures', await rp.myDisclosures(req.user))));
 router.get('/disclosures', [query('employeeId').optional().isUUID()], validate, h(async (req, res) => ok(res, 'Disclosures', await rp.allDisclosures(req.user, req.query))));
 router.post(
@@ -80,7 +87,7 @@ router.post('/disclosures/:id/withdraw', [param('id').isUUID(), body('note').isS
 router.get('/dashboard', [query('entityType').optional().isIn(['property', 'lead', 'deal']), query('review').optional().isIn(['open', 'all']), query('q').optional().isString().isLength({ max: 100 })], validate, h(async (req, res) => ok(res, 'Related-party transactions', await rp.dashboard(req.user, req.query))));
 router.get('/linked-accounts', h(async (req, res) => ok(res, 'Linked accounts', await rp.linkedAccounts(req.user))));
 router.post('/rescan', h(async (req, res) => {
-  await rp.assertReviewer(req.user);
+  await rp.assertCentral(req.user);
   return ok(res, 'Re-checked', await rp.rescan('manual'));
 }));
 router.get('/:entityType/:id', [KIND, param('id').isUUID()], validate, h(async (req, res) => ok(res, 'History', await rp.history(req.user, req.params.entityType, req.params.id))));

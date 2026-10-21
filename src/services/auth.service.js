@@ -71,10 +71,12 @@ async function findUserById(id) {
             u.role_id, r.name AS role_name, r.description AS role_description,
             u.full_name, u.email, u.mobile, u.status,
             u.email_verified, u.mobile_verified, u.profile_picture_url,
-            u.created_by, u.signup_source, u.last_login_at, u.created_at, u.updated_at
+            u.created_by, u.signup_source, u.last_login_at, u.created_at, u.updated_at,
+            ar.designation, ar.assigned_cities, ar.coverage_localities
      FROM users u
      JOIN roles r ON r.id = u.role_id
      LEFT JOIN tenants t ON t.id = u.tenant_id
+     LEFT JOIN arb_representatives ar ON ar.user_id = u.id
      WHERE u.id = $1`,
     [id]
   );

@@ -1,5 +1,6 @@
 const pool = require('../config/db');
 const configService = require('./config.service');
+const management = require('./management.service');
 const notificationService = require('./notification.service');
 const { badRequest, forbidden, notFound } = require('../utils/httpError');
 
@@ -269,7 +270,8 @@ async function escalateRelated(lead, ctx, related) {
     params
   )).rows.map((r) => r.user_id);
   await logEvent(lead.id, { hop: lead.assignment_hop || 0, kind: 'rp_escalated', detail: { linked_employees: related, team_leaders: tls } });
-  await notify([...tls, ...(await adminIds())].filter((id) => !related.includes(id)), {
+  const heads = await management.headsFor({ city: ctx.city, locality: ctx.locality });
+  await notify([...tls, ...heads, ...(await adminIds())].filter((id) => !related.includes(id)), {
     type: 'related_party', title: 'Related-party inquiry needs manual assignment',
     message: `${ctx.locality ? `${ctx.locality}, ` : ''}${ctx.city || 'Location not given'} - a party is linked to an employee and no other representative is available. Assign it by hand (not to the linked employee).`, leadId: lead.id,
   });
@@ -399,13 +401,16 @@ async function place(lead, ctx, c, pick, hop, previous, reason = 'new', exitReas
       type: 'inquiry_missed', title: 'Inquiry window missed', message: `No first contact was logged in time - the inquiry (${label}) moved to the next representative.`, leadId: lead.id,
     });
   }
+  // Sec. 34: a hop-3 (system pool) assignment is a management signal for the Area / City Head.
+  const heads = await management.headsFor({ city: ctx.city, locality: ctx.locality });
   if (hop >= 3) {
-    await notify(await adminIds(), {
+    await notify([...heads, ...(await adminIds())], {
       type: 'inquiry_system_pool', title: `Inquiry reached the system pool (hop ${hop})`, message: `${label} - missed by ${hop - 1} representative(s).`, leadId: lead.id,
     });
   }
+  // The mapping gap goes to the City Head for a permanent mapping.
   if (pick.mappingGap) {
-    await notify(await adminIds(), {
+    await notify([...heads, ...(await adminIds())], {
       type: 'broker_mapping_gap', title: 'Broker has no mapped RM', message: 'An inquiry for an unmapped broker went to the least-busy RM. Map the broker to an RM in Representatives.', leadId: lead.id,
     });
   }
@@ -576,7 +581,9 @@ async function upsertRep(userId, data, actor) {
   if (!ADMIN.includes(actor.role)) throw forbidden('Only an admin can configure representatives');
   const u = (await pool.query(`SELECT u.id, r.name AS role FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = $1`, [userId])).rows[0];
   if (!u || !REP_ROLES.includes(u.role)) throw badRequest('Representatives must be A R staff (internal sales or admin)');
-  if (data.designation && !['rm', 'dm', 'tl', 'tc'].includes(data.designation)) throw badRequest('designation must be rm, dm, tl or tc');
+  // Sec. 33.3: RM, DM, TL, TC, FM, the loan / insurance desks (LD / ID), and City / Area Heads (CH / AH).
+  const DESIGNATIONS = ['rm', 'dm', 'tl', 'tc', 'fm', 'ld', 'id', 'ch', 'ah'];
+  if (data.designation && !DESIGNATIONS.includes(data.designation)) throw badRequest(`designation must be one of: ${DESIGNATIONS.join(', ')}`);
   if (data.teamLeaderId && data.teamLeaderId === userId) throw badRequest('A representative cannot lead themselves');
   const row = (
     await pool.query(

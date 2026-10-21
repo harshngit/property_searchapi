@@ -15,6 +15,12 @@ function badRequest(message) {
   return err;
 }
 
+function forbidden(message) {
+  const err = new Error(message);
+  err.statusCode = 403;
+  return err;
+}
+
 // Every human-readable field (names, titles) a lead row needs for display -
 // the leads table itself only stores FK ids. Shared by listLeads/getLeadById
 // so the shape returned to the frontend is identical everywhere.
@@ -276,6 +282,20 @@ async function assignLead(id, assigneeId, user) {
   }
   if (!isAdmin(user.role) && assignee.rows[0].tenant_id !== user.tenant_id) {
     throw badRequest('Cannot assign a lead to a user outside your tenant');
+  }
+
+  // Sec. 34: moving an inquiry off the cascade to another A R representative is
+  // a manual override - only a Team Leader, the City / Area Head of the
+  // inquiry's place, or an admin.
+  const toRep = (await pool.query('SELECT 1 FROM arb_representatives WHERE user_id = $1', [assigneeId])).rows.length > 0;
+  if (toRep && !isAdmin(user.role)) {
+    const current = (await pool.query('SELECT arb_rep_id FROM leads WHERE id = $1', [id])).rows[0];
+    if (current && current.arb_rep_id && current.arb_rep_id !== assigneeId) {
+      const management = require('./management.service');
+      const ctx = await require('./assignment.service').leadContext(id);
+      const allowed = (await management.isTeamLeader(user.id)) || (await management.canOversee(user, { city: ctx.city, locality: ctx.locality }));
+      if (!allowed) throw forbidden('Only a Team Leader or the City / Area Head can reassign an inquiry to another representative');
+    }
   }
 
   const client = await pool.connect();
