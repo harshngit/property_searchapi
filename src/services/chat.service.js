@@ -192,10 +192,16 @@ async function send(user, threadId, { body }, meta = {}) {
   const others = await pool.query('SELECT user_id FROM chat_participants WHERE thread_id = $1 AND user_id <> $2', [threadId, user.id]);
   for (const o of others.rows) {
     await notificationService.createNotification({ userId: o.user_id, type: 'chat_message', title: `New message - ${t.subject}`.slice(0, 120), message: `${PARTY_LABEL[party]}: ${text.slice(0, 140)}`, relatedEntityType: 'chat_thread', relatedEntityId: threadId }).catch(() => {});
+    require('../realtime/socket').getIo()?.to(`user:${o.user_id}`).emit('chat:unread_bump', { threadId });
   }
   require('./webhook.service').emit('message.new', { threadId, leadId: t.lead_id, party, at: m.created_at }, { leadId: t.lead_id }).catch(() => {});
   const name = (await pool.query('SELECT full_name FROM users WHERE id = $1', [user.id])).rows[0]?.full_name;
-  return shapeMessage({ ...m, sender_name: name }, user);
+  const shaped = shapeMessage({ ...m, sender_name: name }, user);
+  // Broadcast to everyone with the thread open. `mine` above is relative to
+  // the sender (`user`) - meaningless to other recipients, so `senderId` is
+  // included for every client to work out "mine" for itself.
+  require('../realtime/socket').getIo()?.to(`thread:${threadId}`).emit('chat:message', { ...shaped, senderId: m.sender_id });
+  return shaped;
 }
 
 async function markRead(user, threadId) {
@@ -219,6 +225,7 @@ async function setStatus(user, threadId, { status, reason }, meta = {}) {
   if (!t) throw notFound('Conversation not found');
   await pool.query(`INSERT INTO chat_messages (thread_id, sender_id, party, kind, body) VALUES ($1, $2, 'staff', 'system', $3)`, [threadId, user.id, status === 'closed' ? `Conversation closed by A R Buildwel${reason ? `: ${String(reason).slice(0, 200)}` : ''}` : 'Conversation reopened by A R Buildwel']);
   await auditService.log({ actor: user, action: `chat.thread_${status}`, entityType: 'chat_thread', entityId: threadId, after: { reason }, ...meta });
+  require('../realtime/socket').getIo()?.to(`thread:${threadId}`).emit('chat:thread_status', { threadId, status, closedReason: status === 'closed' ? String(reason || '').slice(0, 300) || null : null });
   return view(user, threadId);
 }
 
@@ -232,4 +239,4 @@ async function maskedContact(user, leadId, meta = {}) {
   return { name: firstName(l.full_name), phone_masked: maskPhone(l.mobile), email_masked: maskEmail(l.email), note: 'Use platform messaging to reach this person.' };
 }
 
-module.exports = { open, list, startable, view, messages, send, markRead, unreadCount, setStatus, maskedContact, contactViolations };
+module.exports = { open, list, startable, view, messages, send, markRead, unreadCount, setStatus, maskedContact, contactViolations, threadFor };

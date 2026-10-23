@@ -13,7 +13,12 @@ const app = require('./app');
 // Keep it configurable while using 5001 as the development fallback.
 const PORT = process.env.PORT || 5001;
 
-app.listen(PORT, () => {
+// Built on the raw HTTP server (not app.listen) so Socket.IO - real-time
+// push for Module 36 chat - can attach to the same server/port.
+const server = require('http').createServer(app);
+require('./realtime/socket').init(server);
+
+server.listen(PORT, () => {
   console.log(`PropertySerch Auth Service running on http://localhost:${PORT}`);
   console.log(`Swagger docs available at http://localhost:${PORT}/api-docs`);
   // Section 23 crawlers - on only where CRAWLER_SCHEDULER_ENABLED=true (the
