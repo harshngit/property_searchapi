@@ -1,6 +1,5 @@
 const cheerio = require('cheerio');
 const pdfParse = require('pdf-parse/lib/pdf-parse.js');
-const Anthropic = require('@anthropic-ai/sdk');
 const { politeFetch, CrawlerError } = require('./fetcher');
 
 // Layer 2 - parsers. Each crawler source has an adapter and a field mapping
@@ -20,8 +19,7 @@ const { politeFetch, CrawlerError } = require('./fetcher');
 // source_bank, auction_reference_id, auction_portal_url, possession, area.
 // Contact details are never kept - the normaliser strips them anyway.
 
-const AI_MODEL = 'claude-sonnet-5';
-const aiClient = process.env.ANTHROPIC_API_KEY ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY }) : null;
+const orchestrator = require('../ai/orchestrator.service');
 
 const clean = (v) => (v == null ? null : String(v).replace(/\s+/g, ' ').trim() || null);
 
@@ -107,31 +105,20 @@ const AI_SCHEMA = {
 };
 
 // AI parser for notices the regexes can't read (Layer 2, "complex
-// documents"). Returns null when no AI key is configured. Never asked for -
+// documents"), the "notice_extract" activity. Returns null when AI is off. Never asked for -
 // and the schema has no place for - names, phone numbers or emails.
 async function aiExtract(text) {
-  if (!aiClient || !text || text.trim().length < 40) return null;
-  const response = await aiClient.messages.create({
-    model: AI_MODEL,
-    max_tokens: 1024,
-    output_config: { effort: 'low', format: { type: 'json_schema', schema: AI_SCHEMA } },
-    messages: [
-      {
-        role: 'user',
-        content:
-          'Extract the property sale / auction details from this Indian bank auction or public sale notice. ' +
-          'Prices in rupees as plain numbers (convert lakh / crore). Dates as YYYY-MM-DD (use DD-MM-YYYY Indian order when reading). ' +
-          'Use null for anything not stated. Do not include any person names, phone numbers or email addresses.\n\n' +
-          text.slice(0, 12000),
-      },
-    ],
+  if (!text || text.trim().length < 40) return null;
+  const out = await orchestrator.tryRun('notice_extract', {
+    entityType: 'crawled_notice',
+    schema: AI_SCHEMA,
+    prompt:
+      'Extract the property sale / auction details from this Indian bank auction or public sale notice. ' +
+      'Prices in rupees as plain numbers (convert lakh / crore). Dates as YYYY-MM-DD (use DD-MM-YYYY Indian order when reading). ' +
+      'Use null for anything not stated. Do not include any person names, phone numbers or email addresses.\n\n' +
+      text.slice(0, 12000),
   });
-  const block = response.content.find((b) => b.type === 'text');
-  try {
-    return block ? JSON.parse(block.text) : null;
-  } catch {
-    return null;
-  }
+  return out?.json || null;
 }
 
 // Fill gaps in a regex/HTML-parsed item from the AI parser when enabled.

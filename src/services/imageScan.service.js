@@ -1,4 +1,3 @@
-const Anthropic = require('@anthropic-ai/sdk');
 const { Jimp } = require('jimp');
 const exifr = require('exifr');
 const configService = require('./config.service');
@@ -13,8 +12,7 @@ const configService = require('./config.service');
 //     visiting cards - these images are rejected before upload; without
 //     the AI, a visiting-card shape heuristic flags images for review.
 
-const AI_MODEL = 'claude-sonnet-5';
-const aiClient = process.env.ANTHROPIC_API_KEY ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY }) : null;
+const orchestrator = require('./ai/orchestrator.service');
 
 // 64-bit dHash as a signed BIGINT-compatible string.
 async function fingerprint(image) {
@@ -68,50 +66,37 @@ function looksLikeVisitingCard(width, height) {
 }
 
 async function aiContactScan(image) {
-  if (!aiClient) return null;
+  if (!(await orchestrator.available('image_contact_scan'))) return null;
   try {
     const small = image.bitmap.width > 1024 ? image.clone().resize({ w: 1024 }) : image.clone();
     const jpeg = await small.getBuffer('image/jpeg', { quality: 80 });
-    const response = await aiClient.messages.create({
-      model: AI_MODEL,
-      max_tokens: 300,
-      output_config: {
-        effort: 'low',
-        format: {
-          type: 'json_schema',
-          schema: {
-            type: 'object',
-            properties: {
-              contains_contact_info: { type: 'boolean' },
-              kinds: { type: 'array', items: { type: 'string', enum: ['phone', 'email', 'address', 'url', 'qr_code', 'whatsapp', 'social_handle'] } },
-              is_visiting_card: { type: 'boolean' },
-              text_heavy: { type: 'boolean' },
-            },
-            required: ['contains_contact_info', 'kinds', 'is_visiting_card', 'text_heavy'],
-            additionalProperties: false,
-          },
+    const out = await orchestrator.tryRun('image_contact_scan', {
+      entityType: 'listing_photo',
+      schema: {
+        type: 'object',
+        properties: {
+          contains_contact_info: { type: 'boolean' },
+          kinds: { type: 'array', items: { type: 'string', enum: ['phone', 'email', 'address', 'url', 'qr_code', 'whatsapp', 'social_handle'] } },
+          is_visiting_card: { type: 'boolean' },
+          text_heavy: { type: 'boolean' },
         },
+        required: ['contains_contact_info', 'kinds', 'is_visiting_card', 'text_heavy'],
+        additionalProperties: false,
       },
-      messages: [
+      parts: [
+        { type: 'image', mediaType: 'image/jpeg', data: jpeg.toString('base64') },
         {
-          role: 'user',
-          content: [
-            { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: jpeg.toString('base64') } },
-            {
-              type: 'text',
-              text:
-                'This photo was uploaded to a real-estate listing. Contact details must never appear in listing photos. ' +
-                'Does the image show any readable phone number, email address, street address, website URL, QR code, WhatsApp / social handle, or is it a visiting card? ' +
-                'Watermarks of the property photo itself are fine unless they contain contact details.',
-            },
-          ],
+          type: 'text',
+          text:
+            'This photo was uploaded to a real-estate listing. Contact details must never appear in listing photos. ' +
+            'Does the image show any readable phone number, email address, street address, website URL, QR code, WhatsApp / social handle, or is it a visiting card? ' +
+            'Watermarks of the property photo itself are fine unless they contain contact details.',
         },
       ],
     });
-    const block = response.content.find((b) => b.type === 'text');
-    return block ? JSON.parse(block.text) : null;
+    return out?.json || null;
   } catch (err) {
-    console.error('[imageScan] AI scan failed:', err.message);
+    console.error('[imageScan] aiContactScan failed:', err.message);
     return null;
   }
 }
@@ -155,8 +140,10 @@ async function analyse(buffer, { scan = true } = {}) {
   const reasons = [];
   let status = 'clean';
   let ocr = null;
+  let aiChecked = false;
   if (scan && (await configService.getConfig('fraud.image_scan_enabled', true))) {
     const ai = await aiContactScan(image);
+    aiChecked = !!ai;
     if (ai?.contains_contact_info || ai?.is_visiting_card) {
       status = 'blocked';
       if (ai.is_visiting_card) reasons.push('Image looks like a visiting card');
@@ -173,52 +160,39 @@ async function analyse(buffer, { scan = true } = {}) {
       reasons.push('Text-heavy image');
     }
   }
-  return { decodable: true, width, height, phash, exif, scan: { status, reasons, ai: !!aiClient, ocr: !!ocr } };
+  return { decodable: true, width, height, phash, exif, scan: { status, reasons, ai: aiChecked, ocr: !!ocr } };
 }
 
 // Module 47: is this a picture taken on the spot, or something lifted from a
 // screen or the internet? Returns null when the AI is not configured.
 async function originScan(buffer) {
-  if (!aiClient) return null;
+  if (!(await orchestrator.available('image_origin_check'))) return null;
   try {
     const image = await Jimp.read(buffer);
     const small = image.bitmap.width > 1024 ? image.resize({ w: 1024 }) : image;
     const jpeg = await small.getBuffer('image/jpeg', { quality: 80 });
-    const response = await aiClient.messages.create({
-      model: AI_MODEL,
-      max_tokens: 200,
-      output_config: {
-        effort: 'low',
-        format: {
-          type: 'json_schema',
-          schema: {
-            type: 'object',
-            properties: { is_screenshot: { type: 'boolean' }, is_map_or_street_view: { type: 'boolean' }, is_photo_of_screen: { type: 'boolean' }, has_stock_watermark: { type: 'boolean' } },
-            required: ['is_screenshot', 'is_map_or_street_view', 'is_photo_of_screen', 'has_stock_watermark'],
-            additionalProperties: false,
-          },
-        },
+    const out = await orchestrator.tryRun('image_origin_check', {
+      entityType: 'field_photo',
+      schema: {
+        type: 'object',
+        properties: { is_screenshot: { type: 'boolean' }, is_map_or_street_view: { type: 'boolean' }, is_photo_of_screen: { type: 'boolean' }, has_stock_watermark: { type: 'boolean' } },
+        required: ['is_screenshot', 'is_map_or_street_view', 'is_photo_of_screen', 'has_stock_watermark'],
+        additionalProperties: false,
       },
-      messages: [
+      parts: [
+        { type: 'image', mediaType: 'image/jpeg', data: jpeg.toString('base64') },
         {
-          role: 'user',
-          content: [
-            { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: jpeg.toString('base64') } },
-            {
-              type: 'text',
-              text:
-                'A field worker says they took this photo of a property with their own phone, standing at the property. ' +
-                'Is it instead a screenshot (phone or browser interface visible), map or street-view imagery (navigation arrows, map watermark, blurred faces or plates, stitched panorama), ' +
-                'a photo of another screen (moire pattern, bezel, glare), or an image carrying a stock-photo or property-portal watermark?',
-            },
-          ],
+          type: 'text',
+          text:
+            'A field worker says they took this photo of a property with their own phone, standing at the property. ' +
+            'Is it instead a screenshot (phone or browser interface visible), map or street-view imagery (navigation arrows, map watermark, blurred faces or plates, stitched panorama), ' +
+            'a photo of another screen (moire pattern, bezel, glare), or an image carrying a stock-photo or property-portal watermark?',
         },
       ],
     });
-    const block = response.content.find((b) => b.type === 'text');
-    return block ? JSON.parse(block.text) : null;
+    return out?.json || null;
   } catch (err) {
-    console.error('[imageScan] origin scan failed:', err.message);
+    console.error('[imageScan] originScan failed:', err.message);
     return null;
   }
 }

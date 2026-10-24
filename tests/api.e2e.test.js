@@ -6817,3 +6817,90 @@ test('city / area heads: CH and AH designations never take inquiries, review rel
   await api('PUT', `/representatives/${otherHead.id}`, { token: A, body: { designation: 'ch', assignedCities: [HY] } });
   assert.equal((await api('PUT', `/leads/${lead}/assign`, { token: otherHead.token, body: { assignedTo: r1.id } })).status, 403);
 });
+
+test('AI orchestration + credit wallet: simple tasks on OpenAI, important on Claude, fallback to the other provider, credits taken first (402 when short), refunded when no provider answers, staff and background work free, packs + GST, admin top-ups, append-only ledger, paid AI agreement review', async () => {
+  const ai = require('../src/services/ai/orchestrator.service');
+  const A = ctx.admin.token;
+  const broker = await createUser('broker', 'ai-wallet');
+  const brokerUser = { id: broker.id, role: 'broker' };
+
+  // ---- the wallet: empty, packs with GST, the price list
+  const w0 = await api('GET', '/ai-credits/wallet', { token: broker.token });
+  assert.equal(w0.status, 200, JSON.stringify(w0.body));
+  assert.equal(w0.data.balance, 0);
+  const pro = w0.data.packs.find((p) => p.name === 'Professional');
+  assert.deepEqual([pro.priceInr, pro.gstInr, pro.totalInr, pro.totalCredits], [1000, 180, 1180, 1100], '1 credit = Rs 1, bonus credits, 18% GST');
+  assert.ok(w0.data.prices.some((p) => p.key === 'agreement_review' && p.credits === 49));
+  assert.ok(!w0.data.prices.some((p) => p.key === 'review_screen'), 'background work is not sold');
+
+  // ---- routing: simple -> OpenAI, important -> Claude
+  const simple = await ai.run('review_screen', { prompt: 'Rating 5. Great place.', schema: { type: 'object', properties: { fake_likelihood: { type: 'integer' } }, required: ['fake_likelihood'], additionalProperties: false } });
+  assert.deepEqual([simple.provider, simple.model, simple.creditsCharged], ['openai', 'gpt-6-luna', 0]);
+  assert.equal(typeof simple.json.fake_likelihood, 'number');
+
+  // ---- a user-paid activity with no credits: refused before any model is called
+  await assert.rejects(ai.run('lead_insight', { user: brokerUser, prompt: 'Needs a 2BHK' }), (e) => e.statusCode === 402 && e.errors[0].code === 'insufficient_credits' && e.errors[0].needed === 2);
+  assert.equal((await pool.query(`SELECT error FROM ai_runs WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1`, [broker.id])).rows[0].error, 'not enough credits');
+
+  // ---- admin top-ups: a bank-transfer purchase of a pack, and a grant
+  assert.equal((await api('POST', '/ai-credits/admin/credit', { token: broker.token, body: { userId: broker.id, credits: 100, note: 'self top-up attempt' } })).status, 403);
+  const bought = await api('POST', '/ai-credits/admin/credit', { token: A, body: { userId: broker.id, packId: pro.id, reference: `UTR${RUN}` } });
+  assert.equal(bought.status, 200, JSON.stringify(bought.body));
+  assert.equal(bought.data.balance, 1100);
+  const purchase = (await pool.query(`SELECT * FROM ai_credit_purchases WHERE user_id = $1`, [broker.id])).rows[0];
+  assert.deepEqual([purchase.status, purchase.gateway, Number(purchase.total_inr)], ['paid', 'manual', 1180]);
+  assert.match(purchase.receipt_number, /^AIC-\d{4}-\d{6}$/);
+  assert.equal((await api('POST', '/ai-credits/admin/credit', { token: A, body: { userId: broker.id, credits: -5000, note: 'too much taken back' } })).status, 400, 'never below zero');
+
+  // ---- paid run: credits taken, run logged with tokens and cost
+  const paid = await ai.run('lead_insight', { user: brokerUser, prompt: 'Needs a 2BHK in Dwarka under 90 lakh' });
+  assert.deepEqual([paid.provider, paid.creditsCharged, paid.balance], ['openai', 2, 1098]);
+  const runRow = (await pool.query('SELECT * FROM ai_runs WHERE id = $1', [paid.runId])).rows[0];
+  assert.equal(runRow.status, 'ok');
+  assert.ok(runRow.input_tokens > 0 && Number(runRow.cost_usd) > 0, 'actual cost recorded');
+
+  // ---- fallback to the other provider when the first fails
+  const fb = await ai.run('lead_insight', { user: brokerUser, prompt: 'Lead text [fail-openai]' });
+  assert.deepEqual([fb.provider, fb.fallbackUsed, fb.creditsCharged], ['claude', true, 2]);
+
+  // ---- no provider answers: the credits come back
+  await assert.rejects(ai.run('lead_insight', { user: brokerUser, prompt: 'Lead text [fail-openai] [fail-claude]' }), (e) => e.statusCode === 502 && /credits were returned/.test(e.message));
+  const kinds = (await pool.query(`SELECT kind, credits FROM ai_credit_ledger WHERE user_id = $1 ORDER BY created_at`, [broker.id])).rows.map((r) => `${r.kind}:${r.credits}`);
+  assert.deepEqual(kinds, ['purchase:1100', 'spend:-2', 'spend:-2', 'spend:-2', 'refund:2']);
+  assert.equal((await pool.query('SELECT balance FROM ai_wallets WHERE user_id = $1', [broker.id])).rows[0].balance, 1096);
+  await assert.rejects(pool.query(`UPDATE ai_credit_ledger SET credits = 0 WHERE user_id = $1`, [broker.id]), /append-only/);
+
+  // ---- staff never pay
+  const staffRun = await ai.run('lead_insight', { user: { id: ctx.sales.id, role: 'internal_sales' }, prompt: 'Staff summary' });
+  assert.equal(staffRun.creditsCharged, 0);
+
+  // ---- settings: only the Super Admin; models must be priced and match the provider
+  const root = await createUser('super_admin', 'ai-root');
+  assert.equal((await api('PUT', '/ai-credits/admin/activities/agreement_review', { token: A, body: { credits: 1 } })).status, 403);
+  assert.equal((await api('PUT', '/ai-credits/admin/activities/agreement_review', { token: root.token, body: { provider: 'claude', model: 'gpt-6-luna' } })).status, 400);
+  assert.equal((await api('PUT', '/ai-credits/admin/activities/agreement_review', { token: root.token, body: { model: 'claude-unknown-9' } })).status, 400);
+  const overview = await api('GET', '/ai-credits/admin', { token: A });
+  assert.equal(overview.status, 200);
+  assert.equal(overview.data.activities.find((x) => x.key === 'agreement_review').model, 'claude-opus-5-5');
+  assert.ok(overview.data.usage30d.some((u) => u.activity_key === 'lead_insight'));
+
+  // ---- the paid AI agreement review (Claude Opus 5.5)
+  const tpl = (await pool.query(`SELECT t.id, t.current_version FROM document_templates t WHERE t.template_key = 'agreement_to_sell'`)).rows[0];
+  const doc = (await pool.query(
+    `INSERT INTO generated_documents (document_number, template_id, template_version, state_code, "values", is_blank, created_by) VALUES ($1, $2, $3, 'DL', '{}'::jsonb, false, $4) RETURNING id`,
+    [`DOC-AI-${RUN}`, tpl.id, tpl.current_version, broker.id]
+  )).rows[0].id;
+  const poor = await createUser('broker', 'ai-poor');
+  await pool.query(`UPDATE generated_documents SET created_by = $2 WHERE id = $1`, [doc, poor.id]);
+  const short = await api('POST', `/templates/generated/${doc}/ai-review`, { token: poor.token, body: {} });
+  assert.equal(short.status, 402, 'no credits, no review');
+  assert.match(short.body.message, /needs 49 AI credits/);
+  await pool.query(`UPDATE generated_documents SET created_by = $2 WHERE id = $1`, [doc, broker.id]);
+  const review = await api('POST', `/templates/generated/${doc}/ai-review`, { token: broker.token, body: { focus: 'payment schedule' } });
+  assert.equal(review.status, 201, JSON.stringify(review.body));
+  assert.deepEqual([review.data.model, review.data.creditsCharged, review.data.balance], ['claude-opus-5-5', 49, 1047]);
+  assert.ok(['ok', 'needs_attention', 'serious_issues'].includes(review.data.review.overall));
+  assert.match(review.data.disclaimer, /Not legal advice/);
+  assert.equal((await api('GET', `/templates/generated/${doc}/ai-reviews`, { token: broker.token })).data.length, 1);
+  assert.equal((await api('POST', `/templates/generated/${doc}/ai-review`, { token: poor.token, body: {} })).status, 403, 'not their document');
+});

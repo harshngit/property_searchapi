@@ -1,5 +1,4 @@
 const crypto = require('crypto');
-const Anthropic = require('@anthropic-ai/sdk');
 const pool = require('../config/db');
 const auditService = require('./audit.service');
 const imageScan = require('./imageScan.service');
@@ -24,8 +23,9 @@ const { badRequest, forbidden, notFound } = require('../utils/httpError');
 //   Teams     field partners can work as a team with a shared scoreboard.
 //             Team-mates cannot be each other's buyer or owner.
 
-const AI_MODEL = 'claude-sonnet-5';
-const aiClient = process.env.ANTHROPIC_API_KEY ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY }) : null;
+const orchestrator = require('./ai/orchestrator.service');
+const aiProviders = require('./ai/providers');
+const aiConfigured = () => aiProviders.configured('openai') || aiProviders.configured('claude');
 const wfh = () => require('./wfh.service');
 const num = (c, key, fallback) => (Number.isFinite(Number(c[key])) ? Number(c[key]) : fallback);
 const r1 = (v) => Math.round(v * 10) / 10;
@@ -112,7 +112,7 @@ async function recordTrack(user, assignmentId, points) {
 // ------------------------------------------------------------ photos
 
 const mockSearch = () => process.env.NODE_ENV !== 'production' && process.env.WFH_REVERSE_SEARCH_MOCK === 'true';
-const providers = () => ({ reverseImageSearch: !!process.env.GOOGLE_VISION_API_KEY, aiImageCheck: !!aiClient, aiFraudReview: !!aiClient });
+const providers = () => ({ reverseImageSearch: !!process.env.GOOGLE_VISION_API_KEY, aiImageCheck: aiConfigured(), aiFraudReview: aiConfigured() });
 
 async function visionWebDetection(buffer) {
   const controller = new AbortController();
@@ -149,7 +149,7 @@ async function internetCheck(file, c) {
     const web = await visionWebDetection(file.buffer);
     if (web?.found) return { found: true, source: 'reverse_image_search', where: web.where, checked };
   }
-  if (aiClient) {
+  if (await orchestrator.available('image_origin_check')) {
     checked.push('ai_image_check');
     const ai = await imageScan.originScan(file.buffer);
     if (ai && (ai.is_screenshot || ai.is_map_or_street_view || ai.is_photo_of_screen || ai.has_stock_watermark)) {
@@ -279,30 +279,19 @@ const AI_SCHEMA = {
   additionalProperties: false,
 };
 
-// A second opinion on the signals. No names, numbers or addresses are sent.
+// A second opinion on the signals (the "field_fraud_review" activity: the
+// cheaper model, paid by the platform). No names, numbers or addresses are sent.
 async function aiOpinion(facts) {
-  if (!aiClient) return null;
-  try {
-    const response = await aiClient.messages.create({
-      model: AI_MODEL,
-      max_tokens: 400,
-      output_config: { effort: 'low', format: { type: 'json_schema', schema: AI_SCHEMA } },
-      messages: [{
-        role: 'user',
-        content:
-          'You review field tasks for a real-estate platform that pays people a fixed amount per verified task (bringing a buyer to a property, photographing a property with the owner\'s consent, collecting a buyer\'s requirement). ' +
-          'Fraud means: a visit that never happened, a faked GPS position, photos not taken at the property, or a buyer / owner who is the worker, a relative or an accomplice. ' +
-          'Given the checks below, say whether this submission looks genuine, suspicious or likely fraud, and why in one or two sentences. A new worker or a single weak signal alone is not fraud.\n\n' +
-          JSON.stringify(facts),
-      }],
-    });
-    const block = response.content.find((b) => b.type === 'text');
-    const out = block ? JSON.parse(block.text) : null;
-    return out ? { verdict: out.verdict, reasoning: String(out.reasoning || '').slice(0, 600), model: AI_MODEL } : null;
-  } catch (err) {
-    console.error('[wfh] AI fraud review failed:', err.message);
-    return null;
-  }
+  const out = await orchestrator.tryRun('field_fraud_review', {
+    entityType: 'field_task',
+    schema: AI_SCHEMA,
+    prompt:
+      'You review field tasks for a real-estate platform that pays people a fixed amount per verified task (bringing a buyer to a property, photographing a property with the owner\'s consent, collecting a buyer\'s requirement). ' +
+      'Fraud means: a visit that never happened, a faked GPS position, photos not taken at the property, or a buyer / owner who is the worker, a relative or an accomplice. ' +
+      'Given the checks below, say whether this submission looks genuine, suspicious or likely fraud, and why in one or two sentences. A new worker or a single weak signal alone is not fraud.\n\n' +
+      JSON.stringify(facts),
+  });
+  return out?.json ? { verdict: out.json.verdict, reasoning: String(out.json.reasoning || '').slice(0, 600), model: out.model } : null;
 }
 
 // Score a submission from its flags and the worker's record. Stores the score

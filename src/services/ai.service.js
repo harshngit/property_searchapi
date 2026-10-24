@@ -1,4 +1,3 @@
-const Anthropic = require('@anthropic-ai/sdk');
 const pool = require('../config/db');
 
 function notFound(message = 'Lead not found') {
@@ -7,17 +6,10 @@ function notFound(message = 'Lead not found') {
   return err;
 }
 
-// The spec named "claude-sonnet-4-6" (still a valid, active model), but that
-// generation doesn't support the Messages API's structured-outputs feature
-// (json_schema-constrained responses) - Claude Sonnet 5 does, which gets us
-// a guaranteed-parseable extraction instead of hoping the model's prose JSON
-// parses cleanly. Same tier the spec asked for, just the current generation.
-const AI_MODEL = 'claude-sonnet-5';
+const orchestrator = require('./ai/orchestrator.service');
 
-const client = process.env.ANTHROPIC_API_KEY
-  ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
-  : null;
-
+// Every field is required (nullable where it may be unknown) so the schema
+// also works as a strict structured output on the OpenAI model.
 const INSIGHT_SCHEMA = {
   type: 'object',
   properties: {
@@ -31,7 +23,7 @@ const INSIGHT_SCHEMA = {
     score: { type: 'string', enum: ['hot', 'warm', 'cold'] },
     confidence: { type: 'number' },
   },
-  required: ['summary', 'score', 'confidence'],
+  required: ['budgetMin', 'budgetMax', 'location', 'propertyType', 'intent', 'timeline', 'summary', 'score', 'confidence'],
   additionalProperties: false,
 };
 
@@ -59,75 +51,29 @@ async function gatherLeadText(leadId) {
   return { lead, text: parts.join('\n') };
 }
 
-// TODO: replace with a real Anthropic API key check / secrets manager lookup
-// in production; for now this just reads process.env.ANTHROPIC_API_KEY.
-function assertConfigured() {
-  if (!client) {
-    const err = new Error('AI service is not configured (ANTHROPIC_API_KEY missing)');
-    err.statusCode = 503;
-    throw err;
-  }
-}
-
 // Core extraction call - shared by generateLeadSummary, scoreLead, and
-// previewExtractIntent so the Anthropic API is only ever called from one
-// place. Returns null (does not call the API) when the lead has no notes or
-// inquiry text to extract from - never spend a request on nothing to read.
-async function extractInsight(leadId) {
+// previewExtractIntent. It runs through the AI orchestrator as the
+// "lead_insight" activity (simple task: the cheaper OpenAI model, Claude as
+// fallback). A user who is not staff pays its credits; the automatic summary
+// on a new lead (no user) is on the platform. Returns null without calling
+// the model when the lead has no notes or inquiry text to read.
+async function extractInsight(leadId, user = null) {
   const { text } = await gatherLeadText(leadId);
   if (!text.trim()) return null;
-
-  assertConfigured();
-
-  let response;
-  try {
-    response = await client.messages.create({
-      model: AI_MODEL,
-      max_tokens: 1024,
-      output_config: {
-        effort: 'low', // simple extraction task, not intelligence-sensitive
-        format: { type: 'json_schema', schema: INSIGHT_SCHEMA },
-      },
-      messages: [
-        {
-          role: 'user',
-          content:
-            'You are qualifying a real-estate lead for a brokerage CRM. Read the notes below ' +
-            'and extract the buyer/renter\'s budget range, preferred location, property type, ' +
-            'intent (buy/sell/rent), and timeline if mentioned. Write a short (1-2 sentence) ' +
-            'summary, and rate the lead hot/warm/cold based on how qualified and ready-to-act ' +
-            'they sound.\n\n' +
-            text,
-        },
-      ],
-    });
-  } catch (err) {
-    if (err instanceof Anthropic.APIError) {
-      const wrapped = new Error(`AI extraction failed: ${err.message}`);
-      wrapped.statusCode = 502;
-      wrapped.cause = err;
-      throw wrapped;
-    }
-    throw err;
-  }
-
-  const textBlock = response.content.find((b) => b.type === 'text');
-  if (!textBlock) {
-    const err = new Error('AI extraction returned no content');
-    err.statusCode = 502;
-    throw err;
-  }
-
-  let parsed;
-  try {
-    parsed = JSON.parse(textBlock.text);
-  } catch {
-    const err = new Error('AI extraction returned unparseable JSON');
-    err.statusCode = 502;
-    throw err;
-  }
-
-  return { ...parsed, rawResponse: response };
+  const out = await orchestrator.run('lead_insight', {
+    user,
+    entityType: 'lead',
+    entityId: leadId,
+    schema: INSIGHT_SCHEMA,
+    prompt:
+      'You are qualifying a real-estate lead for a brokerage CRM. Read the notes below ' +
+      'and extract the buyer/renter\'s budget range, preferred location, property type, ' +
+      'intent (buy/sell/rent), and timeline if mentioned. Write a short (1-2 sentence) ' +
+      'summary, and rate the lead hot/warm/cold based on how qualified and ready-to-act ' +
+      'they sound.\n\n' +
+      text,
+  });
+  return { ...out.json, rawResponse: { runId: out.runId, provider: out.provider, model: out.model, creditsCharged: out.creditsCharged } };
 }
 
 async function saveInsight(leadId, insight, overrideScore) {
@@ -156,8 +102,8 @@ async function saveInsight(leadId, insight, overrideScore) {
 }
 
 // POST /api/ai/lead-summary
-async function generateLeadSummary(leadId) {
-  const insight = await extractInsight(leadId);
+async function generateLeadSummary(leadId, user = null) {
+  const insight = await extractInsight(leadId, user);
   if (!insight) {
     // Nothing to extract from - save a placeholder so callers of GET
     // .../analysis still get a row rather than a 404.
@@ -226,12 +172,12 @@ function numericToLevel(score) {
 }
 
 // POST /api/ai/lead-score
-async function scoreLead(leadId) {
+async function scoreLead(leadId, user = null) {
   const leadResult = await pool.query('SELECT * FROM leads WHERE id = $1', [leadId]);
   if (leadResult.rows.length === 0) throw notFound();
   const lead = leadResult.rows[0];
 
-  const insight = await extractInsight(leadId);
+  const insight = await extractInsight(leadId, user);
   const ruleScore = await computeRuleScore(lead);
 
   if (!insight) {
@@ -248,8 +194,8 @@ async function scoreLead(leadId) {
 }
 
 // POST /api/ai/extract-intent - preview only, does not save
-async function previewExtractIntent(leadId) {
-  const insight = await extractInsight(leadId);
+async function previewExtractIntent(leadId, user = null) {
+  const insight = await extractInsight(leadId, user);
   if (!insight) {
     return { summary: 'No notes or inquiry text available yet.', score: 'cold', confidence: 0 };
   }

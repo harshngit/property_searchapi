@@ -525,31 +525,22 @@ async function handleEmail({ to, from, subject, text }) {
 }
 
 // AI fallback for portal email formats the regexes don't know (no code
-// change per new template). Off unless ANTHROPIC_API_KEY is set.
+// change per new template): the "email_lead_parse" activity - a simple task on
+// the cheaper model, paid by the platform. Null when AI is off or unavailable.
 async function aiParseEmail(text) {
-  if (!process.env.ANTHROPIC_API_KEY || !text) return null;
-  const Anthropic = require('@anthropic-ai/sdk');
-  const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  if (!text) return null;
   const nullable = { anyOf: [{ type: 'string' }, { type: 'null' }] };
-  const response = await client.messages.create({
-    model: 'claude-sonnet-5',
-    max_tokens: 600,
-    output_config: {
-      effort: 'low',
-      format: {
-        type: 'json_schema',
-        schema: {
-          type: 'object',
-          properties: { name: nullable, phone: nullable, email: nullable, city: nullable, locality: nullable, budget: nullable, propertyType: nullable, purpose: nullable, message: nullable },
-          required: ['name', 'phone', 'email', 'city', 'locality', 'budget', 'propertyType', 'purpose', 'message'],
-          additionalProperties: false,
-        },
-      },
+  const out = await require('../ai/orchestrator.service').tryRun('email_lead_parse', {
+    entityType: 'lead_email',
+    schema: {
+      type: 'object',
+      properties: { name: nullable, phone: nullable, email: nullable, city: nullable, locality: nullable, budget: nullable, propertyType: nullable, purpose: nullable, message: nullable },
+      required: ['name', 'phone', 'email', 'city', 'locality', 'budget', 'propertyType', 'purpose', 'message'],
+      additionalProperties: false,
     },
-    messages: [{ role: 'user', content: `Extract the enquirer's details from this Indian property portal lead email. Use null when absent.\n\n${text.slice(0, 8000)}` }],
+    prompt: `Extract the enquirer's details from this Indian property portal lead email. Use null when absent.\n\n${text.slice(0, 8000)}`,
   });
-  const block = response.content.find((b) => b.type === 'text');
-  return block ? JSON.parse(block.text) : null;
+  return out?.json || null;
 }
 
 // ---------------------------------------------------------------- pull

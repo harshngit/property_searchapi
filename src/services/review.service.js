@@ -1,4 +1,3 @@
-const Anthropic = require('@anthropic-ai/sdk');
 const pool = require('../config/db');
 const configService = require('./config.service');
 const notificationService = require('./notification.service');
@@ -19,8 +18,7 @@ const { badRequest, forbidden, notFound } = require('../utils/httpError');
 //   - The reviewed person can reply once and can report a review for
 //     moderation; contact details are blocked in all review text.
 
-const AI_MODEL = 'claude-sonnet-5';
-const aiClient = process.env.ANTHROPIC_API_KEY ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY }) : null;
+const orchestrator = require('./ai/orchestrator.service');
 const STAFF = ['internal_sales', 'admin', 'super_admin'];
 
 async function roleOf(userId) {
@@ -106,40 +104,23 @@ async function resolveSubject(user, { dealId, leaseId, subject }) {
 
 const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
 
+// The "review_screen" activity: a simple task on the cheaper model, paid by the platform.
 async function aiAssess(review) {
-  if (!aiClient || !(await configService.getConfig('reviews.ai_filter_enabled', true))) return null;
-  try {
-    const response = await aiClient.messages.create({
-      model: AI_MODEL,
-      max_tokens: 300,
-      output_config: {
-        effort: 'low',
-        format: {
-          type: 'json_schema',
-          schema: {
-            type: 'object',
-            properties: { fake_likelihood: { type: 'integer' }, reasons: { type: 'array', items: { type: 'string' } } },
-            required: ['fake_likelihood', 'reasons'],
-            additionalProperties: false,
-          },
-        },
-      },
-      messages: [
-        {
-          role: 'user',
-          content:
-            'You screen reviews on an Indian real-estate platform for fake, incentivised, spam, abusive or off-topic content. ' +
-            'Return fake_likelihood 0-100 and short reasons. Genuine short or negative reviews are fine.\n\n' +
-            `Rating: ${review.rating}/5\nTitle: ${review.title || ''}\nReview: ${review.body || ''}`,
-        },
-      ],
-    });
-    const block = response.content.find((b) => b.type === 'text');
-    return block ? JSON.parse(block.text) : null;
-  } catch (err) {
-    console.error('[reviews] AI filter failed:', err.message);
-    return null;
-  }
+  if (!(await configService.getConfig('reviews.ai_filter_enabled', true))) return null;
+  const out = await orchestrator.tryRun('review_screen', {
+    entityType: 'review',
+    schema: {
+      type: 'object',
+      properties: { fake_likelihood: { type: 'integer' }, reasons: { type: 'array', items: { type: 'string' } } },
+      required: ['fake_likelihood', 'reasons'],
+      additionalProperties: false,
+    },
+    prompt:
+      'You screen reviews on an Indian real-estate platform for fake, incentivised, spam, abusive or off-topic content. ' +
+      'Return fake_likelihood 0-100 and short reasons. Genuine short or negative reviews are fine.\n\n' +
+      `Rating: ${review.rating}/5\nTitle: ${review.title || ''}\nReview: ${review.body || ''}`,
+  });
+  return out?.json || null;
 }
 
 async function fraudCheck(reviewerId, subjectId, { rating, title, body }) {

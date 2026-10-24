@@ -15,7 +15,7 @@ async function assertLeadAccess(req) {
 async function leadSummary(req, res, next) {
   try {
     await assertLeadAccess(req);
-    const insight = await aiService.generateLeadSummary(req.body.leadId);
+    const insight = await aiService.generateLeadSummary(req.body.leadId, req.user);
     return success(res, 201, 'Lead summary generated successfully', insight);
   } catch (err) {
     next(err);
@@ -26,7 +26,7 @@ async function leadSummary(req, res, next) {
 async function leadScore(req, res, next) {
   try {
     await assertLeadAccess(req);
-    const insight = await aiService.scoreLead(req.body.leadId);
+    const insight = await aiService.scoreLead(req.body.leadId, req.user);
     return success(res, 201, 'Lead score computed successfully', insight);
   } catch (err) {
     next(err);
@@ -37,7 +37,7 @@ async function leadScore(req, res, next) {
 async function extractIntent(req, res, next) {
   try {
     await assertLeadAccess(req);
-    const preview = await aiService.previewExtractIntent(req.body.leadId);
+    const preview = await aiService.previewExtractIntent(req.body.leadId, req.user);
     return success(res, 200, 'Intent extracted successfully', preview);
   } catch (err) {
     next(err);

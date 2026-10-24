@@ -563,6 +563,73 @@ async function download(user, id, format = 'pdf') {
   return render(g, t, v, vars, format);
 }
 
+// ---------------------------------------------------------------- AI review
+// The "agreement_review" activity: an important task, so Claude Opus 5.5 by
+// default (set in the AI settings). A user who is not staff pays its credits
+// from their wallet; not enough credits stops it with a "buy credits" message.
+const REVIEW_SCHEMA = {
+  type: 'object',
+  properties: {
+    overall: { type: 'string', enum: ['ok', 'needs_attention', 'serious_issues'] },
+    summary: { type: 'string' },
+    issues: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          severity: { type: 'string', enum: ['low', 'medium', 'high'] },
+          clause: { type: 'string' },
+          problem: { type: 'string' },
+          suggestion: { type: 'string' },
+        },
+        required: ['severity', 'clause', 'problem', 'suggestion'],
+        additionalProperties: false,
+      },
+    },
+    missing_clauses: { type: 'array', items: { type: 'string' } },
+    inconsistencies: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['overall', 'summary', 'issues', 'missing_clauses', 'inconsistencies'],
+  additionalProperties: false,
+};
+
+async function aiReview(user, id, { focus } = {}) {
+  const g = await loadGenerated(user, id);
+  if (g.is_blank) throw badRequest('A blank form has nothing to review yet - generate it with the deal\'s details first');
+  const t = (await pool.query('SELECT * FROM document_templates WHERE id = $1', [g.template_id])).rows[0];
+  const v = (await pool.query('SELECT * FROM document_template_versions WHERE template_id = $1 AND version = $2', [g.template_id, g.template_version])).rows[0];
+  const vars = (await pool.query('SELECT * FROM template_variables WHERE template_id = $1', [g.template_id])).rows;
+  const text = merge(v, vars, g.values, g.state_code, g.is_blank).map((b) => (b.kind === 'title' ? `# ${b.text}` : b.kind === 'heading' ? `## ${b.text}` : b.text)).join('\n\n');
+  const out = await require('./ai/orchestrator.service').run('agreement_review', {
+    user,
+    entityType: 'generated_document',
+    entityId: g.id,
+    schema: REVIEW_SCHEMA,
+    system:
+      'You review draft Indian property transaction documents (agreements to sell, sale deeds, leases, leave and licence, powers of attorney, MOUs) ' +
+      'for a facilitation platform. Check them against Indian practice: Registration Act, stamp duty in the given state, the Transfer of Property Act, ' +
+      'RERA where relevant, payment schedule and possession terms, default and termination, indemnities, title warranties, encumbrances, ' +
+      'dispute resolution, and signature / witness blocks. Point out missing clauses, risky or one-sided terms, internal inconsistencies ' +
+      '(names, amounts, dates, areas), and blanks. Be specific and practical. This is a working-draft review to help the parties and their ' +
+      'advocate - not legal advice.',
+    prompt:
+      `Document: ${t.name} (${g.document_number}), state ${g.state_code || 'not given'}.` +
+      (focus ? `\nThe user asks you to pay particular attention to: ${String(focus).slice(0, 300)}` : '') +
+      `\n\n${text.slice(0, 60000)}`,
+  });
+  const saved = (await pool.query(
+    'INSERT INTO generated_document_ai_reviews (document_id, run_id, focus, review, model, created_by) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+    [g.id, out.runId, focus ? String(focus).slice(0, 300) : null, JSON.stringify(out.json), out.model, user.id]
+  )).rows[0];
+  return { id: saved.id, review: out.json, model: out.model, creditsCharged: out.creditsCharged, balance: out.balance, createdAt: saved.created_at, disclaimer: 'AI working-draft review. Not legal advice - have your advocate review the document before execution.' };
+}
+
+async function aiReviews(user, id) {
+  const g = await loadGenerated(user, id);
+  const r = await pool.query('SELECT id, focus, review, model, created_at FROM generated_document_ai_reviews WHERE document_id = $1 ORDER BY created_at DESC LIMIT 20', [g.id]);
+  return r.rows.map((x) => ({ id: x.id, focus: x.focus, review: x.review, model: x.model, createdAt: x.created_at }));
+}
+
 async function listGenerated(user, { dealId, templateId } = {}) {
   const where = [];
   const params = [];
@@ -587,4 +654,4 @@ async function markReviewed(user, id, meta = {}) {
   return generatedView(r);
 }
 
-module.exports = { FIELD_TYPES, COMPUTED_KINDS, PREFILL, amountInWords, deedDate, variablesIn, saveTemplate, setStatus, listTemplates, templateDetail, form, generate, download, listGenerated, markReviewed };
+module.exports = { FIELD_TYPES, COMPUTED_KINDS, PREFILL, amountInWords, deedDate, variablesIn, saveTemplate, setStatus, listTemplates, templateDetail, form, generate, download, listGenerated, markReviewed, aiReview, aiReviews };

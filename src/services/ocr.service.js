@@ -13,10 +13,9 @@ const configService = require('./config.service');
 //   3. When Tesseract's confidence is below crawler.ocr_min_confidence, or
 //      the scan uses a codec that cannot be decoded here (CCITT fax / JBIG2 /
 //      JPEG 2000), the AI vision parser reads the document instead - only
-//      when ANTHROPIC_API_KEY is configured.
+//      when an AI provider is configured (the "scan_transcribe" activity).
 // Never throws: returns { text: '', method: 'none' } when nothing readable.
 
-const AI_MODEL = 'claude-sonnet-5';
 const CACHE_DIR = process.env.OCR_CACHE_DIR || path.join(os.tmpdir(), 'propertyserch-ocr');
 
 async function settings() {
@@ -151,26 +150,17 @@ async function tesseract(images, langs) {
   }
 }
 
+// The "scan_transcribe" activity: the cheaper model, paid by the platform.
 async function aiTranscribe(buffer, mimetype) {
-  if (!process.env.ANTHROPIC_API_KEY) return null;
-  try {
-    const Anthropic = require('@anthropic-ai/sdk');
-    const client = new Anthropic();
-    const data = buffer.toString('base64');
-    const block = mimetype === 'application/pdf'
-      ? { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data } }
-      : { type: 'image', source: { type: 'base64', media_type: mimetype, data } };
-    const res = await client.messages.create({
-      model: AI_MODEL,
-      max_tokens: 8000,
-      messages: [{ role: 'user', content: [block, { type: 'text', text: 'Transcribe all text in this scanned document exactly as written, in reading order. Output only the transcribed text - no commentary. Keep numbers, dates and amounts exact.' }] }],
-    });
-    const text = res.content.filter((c) => c.type === 'text').map((c) => c.text).join('\n').trim();
-    return text || null;
-  } catch (err) {
-    console.error('[ocr] AI transcription failed:', err.message);
-    return null;
-  }
+  const data = buffer.toString('base64');
+  const out = await require('./ai/orchestrator.service').tryRun('scan_transcribe', {
+    entityType: 'scanned_document',
+    parts: [
+      mimetype === 'application/pdf' ? { type: 'pdf', data } : { type: 'image', mediaType: mimetype, data },
+      { type: 'text', text: 'Transcribe all text in this scanned document exactly as written, in reading order. Output only the transcribed text - no commentary. Keep numbers, dates and amounts exact.' },
+    ],
+  });
+  return out?.text?.trim() || null;
 }
 
 // ------------------------------------------------------------ public API

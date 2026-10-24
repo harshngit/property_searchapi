@@ -1,4 +1,3 @@
-const Anthropic = require('@anthropic-ai/sdk');
 const pool = require('../config/db');
 const configService = require('./config.service');
 const auditService = require('./audit.service');
@@ -21,8 +20,7 @@ const { badRequest, forbidden, notFound } = require('../utils/httpError');
 //   - Role visibility: owner / broker / buyer / admin each see only the
 //     documents shared with their role.
 
-const AI_MODEL = 'claude-sonnet-5';
-const aiClient = process.env.ANTHROPIC_API_KEY ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY }) : null;
+const orchestrator = require('./ai/orchestrator.service');
 const STAFF = ['internal_sales', 'admin', 'super_admin'];
 const TRANSFER_TYPES = ['sale_deed', 'title_document'];
 
@@ -144,8 +142,10 @@ async function ruleFlags(text) {
   return flags;
 }
 
+// The "document_analysis" activity: an important task, so Claude Opus 5.5
+// (OpenAI as fallback). It runs on every upload, so the platform pays.
 async function aiAnalyse(buffer, mimetype, text) {
-  if (!aiClient || !(await configService.getConfig('dd.ai_enabled', true))) return null;
+  if (!(await configService.getConfig('dd.ai_enabled', true))) return null;
   const schema = {
     type: 'object',
     properties: {
@@ -176,9 +176,9 @@ async function aiAnalyse(buffer, mimetype, text) {
   };
   const content = [];
   if (mimetype === 'application/pdf' && buffer && buffer.length < 20 * 1024 * 1024) {
-    content.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: buffer.toString('base64') } });
+    content.push({ type: 'pdf', data: buffer.toString('base64') });
   } else if (/^image\/(jpeg|png|webp|gif)$/.test(mimetype || '') && buffer && buffer.length < 5 * 1024 * 1024) {
-    content.push({ type: 'image', source: { type: 'base64', media_type: mimetype, data: buffer.toString('base64') } });
+    content.push({ type: 'image', mediaType: mimetype, data: buffer.toString('base64') });
   } else if (text) {
     content.push({ type: 'text', text: text.slice(0, 20000) });
   } else return null;
@@ -190,19 +190,8 @@ async function aiAnalyse(buffer, mimetype, text) {
       'compliance notices, possession issues, missing signatures or stamps, expired validity, or internal inconsistencies (dates, areas, names). ' +
       'This is facilitation support for A R Buildwel staff, not legal advice.',
   });
-  try {
-    const response = await aiClient.messages.create({
-      model: AI_MODEL,
-      max_tokens: 1200,
-      output_config: { effort: 'low', format: { type: 'json_schema', schema } },
-      messages: [{ role: 'user', content }],
-    });
-    const block = response.content.find((b) => b.type === 'text');
-    return block ? JSON.parse(block.text) : null;
-  } catch (err) {
-    console.error('[dd] AI analysis failed:', err.message);
-    return null;
-  }
+  const out = await orchestrator.tryRun('document_analysis', { entityType: 'property_document', schema, parts: content });
+  return out?.json || null;
 }
 
 // Classify + risk-scan one document buffer (no storage).

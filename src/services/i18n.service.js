@@ -208,7 +208,8 @@ async function aiDraft(admin, { language: code, app, limit = 80 }, meta = {}) {
   assertApp(app);
   const l = await language(code);
   if (l.is_source) throw badRequest('Choose a language other than English');
-  if (!process.env.ANTHROPIC_API_KEY) throw badRequest('The AI helper is not configured (ANTHROPIC_API_KEY) - download the file and translate it instead');
+  const orchestrator = require('./ai/orchestrator.service');
+  if (!(await orchestrator.available('translation'))) throw badRequest('The AI helper is not configured - download the file and translate it instead');
   const n = Math.min(Math.max(Number(limit) || 80, 1), 150);
   const missing = (
     await pool.query(
@@ -218,22 +219,18 @@ async function aiDraft(admin, { language: code, app, limit = 80 }, meta = {}) {
     )
   ).rows.map((r) => r.source_text);
   if (!missing.length) return { drafted: 0, remaining: 0 };
-  const Anthropic = require('@anthropic-ai/sdk');
-  const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-  const response = await client.messages.create({
-    model: process.env.I18N_AI_MODEL || 'claude-sonnet-5',
-    max_tokens: 16000,
-    messages: [{
-      role: 'user',
-      content:
-        `Translate these interface strings of an Indian real-estate platform from English into ${l.name} (${l.native_name}). ` +
-        'Use the natural, everyday wording an Indian property buyer or broker would expect; keep common English terms people actually use (BHK, RERA, GST, OTP, EMI, CRM, NRI, KYC, PDF). ' +
-        'Never translate the brand names "PropertySerch" and "A R Buildwel". Keep numbers, symbols, punctuation and any leading or trailing words such as "in" that join onto a value exactly in position. ' +
-        'Reply with only a JSON array of the translated strings, in the same order and of the same length as the input array.\n\n' +
-        JSON.stringify(missing),
-    }],
+  // The "translation" activity: the cheaper model, paid by the platform.
+  const run = await orchestrator.run('translation', {
+    user: null,
+    entityType: 'i18n',
+    prompt:
+      `Translate these interface strings of an Indian real-estate platform from English into ${l.name} (${l.native_name}). ` +
+      'Use the natural, everyday wording an Indian property buyer or broker would expect; keep common English terms people actually use (BHK, RERA, GST, OTP, EMI, CRM, NRI, KYC, PDF). ' +
+      'Never translate the brand names "PropertySerch" and "A R Buildwel". Keep numbers, symbols, punctuation and any leading or trailing words such as "in" that join onto a value exactly in position. ' +
+      'Reply with only a JSON array of the translated strings, in the same order and of the same length as the input array.\n\n' +
+      JSON.stringify(missing),
   });
-  const text = response.content.find((b) => b.type === 'text')?.text || '';
+  const text = run.text || '';
   let out;
   try {
     out = JSON.parse(text.slice(text.indexOf('['), text.lastIndexOf(']') + 1));

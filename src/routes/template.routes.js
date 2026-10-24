@@ -79,6 +79,9 @@ router.get('/', h(async (req, res) => ok(res, 'Templates', await templates.listT
 router.get('/meta', h(async (req, res) => ok(res, 'Template options', { fieldTypes: templates.FIELD_TYPES, computedKinds: templates.COMPUTED_KINDS, prefillSources: templates.PREFILL })));
 router.get('/generated', h(async (req, res) => ok(res, 'Generated documents', await templates.listGenerated(req.user, { dealId: req.query.dealId, templateId: req.query.templateId }))));
 router.get('/generated/:id/download', idp, validate, h(async (req, res) => send(res, await templates.download(req.user, req.params.id, req.query.format || 'pdf'))));
+// AI review of a generated agreement - the "agreement_review" AI activity (Claude Opus 5.5 by default); paid in AI credits by non-staff users.
+router.post('/generated/:id/ai-review', [...idp, body('focus').optional({ nullable: true }).isString().isLength({ max: 300 })], validate, h(async (req, res) => ok(res, 'AI review ready', await templates.aiReview(req.user, req.params.id, req.body), 201)));
+router.get('/generated/:id/ai-reviews', idp, validate, h(async (req, res) => ok(res, 'AI reviews', await templates.aiReviews(req.user, req.params.id))));
 router.post('/generated/:id/advocate-reviewed', idp, validate, h(async (req, res) => ok(res, 'Advocate review recorded', await templates.markReviewed(req.user, req.params.id, meta(req)))));
 router.post('/', authorize(...ADMIN), [body('body').isString().isLength({ min: 40, max: 200000 }), body('variables').optional().isArray()], validate, h(async (req, res) => ok(res, 'Template saved', await templates.saveTemplate(req.user, req.body, meta(req)), 201)));
 router.get('/:id', idp, validate, h(async (req, res) => ok(res, 'Template', await templates.templateDetail(req.user, req.params.id))));
