@@ -18,6 +18,9 @@ const liquidityService = require('./liquidity.service');
 // smoothed towards the overall rate, nudges the score up or down by at most
 // opportunity.learning_max_adjustment points once enough history exists.
 // The adjustment and the data behind it are kept in score_breakdown.
+// Phase 1 (client decision): the history is collected and shown, but the
+// adjustment stays off until opportunity.learning_enabled is switched on in
+// Phase 2.
 
 const DEFAULT_WEIGHTS = { discount: 40, liquidity: 25, risk: 20, yield: 15 };
 const LIQUIDITY_FRACTION = { high: 1, moderate: 0.6, low: 0.2 };
@@ -45,10 +48,11 @@ const BAND_SQL = `CASE WHEN p.discount_percent IS NULL THEN 'unknown' WHEN p.dis
 
 // Conversion history for a deal's segment vs all opportunity deals.
 async function conversionAdjustment(property, discountPercent, liquidityBand) {
-  const [maxPoints, minHistory, prior] = await Promise.all([
+  const [maxPoints, minHistory, prior, enabled] = await Promise.all([
     configService.getConfig('opportunity.learning_max_adjustment', 10),
     configService.getConfig('opportunity.learning_min_interests', 20),
     configService.getConfig('opportunity.learning_prior_weight', 10),
+    configService.getConfig('opportunity.learning_enabled', false),
   ]);
   const segment = { category: property.listing_category, discountBand: discountBand(discountPercent), liquidityBand: liquidityBand || 'unknown' };
   const result = await pool.query(
@@ -62,6 +66,10 @@ async function conversionAdjustment(property, discountPercent, liquidityBand) {
   );
   const r = result.rows[0];
   const learning = { segment, interests: r.interests, closures: r.closures, segmentInterests: r.seg_interests, segmentClosures: r.seg_closures, adjustment: 0 };
+  if (enabled !== true) {
+    learning.note = 'Learning from past conversions switches on in Phase 2 - the history is being collected';
+    return learning;
+  }
   if (r.interests < Number(minHistory) || r.closures === 0) {
     learning.note = 'Not enough closed deals yet to learn from';
     return learning;

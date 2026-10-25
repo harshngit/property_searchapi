@@ -23,7 +23,9 @@ const { badRequest, forbidden, notFound } = require('../utils/httpError');
 const ADMIN = ['admin', 'super_admin'];
 const STAFF = ['internal_sales', ...ADMIN];
 const CATEGORIES = ['collection', 'usage', 'sharing', 'retention', 'rights', 'security'];
-const OPTIONAL = ['marketing'];
+// Optional, withdrawable: marketing, and behaviour-based (personalised)
+// matching of deals and properties (DPDP notice + consent, feature #12).
+const OPTIONAL = ['marketing', 'personalised_matching'];
 
 const consentVersion = () => configService.getConfig('privacy.consent_version', '2026-10');
 const noticeDays = async () => Number(await configService.getConfig('privacy.deletion_notice_days', 30)) || 30;

@@ -511,36 +511,66 @@ async function handleEmail({ to, from, subject, text }) {
   const match = Object.entries(senders || {}).find(([d]) => fromDomain === d || fromDomain.endsWith(`.${d}`));
   const source = await getSource(match ? match[1] : 'portal_email');
   const conn = (await pool.query(`SELECT * FROM lead_source_connections WHERE source_id = $1 AND COALESCE(tenant_id, $2::uuid) = COALESCE($3::uuid, $2::uuid)`, [source.id, NIL, tenantId])).rows[0] || null;
-  let parsed = N.emailLead({ subject, text, from });
-  let byAi = false;
-  if (N.confidence(parsed) < 70) {
-    const ai = await aiParseEmail(`${subject || ''}\n${text || ''}`).catch(() => null);
-    if (ai) {
-      for (const [k, v] of Object.entries(ai)) if (parsed[k] == null && v != null) parsed[k] = k === 'phone' ? N.cleanPhone(v) : k === 'budget' ? N.parseBudget(v) : v;
-      byAi = true;
-    }
-  }
+  // Regex only (feature #3). An email the rules cannot read goes to the review
+  // queue, where an org admin may ask Serchi to read it (aiReadInbox, paid
+  // from their credits).
+  const parsed = N.emailLead({ subject, text, from });
   const raw = `From: ${from}\nTo: ${to}\nSubject: ${subject}\n\n${text}`;
-  return ingest({ source, connection: conn, tenantId, method: 'email_parser', mode: 'push', raw, parsed, parsedByAi: byAi });
+  const result = await ingest({ source, connection: conn, tenantId, method: 'email_parser', mode: 'push', raw, parsed, parsedByAi: false });
+  if (result.status === 'lead_created' && result.leadId) await emailPrivacyNotice(result.leadId);
+  return result;
 }
 
-// AI fallback for portal email formats the regexes don't know (no code
-// change per new template): the "email_lead_parse" activity - a simple task on
-// the cheaper model, paid by the platform. Null when AI is off or unavailable.
-async function aiParseEmail(text) {
-  if (!text) return null;
+// DPDP notice for a person whose details reached us in a forwarded email
+// (feature #3): logged on the lead (what they were told and when) and sent
+// with the WhatsApp acknowledgement - the approved template carries the
+// notice wording.
+async function emailPrivacyNotice(leadId) {
+  const notice = await configService.getConfig(
+    'ingestion.email_privacy_notice',
+    'Your enquiry details reached PropertySerch through a property portal. We use them only to respond to this enquiry, under our privacy policy (propertyserch.com/privacy). Reply STOP or write to privacy@propertyserch.com to have them deleted.'
+  );
+  await pool.query(`INSERT INTO lead_activity_log (lead_id, user_id, action, details) VALUES ($1, NULL, 'dpdp_notice', $2)`, [leadId, JSON.stringify({ channel: 'whatsapp', notice })]);
+  await require('../whatsapp.service').acknowledgeLead(leadId).catch((err) => console.error('[ingestion] privacy notice not sent:', err.message));
+}
+
+// Feature #3: an org admin asks Serchi to read an inbound lead the regexes
+// could not (the "email_lead_parse" activity, the cheaper model) - paid from
+// that admin's AI credits. Returns suggested fields to check before "resolve".
+const AI_EMAIL_SCHEMA = (() => {
   const nullable = { anyOf: [{ type: 'string' }, { type: 'null' }] };
-  const out = await require('../ai/orchestrator.service').tryRun('email_lead_parse', {
-    entityType: 'lead_email',
-    schema: {
-      type: 'object',
-      properties: { name: nullable, phone: nullable, email: nullable, city: nullable, locality: nullable, budget: nullable, propertyType: nullable, purpose: nullable, message: nullable },
-      required: ['name', 'phone', 'email', 'city', 'locality', 'budget', 'propertyType', 'purpose', 'message'],
-      additionalProperties: false,
-    },
-    prompt: `Extract the enquirer's details from this Indian property portal lead email. Use null when absent.\n\n${text.slice(0, 8000)}`,
+  const keys = ['name', 'phone', 'email', 'city', 'locality', 'budget', 'propertyType', 'purpose', 'message'];
+  return { type: 'object', properties: Object.fromEntries(keys.map((k) => [k, nullable])), required: keys, additionalProperties: false };
+})();
+
+async function rawPayload(row) {
+  if (row.raw_payload) return row.raw_payload;
+  if (!row.raw_payload_ref) return null;
+  const buf = await require('../../utils/storage').downloadBuffer(row.raw_payload_ref);
+  return buf ? buf.toString('utf8') : null;
+}
+
+async function aiReadInbox(user, id, meta = {}) {
+  await getInboxItem(user, id); // access check
+  const row = (await pool.query('SELECT * FROM lead_ingestion_inbox WHERE id = $1', [id])).rows[0];
+  if (!['parse_failed', 'parsed'].includes(row.parse_status)) throw badRequest(`Item is ${row.parse_status}`);
+  const text = await rawPayload(row);
+  if (!text) throw badRequest('The original message is not available to read');
+  const out = await require('../ai/serchi').run('email_lead_parse', {
+    user,
+    entityType: 'lead_inbox',
+    entityId: id,
+    schema: AI_EMAIL_SCHEMA,
+    prompt: `Extract the enquirer's details from this Indian property portal lead. Use null when absent.\n\n${String(text).slice(0, 8000)}`,
   });
-  return out?.json || null;
+  const a = out.json || {};
+  const suggested = {
+    name: a.name || null, phone: N.cleanPhone(a.phone), email: N.cleanEmail(a.email), city: a.city || null, locality: a.locality || null,
+    budget: a.budget ? N.parseBudget(a.budget) : null, propertyType: a.propertyType ? N.mapPropertyType(a.propertyType) : null, purpose: a.purpose ? N.mapPurpose(a.purpose) : null, message: a.message || null,
+  };
+  await pool.query('UPDATE lead_ingestion_inbox SET parsed_by_ai = true WHERE id = $1', [id]);
+  await auditService.log({ actor: user, action: 'lead_inbox.ai_read', entityType: 'lead_inbox', entityId: id, after: { creditsCharged: out.creditsCharged }, ...meta });
+  return { suggested, creditsCharged: out.creditsCharged, balance: out.balance, disclaimer: out.disclaimer };
 }
 
 // ---------------------------------------------------------------- pull
@@ -793,6 +823,7 @@ async function leadSources(leadId) {
 
 module.exports = {
   ORG_ADMIN,
+  aiReadInbox,
   listSources,
   getSource,
   createSource,

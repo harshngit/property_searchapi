@@ -1,5 +1,5 @@
 const express = require('express');
-const { body, param } = require('express-validator');
+const { body, param, query } = require('express-validator');
 const router = express.Router();
 
 const validate = require('../middlewares/validate');
@@ -8,6 +8,7 @@ const asyncHandler = require('../utils/asyncHandler');
 const { success } = require('../utils/response');
 const auditService = require('../services/audit.service');
 const ai = require('../services/ai/orchestrator.service');
+const walletService = require('../services/ai/wallet.service');
 
 // AI credit wallet (1 credit = Rs 1) and the AI orchestration settings.
 const meta = (req) => auditService.requestMeta(req);
@@ -25,6 +26,41 @@ router.use(authenticate);
  * /ai-credits/wallet:
  *   get:
  *     summary: My balance, history, packs on sale and the credit price of each AI action
+ *     tags: [AI credits]
+ *     security: [{ bearerAuth: [] }]
+ * /ai-credits/settings:
+ *   put:
+ *     summary: My low-balance alert and optional daily / monthly AI spend limits (credits; empty = none)
+ *     tags: [AI credits]
+ *     security: [{ bearerAuth: [] }]
+ * /ai-credits/topups:
+ *   post:
+ *     summary: Report a bank transfer / UPI payment for a pack (with its reference) - credited once an admin approves it
+ *     tags: [AI credits]
+ *     security: [{ bearerAuth: [] }]
+ * /ai-credits/purchases/{id}/invoice:
+ *   get:
+ *     summary: GST tax invoice (PDF) of a paid credit purchase
+ *     tags: [AI credits]
+ *     security: [{ bearerAuth: [] }]
+ * /ai-credits/admin/topups:
+ *   get:
+ *     summary: Bank / UPI payments reported by users, waiting for approval (admin)
+ *     tags: [AI credits]
+ *     security: [{ bearerAuth: [] }]
+ * /ai-credits/admin/topups/{id}/decide:
+ *   post:
+ *     summary: Approve (credits added, GST invoice issued) or reject a reported payment (admin)
+ *     tags: [AI credits]
+ *     security: [{ bearerAuth: [] }]
+ * /ai-credits/admin/users/{id}/settings:
+ *   put:
+ *     summary: Set a user's low-balance alert and AI spend limits (admin)
+ *     tags: [AI credits]
+ *     security: [{ bearerAuth: [] }]
+ * /ai-credits/admin/purchases/{id}/refund:
+ *   post:
+ *     summary: Refund the unused credits of a purchase within the Terms & Conditions window (admin)
  *     tags: [AI credits]
  *     security: [{ bearerAuth: [] }]
  * /ai-credits/purchases:
@@ -67,7 +103,24 @@ router.use(authenticate);
  *     tags: [AI credits]
  *     security: [{ bearerAuth: [] }]
  */
-router.get('/wallet', h(async (req, res) => ok(res, 'AI credits', await ai.wallet(req.user))));
+router.get('/wallet', h(async (req, res) => ok(res, 'AI credits', await walletService.view(req.user))));
+const limitRules = ['lowBalanceAlert', 'dailyCap', 'monthlyCap'].map((k) => body(k).optional({ nullable: true }).custom((v) => v === '' || (Number.isInteger(Number(v)) && Number(v) >= 0)));
+router.put('/settings', limitRules, validate, h(async (req, res) => ok(res, 'Settings saved', await walletService.saveSettings(req.user, req.user.id, req.body, meta(req)))));
+router.post(
+  '/topups',
+  [body('packId').isUUID(), body('method').isIn(['bank', 'upi']), body('reference').isString().isLength({ min: 6, max: 60 }), body('paidOn').optional({ checkFalsy: true }).isISO8601(), body('note').optional({ nullable: true }).isString().isLength({ max: 300 })],
+  validate,
+  h(async (req, res) => ok(res, 'Payment reported - credits are added once it is checked', await walletService.requestTopup(req.user, req.body, meta(req)), 201))
+);
+router.get(
+  '/purchases/:id/invoice',
+  [param('id').isUUID()],
+  validate,
+  h(async (req, res) => {
+    const { buffer, fileName } = await walletService.invoicePdf(req.user, req.params.id);
+    res.set({ 'Content-Type': 'application/pdf', 'Content-Disposition': `attachment; filename="${fileName}"` }).send(buffer);
+  })
+);
 router.post('/purchases', [body('packId').isUUID()], validate, h(async (req, res) => ok(res, 'Payment started', await ai.startPurchase(req.user, req.body.packId), 201)));
 router.post(
   '/purchases/:id/verify',
@@ -77,6 +130,22 @@ router.post(
 );
 
 router.get('/admin', authorize(...ADMIN), h(async (req, res) => ok(res, 'AI settings', await ai.adminOverview(req.user))));
+router.get('/admin/topups', authorize(...ADMIN), [query('status').optional().isIn(['pending', 'approved', 'rejected', 'all'])], validate, h(async (req, res) => ok(res, 'Reported payments', await walletService.listTopups(req.user, req.query))));
+router.post(
+  '/admin/topups/:id/decide',
+  authorize(...ADMIN),
+  [param('id').isUUID(), body('action').isIn(['approve', 'reject']), body('note').optional({ nullable: true }).isString().isLength({ max: 300 })],
+  validate,
+  h(async (req, res) => ok(res, 'Payment decided', await walletService.decideTopup(req.user, req.params.id, req.body, meta(req))))
+);
+router.put('/admin/users/:id/settings', authorize(...ADMIN), [param('id').isUUID(), ...limitRules], validate, h(async (req, res) => ok(res, 'Settings saved', await walletService.saveSettings(req.user, req.params.id, req.body, meta(req)))));
+router.post(
+  '/admin/purchases/:id/refund',
+  authorize(...ADMIN),
+  [param('id').isUUID(), body('note').isString().isLength({ min: 5, max: 300 })],
+  validate,
+  h(async (req, res) => ok(res, 'Unused credits refunded', await walletService.refundPurchase(req.user, req.params.id, req.body, meta(req))))
+);
 router.put(
   '/admin/activities/:key',
   authorize('super_admin'),
@@ -89,7 +158,6 @@ router.put(
     body('effort').optional().isIn(['low', 'medium', 'high', 'xhigh', 'max']),
     body('maxOutputTokens').optional().isInt({ min: 50, max: 64000 }),
     body('credits').optional().isInt({ min: 0, max: 100000 }),
-    body('payer').optional().isIn(['user', 'platform']),
     body('active').optional().isBoolean(),
   ],
   validate,

@@ -18,7 +18,7 @@ const { badRequest, forbidden, notFound } = require('../utils/httpError');
 //   - The reviewed person can reply once and can report a review for
 //     moderation; contact details are blocked in all review text.
 
-const orchestrator = require('./ai/orchestrator.service');
+const serchi = require('./ai/serchi');
 const STAFF = ['internal_sales', 'admin', 'super_admin'];
 
 async function roleOf(userId) {
@@ -104,23 +104,39 @@ async function resolveSubject(user, { dealId, leaseId, subject }) {
 
 const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
 
-// The "review_screen" activity: a simple task on the cheaper model, paid by the platform.
-async function aiAssess(review) {
-  if (!(await configService.getConfig('reviews.ai_filter_enabled', true))) return null;
-  const out = await orchestrator.tryRun('review_screen', {
+// Feature #7: an AI second opinion on one review, asked for by a moderator and
+// paid from their AI credits (the "review_screen" activity in Serchi). The
+// rule-based filter below runs on every review with no AI cost.
+const AI_REVIEW_SCHEMA = {
+  type: 'object',
+  properties: { fake_likelihood: { type: 'integer' }, reasons: { type: 'array', items: { type: 'string' } } },
+  required: ['fake_likelihood', 'reasons'],
+  additionalProperties: false,
+};
+async function aiSecondOpinion(user, id, meta = {}) {
+  const rv = (await pool.query('SELECT id, rating, title, body, fraud_score, fraud_reasons FROM reviews WHERE id = $1', [id])).rows[0];
+  if (!rv) throw notFound('Review not found');
+  const out = await serchi.run('review_screen', {
+    user,
     entityType: 'review',
-    schema: {
-      type: 'object',
-      properties: { fake_likelihood: { type: 'integer' }, reasons: { type: 'array', items: { type: 'string' } } },
-      required: ['fake_likelihood', 'reasons'],
-      additionalProperties: false,
-    },
+    entityId: id,
+    schema: AI_REVIEW_SCHEMA,
     prompt:
       'You screen reviews on an Indian real-estate platform for fake, incentivised, spam, abusive or off-topic content. ' +
       'Return fake_likelihood 0-100 and short reasons. Genuine short or negative reviews are fine.\n\n' +
-      `Rating: ${review.rating}/5\nTitle: ${review.title || ''}\nReview: ${review.body || ''}`,
+      `Rule-based signals already found: ${JSON.stringify(rv.fraud_reasons || [])}\n` +
+      `Rating: ${rv.rating}/5\nTitle: ${rv.title || ''}\nReview: ${rv.body || ''}`,
   });
-  return out?.json || null;
+  const opinion = {
+    fakeLikelihood: Math.max(0, Math.min(100, Math.round(Number(out.json.fake_likelihood) || 0))),
+    reasons: (out.json.reasons || []).slice(0, 5).map((x) => String(x).slice(0, 200)),
+    model: out.model,
+    askedBy: user.id,
+    at: new Date().toISOString(),
+  };
+  await pool.query('UPDATE reviews SET ai_opinion = $2 WHERE id = $1', [id, JSON.stringify(opinion)]);
+  await auditService.log({ actor: user, action: 'review.ai_second_opinion', entityType: 'review', entityId: id, after: { fakeLikelihood: opinion.fakeLikelihood, creditsCharged: out.creditsCharged }, ...meta });
+  return { ...opinion, creditsCharged: out.creditsCharged, balance: out.balance, disclaimer: out.disclaimer };
 }
 
 async function fraudCheck(reviewerId, subjectId, { rating, title, body }) {
@@ -130,7 +146,7 @@ async function fraudCheck(reviewerId, subjectId, { rating, title, body }) {
     score += points;
     reasons.push(reason);
   };
-  const [reviewer, recentByReviewer, recentForSubject, duplicate, related] = await Promise.all([
+  const [reviewer, recentByReviewer, recentForSubject, duplicate, related, sharedIp, ipCluster] = await Promise.all([
     pool.query('SELECT created_at, tenant_id, created_by FROM users WHERE id = $1', [reviewerId]),
     pool.query(`SELECT COUNT(*)::int AS n FROM reviews WHERE reviewer_id = $1 AND created_at > now() - interval '24 hours'`, [reviewerId]),
     pool.query(`SELECT COUNT(*)::int AS n FROM reviews WHERE subject_user_id = $1 AND created_at > now() - interval '24 hours'`, [subjectId]),
@@ -138,6 +154,15 @@ async function fraudCheck(reviewerId, subjectId, { rating, title, body }) {
       ? pool.query(`SELECT 1 FROM reviews WHERE lower(regexp_replace(COALESCE(body, ''), '[^a-zA-Z0-9]+', ' ', 'g')) = $1 LIMIT 1`, [norm(body)])
       : { rows: [] },
     pool.query('SELECT tenant_id FROM users WHERE id = $1', [subjectId]),
+    // Device / network: the reviewer and the reviewed person seen on the same IP address.
+    pool.query(`SELECT 1 FROM user_ips a JOIN user_ips b ON b.ip = a.ip WHERE a.user_id = $1 AND b.user_id = $2 LIMIT 1`, [reviewerId, subjectId]),
+    // Other recent reviewers of the same person who share an IP address with this reviewer.
+    pool.query(
+      `SELECT COUNT(DISTINCT rv.reviewer_id)::int AS n FROM reviews rv
+       JOIN user_ips o ON o.user_id = rv.reviewer_id JOIN user_ips me ON me.ip = o.ip AND me.user_id = $1
+       WHERE rv.subject_user_id = $2 AND rv.reviewer_id <> $1 AND rv.created_at > now() - interval '30 days'`,
+      [reviewerId, subjectId]
+    ),
   ]);
   const r = reviewer.rows[0];
   if (Date.now() - new Date(r.created_at).getTime() < 3 * 86400000) add(20, 'Reviewer account is less than 3 days old');
@@ -146,12 +171,9 @@ async function fraudCheck(reviewerId, subjectId, { rating, title, body }) {
   if ((rating === 1 || rating === 5) && norm(body).length < 20) add(10, 'Extreme rating with little or no text');
   if (duplicate.rows.length) add(40, 'Same text as another review');
   if (r.created_by === subjectId || (r.tenant_id && r.tenant_id === related.rows[0]?.tenant_id)) add(40, 'Reviewer is linked to the reviewed person');
-  const ai = await aiAssess({ rating, title, body });
-  if (ai && ai.fake_likelihood >= 30) {
-    score += Math.round(ai.fake_likelihood / 2);
-    reasons.push(...(ai.reasons || []).slice(0, 3).map((x) => `AI: ${x}`));
-  }
-  return { score: Math.min(100, score), reasons, ai: !!ai };
+  if (sharedIp.rows.length) add(35, 'Reviewer and the reviewed person used the same network (IP address)');
+  if (ipCluster.rows[0].n >= 1) add(25, 'Other recent reviewers of this person share a network with this reviewer');
+  return { score: Math.min(100, score), reasons, ai: false };
 }
 
 // ----------------------------------------------------------------- writes
@@ -212,6 +234,7 @@ function publicReview(r, { staff = false } = {}) {
           subjectName: r.subject_name,
           fraudScore: r.fraud_score,
           fraudReasons: r.fraud_reasons,
+          aiOpinion: r.ai_opinion || null,
           reportedAt: r.reported_at,
           reportReason: r.report_reason,
           moderationNote: r.moderation_note,
@@ -428,6 +451,7 @@ async function decideVerification(user, id, action, notes, meta = {}) {
 }
 
 module.exports = {
+  aiSecondOpinion,
   STAFF,
   eligibleInteractions,
   createReview,

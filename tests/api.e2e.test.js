@@ -1284,8 +1284,10 @@ test('matching engine: binding weights, tiers, reverse matching, marketplace, se
   const w = learned.data.weights;
   assert.ok(Math.abs(Object.values(w).reduce((a, b) => a + b, 0) - 100) < 0.5, 'weights sum to 100');
   assert.ok(w.location > 30 && w.location <= 30 * 1.3 + 3, 'location gains weight, within the bound');
+  // Phase 1 (client): the weights are computed for review, but the engine stays
+  // on its rule-based weights until learning is switched on in Phase 2.
   const overview = await api('GET', '/matching/overview', { token: A });
-  assert.ok(overview.data.learned);
+  assert.equal(overview.data.learned, null, 'learning not applied in Phase 1');
   const ab = await api('GET', '/matching/ab-report', { token: A });
   assert.ok(ab.data.variants.A.shown >= 60 && ab.data.variants.B);
   // Leave the engine on its binding weights for other tests / runs.
@@ -3352,8 +3354,10 @@ test('languages: Hindi live at launch, public bundle with ETag, saved preference
   assert.equal(cat.status, 200, JSON.stringify(cat.body));
   assert.equal(cat.data.added, 1);
   assert.equal((await api('GET', '/i18n/bundle/hi?app=crm')).data.strings.Dashboard, 'डैशबोर्ड');
-  // The AI helper is optional: without a key it says so rather than failing silently.
-  if (!process.env.ANTHROPIC_API_KEY) assert.equal((await api('POST', '/i18n/manage/ai-draft', { token: A, body: { language: code, app: 'website' } })).status, 400);
+  // The AI helper is optional and paid from the admin's own AI credits: with no
+  // key it says so (400); with no credits it asks for credits (402) - never silent.
+  const draft = await api('POST', '/i18n/manage/ai-draft', { token: A, body: { language: code, app: 'website' } });
+  assert.ok([400, 402].includes(draft.status), JSON.stringify(draft.body));
   await api('POST', '/i18n/manage/languages', { token: A, body: { code, isActive: false } });
   await pool.query('DELETE FROM languages WHERE code = $1', [code]);
   await pool.query(`DELETE FROM i18n_strings WHERE source_text IN ($1, $2)`, [newText, `Fresh label ${RUN}`]);
@@ -6818,63 +6822,131 @@ test('city / area heads: CH and AH designations never take inquiries, review rel
   assert.equal((await api('PUT', `/leads/${lead}/assign`, { token: otherHead.token, body: { assignedTo: r1.id } })).status, 403);
 });
 
-test('AI orchestration + credit wallet: simple tasks on OpenAI, important on Claude, fallback to the other provider, credits taken first (402 when short), refunded when no provider answers, staff and background work free, packs + GST, admin top-ups, append-only ledger, paid AI agreement review', async () => {
-  const ai = require('../src/services/ai/orchestrator.service');
+test('Serchi + AI credit wallet: every AI call paid from the asking user\'s wallet (staff too, never the platform), safety AI off, 402 before any model, fallback + refund, disclaimers, spend caps, bank / UPI top-ups with admin approval, GST invoice, referral credits (join, usage, deal close), credit expiry and refunds per the T&C, cost vs credits, paid agreement review', async () => {
+  const ai = require('../src/services/ai/serchi');
+  const walletService = require('../src/services/ai/wallet.service');
   const A = ctx.admin.token;
+  const referrer = await createUser('broker', 'ai-referrer');
   const broker = await createUser('broker', 'ai-wallet');
   const brokerUser = { id: broker.id, role: 'broker' };
 
-  // ---- the wallet: empty, packs with GST, the price list
+  // ---- referral credits: the introducer earns when the person joins (once)
+  await pool.query(
+    `INSERT INTO referral_tree (referrer_id, referred_id, referral_code) VALUES ($1, $2, 'E2E') ON CONFLICT (referred_id) DO UPDATE SET referrer_id = EXCLUDED.referrer_id`,
+    [referrer.id, broker.id]
+  );
+  assert.equal(await walletService.onJoined(broker.id), 25);
+  assert.equal(await walletService.onJoined(broker.id), null, 'one join reward per person');
+
+  // ---- the wallet: empty, packs with GST, prices of the user-asked AI actions
   const w0 = await api('GET', '/ai-credits/wallet', { token: broker.token });
   assert.equal(w0.status, 200, JSON.stringify(w0.body));
   assert.equal(w0.data.balance, 0);
+  assert.equal(w0.data.staffFree, undefined, 'nobody uses AI free');
   const pro = w0.data.packs.find((p) => p.name === 'Professional');
   assert.deepEqual([pro.priceInr, pro.gstInr, pro.totalInr, pro.totalCredits], [1000, 180, 1180, 1100], '1 credit = Rs 1, bonus credits, 18% GST');
-  assert.ok(w0.data.prices.some((p) => p.key === 'agreement_review' && p.credits === 49));
-  assert.ok(!w0.data.prices.some((p) => p.key === 'review_screen'), 'background work is not sold');
+  const price = (k) => w0.data.prices.find((p) => p.key === k)?.credits;
+  assert.deepEqual([price('agreement_review'), price('document_analysis'), price('lead_insight'), price('review_screen'), price('field_fraud_review')], [49, 25, 2, 2, 3]);
+  assert.equal(price('image_contact_scan'), undefined, 'safety checks have no AI activity');
+  assert.equal(w0.data.referrals.rewards.join, 25);
 
-  // ---- routing: simple -> OpenAI, important -> Claude
-  const simple = await ai.run('review_screen', { prompt: 'Rating 5. Great place.', schema: { type: 'object', properties: { fake_likelihood: { type: 'integer' } }, required: ['fake_likelihood'], additionalProperties: false } });
-  assert.deepEqual([simple.provider, simple.model, simple.creditsCharged], ['openai', 'gpt-6-luna', 0]);
-  assert.equal(typeof simple.json.fake_likelihood, 'number');
+  // ---- no anonymous / platform-paid AI, and the safety AI is switched off
+  await assert.rejects(ai.run('review_screen', { prompt: 'Great place' }), (e) => e.statusCode === 403);
+  for (const k of ['image_contact_scan', 'image_origin_check', 'scan_transcribe', 'notice_extract']) {
+    await assert.rejects(ai.run(k, { user: brokerUser, prompt: 'x' }), (e) => e.statusCode === 503, k);
+  }
+  assert.equal((await pool.query(`SELECT COUNT(*)::int AS n FROM ai_activities WHERE payer <> 'user'`)).rows[0].n, 0);
 
-  // ---- a user-paid activity with no credits: refused before any model is called
+  // ---- not enough credits: refused before any model is called
   await assert.rejects(ai.run('lead_insight', { user: brokerUser, prompt: 'Needs a 2BHK' }), (e) => e.statusCode === 402 && e.errors[0].code === 'insufficient_credits' && e.errors[0].needed === 2);
-  assert.equal((await pool.query(`SELECT error FROM ai_runs WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1`, [broker.id])).rows[0].error, 'not enough credits');
 
-  // ---- admin top-ups: a bank-transfer purchase of a pack, and a grant
-  assert.equal((await api('POST', '/ai-credits/admin/credit', { token: broker.token, body: { userId: broker.id, credits: 100, note: 'self top-up attempt' } })).status, 403);
-  const bought = await api('POST', '/ai-credits/admin/credit', { token: A, body: { userId: broker.id, packId: pro.id, reference: `UTR${RUN}` } });
-  assert.equal(bought.status, 200, JSON.stringify(bought.body));
-  assert.equal(bought.data.balance, 1100);
+  // ---- bank / UPI top-up: reported by the user, credited after admin approval, with a GST invoice
+  const topup = await api('POST', '/ai-credits/topups', { token: broker.token, body: { packId: pro.id, method: 'upi', reference: `UPI${RUN}777` } });
+  assert.equal(topup.status, 201, JSON.stringify(topup.body));
+  assert.deepEqual([topup.data.status, topup.data.amountInr], ['pending', 1180]);
+  assert.equal((await api('POST', '/ai-credits/topups', { token: broker.token, body: { packId: pro.id, method: 'upi', reference: `upi${RUN}777` } })).status, 400, 'same reference twice');
+  assert.equal((await api('GET', '/ai-credits/wallet', { token: broker.token })).data.balance, 0, 'nothing until approved');
+  assert.equal((await api('GET', '/ai-credits/admin/topups', { token: broker.token })).status, 403);
+  assert.ok((await api('GET', '/ai-credits/admin/topups', { token: A })).data.some((t) => t.id === topup.data.id));
+  assert.equal((await api('POST', `/ai-credits/admin/topups/${topup.data.id}/decide`, { token: A, body: { action: 'reject' } })).status, 400, 'a rejection needs a reason');
+  const approved = await api('POST', `/ai-credits/admin/topups/${topup.data.id}/decide`, { token: A, body: { action: 'approve', note: 'matched in the bank statement' } });
+  assert.equal(approved.data.status, 'approved', JSON.stringify(approved.body));
   const purchase = (await pool.query(`SELECT * FROM ai_credit_purchases WHERE user_id = $1`, [broker.id])).rows[0];
-  assert.deepEqual([purchase.status, purchase.gateway, Number(purchase.total_inr)], ['paid', 'manual', 1180]);
-  assert.match(purchase.receipt_number, /^AIC-\d{4}-\d{6}$/);
+  assert.deepEqual([purchase.status, purchase.gateway, Number(purchase.total_inr), purchase.credits], ['paid', 'upi', 1180, 1100]);
+  assert.match(purchase.invoice_number, /^AIC-INV-\d{4}-\d{6}$/);
+  const pdf = await fetch(`${BASE}/ai-credits/purchases/${purchase.id}/invoice`, { headers: { authorization: `Bearer ${broker.token}` } });
+  assert.equal(pdf.status, 200);
+  assert.equal(pdf.headers.get('content-type'), 'application/pdf');
+  assert.equal(Buffer.from(await pdf.arrayBuffer()).subarray(0, 5).toString(), '%PDF-');
+  assert.equal((await fetch(`${BASE}/ai-credits/purchases/${purchase.id}/invoice`, { headers: { authorization: `Bearer ${referrer.token}` } })).status, 404, 'not their invoice');
   assert.equal((await api('POST', '/ai-credits/admin/credit', { token: A, body: { userId: broker.id, credits: -5000, note: 'too much taken back' } })).status, 400, 'never below zero');
 
-  // ---- paid run: credits taken, run logged with tokens and cost
+  // ---- paid run: credits taken, cost recorded, disclaimer attached
   const paid = await ai.run('lead_insight', { user: brokerUser, prompt: 'Needs a 2BHK in Dwarka under 90 lakh' });
   assert.deepEqual([paid.provider, paid.creditsCharged, paid.balance], ['openai', 2, 1098]);
+  assert.match(paid.disclaimer, /Indicative only/);
   const runRow = (await pool.query('SELECT * FROM ai_runs WHERE id = $1', [paid.runId])).rows[0];
   assert.equal(runRow.status, 'ok');
   assert.ok(runRow.input_tokens > 0 && Number(runRow.cost_usd) > 0, 'actual cost recorded');
 
-  // ---- fallback to the other provider when the first fails
+  // ---- fallback to the other provider, and the refund when no provider answers
   const fb = await ai.run('lead_insight', { user: brokerUser, prompt: 'Lead text [fail-openai]' });
   assert.deepEqual([fb.provider, fb.fallbackUsed, fb.creditsCharged], ['claude', true, 2]);
-
-  // ---- no provider answers: the credits come back
   await assert.rejects(ai.run('lead_insight', { user: brokerUser, prompt: 'Lead text [fail-openai] [fail-claude]' }), (e) => e.statusCode === 502 && /credits were returned/.test(e.message));
   const kinds = (await pool.query(`SELECT kind, credits FROM ai_credit_ledger WHERE user_id = $1 ORDER BY created_at`, [broker.id])).rows.map((r) => `${r.kind}:${r.credits}`);
   assert.deepEqual(kinds, ['purchase:1100', 'spend:-2', 'spend:-2', 'spend:-2', 'refund:2']);
   assert.equal((await pool.query('SELECT balance FROM ai_wallets WHERE user_id = $1', [broker.id])).rows[0].balance, 1096);
   await assert.rejects(pool.query(`UPDATE ai_credit_ledger SET credits = 0 WHERE user_id = $1`, [broker.id]), /append-only/);
 
-  // ---- staff never pay
-  const staffRun = await ai.run('lead_insight', { user: { id: ctx.sales.id, role: 'internal_sales' }, prompt: 'Staff summary' });
-  assert.equal(staffRun.creditsCharged, 0);
+  // ---- referral usage share: 5% of what the introduced person spends, paid out in whole credits
+  assert.equal(Number((await pool.query('SELECT referral_accrued FROM ai_wallets WHERE user_id = $1', [referrer.id])).rows[0].referral_accrued), 0.2);
 
-  // ---- settings: only the Super Admin; models must be priced and match the provider
+  // ---- staff pay too (A R Buildwel never absorbs AI cost)
+  await assert.rejects(ai.run('lead_insight', { user: { id: ctx.sales.id, role: 'internal_sales' }, prompt: 'Staff summary' }), (e) => e.statusCode === 402);
+
+  // ---- spend caps and the low-balance alert
+  assert.equal((await api('PUT', '/ai-credits/settings', { token: broker.token, body: { dailyCap: 50, monthlyCap: 10 } })).status, 400, 'daily above monthly');
+  const capped = await api('PUT', '/ai-credits/settings', { token: broker.token, body: { dailyCap: 5, lowBalanceAlert: 1095 } });
+  assert.deepEqual([capped.data.dailyCap, capped.data.lowBalanceAlert], [5, 1095], JSON.stringify(capped.body));
+  await assert.rejects(ai.run('lead_insight', { user: brokerUser, prompt: 'Over the cap' }), (e) => e.statusCode === 402 && e.errors[0].code === 'daily_cap_reached' && e.errors[0].used === 4);
+  await api('PUT', '/ai-credits/settings', { token: broker.token, body: { dailyCap: null } });
+  await ai.run('lead_insight', { user: brokerUser, prompt: 'Within budget again' });
+  assert.ok((await pool.query(`SELECT 1 FROM notifications WHERE user_id = $1 AND type = 'ai_credits' AND title ILIKE '%running low%'`, [broker.id])).rows.length, 'alerted below the chosen level');
+
+  // ---- free / promotional credits expire per the T&C validity
+  await api('POST', '/ai-credits/admin/credit', { token: A, body: { userId: broker.id, credits: 10, note: 'launch promotion' } });
+  const lot = (await pool.query(`SELECT id, expires_at FROM ai_credit_lots WHERE user_id = $1 AND kind = 'grant' ORDER BY created_at DESC LIMIT 1`, [broker.id])).rows[0];
+  assert.ok(lot.expires_at && new Date(lot.expires_at) > new Date(Date.now() + 80 * 86400000), 'grant credits valid ~90 days');
+  await pool.query(`UPDATE ai_credit_lots SET expires_at = now() - interval '1 minute' WHERE id = $1`, [lot.id]);
+  const before = (await pool.query('SELECT balance FROM ai_wallets WHERE user_id = $1', [broker.id])).rows[0].balance;
+  await walletService.expireCredits();
+  assert.equal((await pool.query('SELECT balance FROM ai_wallets WHERE user_id = $1', [broker.id])).rows[0].balance, before - 10);
+  assert.equal((await pool.query(`SELECT credits FROM ai_credit_ledger WHERE user_id = $1 AND kind = 'expire'`, [broker.id])).rows[0].credits, -10);
+  const sums = (await pool.query(`SELECT (SELECT balance FROM ai_wallets WHERE user_id = $1) AS balance, (SELECT SUM(remaining)::int FROM ai_credit_lots WHERE user_id = $1) AS lots`, [broker.id])).rows[0];
+  assert.equal(sums.balance, sums.lots, 'the balance is always the sum of the lots');
+
+  // ---- refund of unused purchased credits within the window
+  const buyer = await createUser('broker', 'ai-refund');
+  const starter = w0.data.packs.find((p) => p.name === 'Starter');
+  await api('POST', '/ai-credits/admin/credit', { token: A, body: { userId: buyer.id, packId: starter.id, reference: `NEFT${RUN}9` } });
+  await ai.run('lead_insight', { user: { id: buyer.id, role: 'broker' }, prompt: 'One summary' });
+  const bp = (await pool.query(`SELECT id FROM ai_credit_purchases WHERE user_id = $1`, [buyer.id])).rows[0];
+  const refunded = await api('POST', `/ai-credits/admin/purchases/${bp.id}/refund`, { token: A, body: { note: 'asked within 7 days' } });
+  assert.equal(refunded.status, 200, JSON.stringify(refunded.body));
+  assert.deepEqual([refunded.data.refundedCredits, refunded.data.refundInr, refunded.data.balance], [498, 587.64, 0]);
+  assert.equal((await api('POST', `/ai-credits/admin/purchases/${bp.id}/refund`, { token: A, body: { note: 'again please' } })).status, 400);
+
+  // ---- referral reward when an introduced person's deal closes (once per deal)
+  const cust = await require('../src/services/customer.service').findOrCreateCustomerByContact({ fullName: `Deal buyer ${RUN}`, mobile: `8${String(Math.floor(Math.random() * 1e9)).padStart(9, '0')}` });
+  const deal = (await pool.query(`INSERT INTO deals (customer_id, broker_id) VALUES ($1, $2) RETURNING id`, [cust.id, broker.id])).rows[0].id;
+  const rewards = await walletService.onDealClosed(deal);
+  assert.deepEqual(rewards.map((r) => [r.referrer, r.credits]), [[referrer.id, 250]]);
+  assert.deepEqual(await walletService.onDealClosed(deal), [], 'once per deal');
+  const refWallet = await api('GET', '/ai-credits/wallet', { token: referrer.token });
+  assert.equal(refWallet.data.balance, 275, 'join 25 + deal 250');
+  assert.deepEqual([refWallet.data.referrals.earned.join.credits, refWallet.data.referrals.earned.deal_closed.credits], [25, 250]);
+
+  // ---- settings: only the Super Admin; cost against credits for the admin
   const root = await createUser('super_admin', 'ai-root');
   assert.equal((await api('PUT', '/ai-credits/admin/activities/agreement_review', { token: A, body: { credits: 1 } })).status, 403);
   assert.equal((await api('PUT', '/ai-credits/admin/activities/agreement_review', { token: root.token, body: { provider: 'claude', model: 'gpt-6-luna' } })).status, 400);
@@ -6882,7 +6954,9 @@ test('AI orchestration + credit wallet: simple tasks on OpenAI, important on Cla
   const overview = await api('GET', '/ai-credits/admin', { token: A });
   assert.equal(overview.status, 200);
   assert.equal(overview.data.activities.find((x) => x.key === 'agreement_review').model, 'claude-opus-5-5');
-  assert.ok(overview.data.usage30d.some((u) => u.activity_key === 'lead_insight'));
+  const li = overview.data.usage30d.find((u) => u.activity_key === 'lead_insight');
+  assert.ok(li && typeof li.costInr === 'number' && typeof li.marginInr === 'number' && li.belowCost === false, 'cost in rupees against credits');
+  assert.ok(overview.data.recentRuns.some((r) => r.activityKey === 'lead_insight' && r.creditsCharged === 2 && typeof r.costInr === 'number'));
 
   // ---- the paid AI agreement review (Claude Opus 5.5)
   const tpl = (await pool.query(`SELECT t.id, t.current_version FROM document_templates t WHERE t.template_key = 'agreement_to_sell'`)).rows[0];
@@ -6896,11 +6970,198 @@ test('AI orchestration + credit wallet: simple tasks on OpenAI, important on Cla
   assert.equal(short.status, 402, 'no credits, no review');
   assert.match(short.body.message, /needs 49 AI credits/);
   await pool.query(`UPDATE generated_documents SET created_by = $2 WHERE id = $1`, [doc, broker.id]);
+  const bal = (await pool.query('SELECT balance FROM ai_wallets WHERE user_id = $1', [broker.id])).rows[0].balance;
   const review = await api('POST', `/templates/generated/${doc}/ai-review`, { token: broker.token, body: { focus: 'payment schedule' } });
   assert.equal(review.status, 201, JSON.stringify(review.body));
-  assert.deepEqual([review.data.model, review.data.creditsCharged, review.data.balance], ['claude-opus-5-5', 49, 1047]);
+  assert.deepEqual([review.data.model, review.data.creditsCharged, review.data.balance], ['claude-opus-5-5', 49, bal - 49]);
   assert.ok(['ok', 'needs_attention', 'serious_issues'].includes(review.data.review.overall));
   assert.match(review.data.disclaimer, /Not legal advice/);
   assert.equal((await api('GET', `/templates/generated/${doc}/ai-reviews`, { token: broker.token })).data.length, 1);
   assert.equal((await api('POST', `/templates/generated/${doc}/ai-review`, { token: poor.token, body: {} })).status, 403, 'not their document');
 });
+
+test('chat intake (Engine 1): WhatsApp / Telegram free text read for intent (buy / rent / sell / rent out / institutional) by rules, requirements become tagged leads, property posts with photos wait for staff approval with a duplicate check, institutional sales go to the institutional desk', async () => {
+  const intake = require('../src/services/messaging/chatIntake.service');
+  const bot = require('../src/services/whatsappBot.service');
+  const { Jimp } = require('jimp');
+  const A = ctx.admin.token;
+  const S = ctx.sales.token;
+  const CITYX = (await pool.query(`SELECT city_name FROM cities WHERE city_name ~ '^[A-Za-z]+$' ORDER BY city_name LIMIT 1`)).rows[0].city_name;
+  const SEC = 100 + (parseInt(RUN, 16) % 800);
+  const phone = () => `8${String(Math.floor(Math.random() * 1e9)).padStart(9, '0')}`;
+
+  // ---- intent rules (English / Hinglish)
+  const intentOf = (t) => intake.detectIntent(t).intent;
+  assert.equal(intentOf(`Selling my 3 BHK flat in Sector ${SEC}, 1.6 Cr`), 'sell');
+  assert.equal(intentOf('2BHK available for rent in Indirapuram, 22k/month'), 'rent_out');
+  assert.equal(intentOf('Tenant chahiye 1RK Laxmi Nagar 9000 per month'), 'rent_out');
+  assert.equal(intentOf('Looking for 2 bhk on rent in Noida budget 25k'), 'rent');
+  assert.equal(intentOf('need 3bhk flat under 1.5 cr'), 'buy');
+  assert.equal(intentOf('mera plot bechna hai 200 gaj'), 'sell');
+  assert.equal(intentOf('CBSE school for sale in Jaipur, 5 acre campus'), 'institutional_sale');
+  assert.equal(intentOf('Want to buy a running hospital in Lucknow'), 'institutional_buy');
+  assert.equal(intentOf('flat near a school, need 2bhk'), 'buy', 'a school nearby is not an institutional deal');
+  assert.equal(intentOf('hi'), 'greeting');
+  const f = await intake.parseFields(`Selling 3 BHK in Sector ${SEC} ${CITYX}, 1650 sq ft, 1.6 Cr, semi furnished`, 'sell');
+  assert.deepEqual([f.bedrooms, f.areaSqft, f.priceValue, f.propertyType, f.furnishing, f.city, f.locality], [3, 1650, 16000000, 'apartment', 'semi-furnished', CITYX, `Sector ${SEC}`]);
+  assert.equal((await intake.parseFields('plot 200 gaj', 'sell')).areaSqft, 1800, 'gaj = 9 sq ft');
+
+  // ---- rules only: no AI call, even for an unclear message (the poster has no wallet to pay)
+  const aiBefore = (await pool.query(`SELECT COUNT(*)::int AS n FROM ai_runs`)).rows[0].n;
+  const clear = await intake.read(`Selling my 3 BHK flat in Sector ${SEC} ${CITYX}, asking 1.6 Cr`);
+  assert.deepEqual([clear.intent, clear.method], ['sell', 'rules']);
+  const unclear = await intake.read(`3bhk sector ${SEC} 1.2cr`);
+  assert.equal(unclear.intent, 'other', 'unclear messages are left to the bot questions');
+  assert.equal((await pool.query(`SELECT COUNT(*)::int AS n FROM ai_runs`)).rows[0].n, aiBefore, 'no AI call');
+
+  // ---- WhatsApp: a typed requirement becomes a WhatsApp-Requirement lead (no question flow)
+  const waPhone = phone();
+  const req = await bot.handleInboundMessage({ phoneNumber: `91${waPhone}`, waUserId: `wa-req-${RUN}`, text: `need 3bhk flat in ${CITYX} under 1.5 cr, my name is Rohit Sharma`, messageId: `wamid-req-${RUN}` });
+  assert.equal(req.intake.routedTo, 'requirement', JSON.stringify(req));
+  const waLead = (await pool.query(`SELECT l.source_tag, c.full_name FROM leads l JOIN customers c ON c.id = l.customer_id WHERE l.id = $1`, [req.intake.leadId])).rows[0];
+  assert.deepEqual(waLead, { source_tag: 'WhatsApp-Requirement', full_name: 'Rohit Sharma' });
+  assert.equal((await pool.query(`SELECT COUNT(*)::int AS n FROM whatsapp_bot_sessions WHERE wa_user_id = $1`, [`wa-req-${RUN}`])).rows[0].n, 0, 'no question flow started');
+  // A greeting still starts the question flow.
+  const hi = await bot.handleInboundMessage({ phoneNumber: `91${phone()}`, waUserId: `wa-hi-${RUN}`, text: 'Hi' }).catch((e) => ({ error: e.message }));
+  assert.ok(!hi.intake, 'greeting goes to the question flow');
+
+  // ---- an existing live listing, to be caught as a duplicate
+  const original = await api('POST', '/properties', { token: A, body: { ...baseListing(), title: `3 BHK apartment for sale in Sector ${SEC}, ${CITYX}`, city: CITYX, locality: `Sector ${SEC}`, bedrooms: 3, price: '1.6 Cr' } });
+  assert.equal(original.status, 201, JSON.stringify(original.body));
+
+  // ---- WhatsApp: a property post with a photo, more photos, then a missing detail
+  const owner = { channel: 'whatsapp', phone: phone(), waUserId: `wa-own-${RUN}`, name: 'Owner Gupta' };
+  const photo = async (c) => ({ buffer: await new Jimp({ width: 320, height: 240, color: c }).getBuffer('image/jpeg'), mimetype: 'image/jpeg' });
+  const post = await intake.handleMessage(owner, { text: `Selling my 3 BHK flat in Sector ${SEC} ${CITYX}, 1650 sq ft, semi furnished. Call 98${String(RUN).replace(/\D/g, '').padEnd(8, '1').slice(0, 8)}`, photos: [await photo(0x3366ccff)], reply: false });
+  assert.deepEqual([post.handled, post.routedTo, post.intent], [true, 'listing', 'sell'], JSON.stringify(post));
+  assert.ok(post.duplicates >= 1, 'possible duplicate of the live listing flagged on arrival');
+  const more = await intake.handleMessage(owner, { photos: [await photo(0x22aa66ff)], reply: false });
+  assert.deepEqual([more.routedTo, more.photos], ['photo', 2]);
+  const detail = await intake.handleMessage(owner, { text: 'price 1.55 cr', reply: false });
+  assert.equal(detail.routedTo, 'listing_update', JSON.stringify(detail));
+  let sub = (await pool.query('SELECT * FROM chat_listing_submissions WHERE id = $1', [post.submissionId])).rows[0];
+  assert.match(sub.reference, /^CL-\d{4}-\d{6}$/);
+  assert.equal(sub.parsed.priceValue, 15500000);
+  assert.equal(sub.contact_phone, owner.phone);
+  assert.ok(!/\d{10}/.test(sub.parsed.description), 'contact numbers never reach the listing text');
+  assert.equal(sub.duplicates[0].propertyId, original.data.id);
+
+  // ---- Telegram: free-text post, then the number is shared
+  const tg = (u) => fetch(`${BASE}/telegram/webhook`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-telegram-bot-api-secret-token': process.env.TELEGRAM_WEBHOOK_SECRET }, body: JSON.stringify(u) }).then((r) => r.json());
+  const chatL = Number(`8${parseInt(RUN, 16)}`);
+  const tPost = await tg({ message: { chat: { id: chatL }, from: { first_name: 'Tele', last_name: 'Owner' }, text: `2BHK available for rent in Sector ${SEC} ${CITYX}, 22k per month, fully furnished` } });
+  assert.deepEqual([tPost.data.intake.routedTo, tPost.data.intake.intent, tPost.data.intake.needsPhone], ['listing', 'rent_out', true], JSON.stringify(tPost));
+  const tPhone = phone();
+  const tShared = await tg({ message: { chat: { id: chatL }, contact: { phone_number: `+91${tPhone}` } } });
+  assert.equal(tShared.data.completed, true, JSON.stringify(tShared));
+  const tSub = (await pool.query('SELECT * FROM chat_listing_submissions WHERE id = $1', [tPost.data.intake.submissionId])).rows[0];
+  assert.deepEqual([tSub.channel, tSub.contact_phone, tSub.contact_name, tSub.parsed.transactionType, tSub.parsed.priceValue], ['telegram', tPhone, 'Tele Owner', 'rent', 22000]);
+  // Telegram requirement: held until the number is shared, then a Telegram-Requirement lead.
+  const chatR = chatL + 1;
+  const tReq = await tg({ message: { chat: { id: chatR }, text: `Looking for 2 bhk on rent in Sector ${SEC} ${CITYX} budget 25k` } });
+  assert.equal(tReq.data.intake.needsPhone, true, JSON.stringify(tReq));
+  const tReqDone = await tg({ message: { chat: { id: chatR }, contact: { phone_number: `+91${phone()}` } } });
+  const tLead = (await pool.query('SELECT source_tag FROM leads WHERE id = $1', [tReqDone.data.intake.leadId])).rows[0];
+  assert.equal(tLead?.source_tag, 'Telegram-Requirement', JSON.stringify(tReqDone));
+  // The "Sell / rent out my property" button: the next message is read as a listing.
+  const chatB = chatL + 2;
+  await tg({ message: { chat: { id: chatB }, text: '/start' } });
+  const tapSell = await tg({ callback_query: { id: 'cb', data: 'purpose:sell', message: { chat: { id: chatB } } } });
+  assert.equal(tapSell.data.step, 'intake');
+  const viaButton = await tg({ message: { chat: { id: chatB }, text: `Plot 200 gaj Sector ${SEC} ${CITYX} 1.1 cr` } });
+  assert.equal(viaButton.data.intake.routedTo, 'listing', JSON.stringify(viaButton));
+
+  // ---- staff review queue
+  assert.equal((await api('GET', '/chat-intake/submissions', { token: (await createUser('broker', 'chat-broker')).token })).status, 403);
+  const queue = await api('GET', '/chat-intake/submissions', { token: S });
+  assert.equal(queue.status, 200, JSON.stringify(queue.body));
+  assert.ok(queue.data.items.some((i) => i.id === post.submissionId));
+  const one = await api('GET', `/chat-intake/submissions/${post.submissionId}`, { token: S });
+  assert.deepEqual([one.data.photoCount, one.data.photos.length, one.data.duplicates.length >= 1], [2, 2, true]);
+  const edited = await api('PUT', `/chat-intake/submissions/${post.submissionId}`, { token: S, body: { title: `Owner 3 BHK in Sector ${SEC}, ${CITYX}`, bathrooms: 2 } });
+  assert.equal(edited.data.parsed.title, `Owner 3 BHK in Sector ${SEC}, ${CITYX}`);
+  const approved = await api('POST', `/chat-intake/submissions/${post.submissionId}/approve`, { token: S, body: {} });
+  assert.equal(approved.status, 200, JSON.stringify(approved.body));
+  assert.equal(approved.data.status, 'approved');
+  const prop = (await pool.query('SELECT title, city, locality, bedrooms, bathrooms, price_value, transaction_type::text, status::text FROM properties WHERE id = $1', [approved.data.propertyId])).rows[0];
+  assert.deepEqual([prop.title, prop.city, prop.bedrooms, prop.bathrooms, Number(prop.price_value), prop.transaction_type], [`Owner 3 BHK in Sector ${SEC}, ${CITYX}`, CITYX, 3, 2, 15500000, 'sell']);
+  assert.notEqual(prop.status, 'rejected');
+  assert.equal((await api('POST', `/chat-intake/submissions/${post.submissionId}/approve`, { token: S, body: {} })).status, 400, 'reviewed once');
+  // Missing price -> must be added before approval; reject with a reason.
+  const bare = await intake.handleMessage({ channel: 'whatsapp', phone: phone(), waUserId: `wa-bare-${RUN}` }, { text: `Selling my villa in ${CITYX}, please call`, reply: false });
+  assert.equal((await api('POST', `/chat-intake/submissions/${bare.submissionId}/approve`, { token: S, body: {} })).status, 400);
+  const rejected = await api('POST', `/chat-intake/submissions/${bare.submissionId}/reject`, { token: S, body: { reason: 'Owner did not share the price', notify: false } });
+  assert.equal(rejected.data.status, 'rejected');
+
+  // ---- institutional sale -> the institutional desk (Engine 7) on approval
+  const inst = await intake.handleMessage({ channel: 'whatsapp', phone: phone(), waUserId: `wa-inst-${RUN}` }, { text: `CBSE school for sale in ${CITYX}, 5 acre campus, asking 45 Cr`, reply: false });
+  assert.equal(inst.intent, 'institutional_sale', JSON.stringify(inst));
+  assert.equal((await api('POST', `/chat-intake/submissions/${inst.submissionId}/approve`, { token: S, body: {} })).status, 400, 'asset class, name and map pin needed first');
+  const instOk = await api('POST', `/chat-intake/submissions/${inst.submissionId}/approve`, { token: S, body: { institutionName: `Chat School ${RUN}`, assetClass: 'k12_school', latitude: 27.17, longitude: 78.04 } });
+  assert.equal(instOk.status, 200, JSON.stringify(instOk.body));
+  const il = (await pool.query(`SELECT p.listing_category, i.asking_price_cr, i.institution_name FROM properties p JOIN institutional_listings i ON i.property_id = p.id WHERE p.id = $1`, [instOk.data.propertyId])).rows[0];
+  assert.deepEqual([il.listing_category, Number(il.asking_price_cr), il.institution_name], ['institutional', 45, `Chat School ${RUN}`]);
+
+  // ---- the message log: intent, rules / AI, where it went
+  const lg = await api('GET', '/chat-intake/log?days=1', { token: S });
+  assert.equal(lg.status, 200);
+  const routes = new Set(lg.data.items.map((i) => i.routedTo));
+  for (const r of ['listing', 'requirement', 'photo']) assert.ok(routes.has(r), `log has ${r}`);
+  assert.ok(lg.data.items.every((i) => !/\d{10}/.test(i.contact || '')), 'phone numbers masked in the log');
+});
+
+test('paid AI buttons (Serchi): review second opinion (#7), read an inbound lead with AI (#3), document analysis (#9) and field-task second opinion (#10) are asked for and paid by the user; the rule-based checks run free; compliance wording', async () => {
+  const A = ctx.admin.token;
+  const mod = await createUser('admin', 'ai-moderator');
+  const a = await createUser('customer', 'rv-author');
+  const b = await createUser('broker', 'rv-subject');
+
+  // ---- #7: the rule-based filter runs on every review; the AI opinion is a paid button
+  const rv = (await pool.query(`INSERT INTO reviews (reviewer_id, subject_user_id, interaction, rating, title, body, status) VALUES ($1, $2, 'site_visit', 5, 'Best broker', 'Best broker ever best best', 'pending_moderation') RETURNING id`, [a.id, b.id])).rows[0].id;
+  const noCredits = await api('POST', `/trust/reviews/${rv}/ai-second-opinion`, { token: mod.token });
+  assert.equal(noCredits.status, 402, 'staff pay too');
+  await api('POST', '/ai-credits/admin/credit', { token: A, body: { userId: mod.id, credits: 20, note: 'moderation credits' } });
+  const op = await api('POST', `/trust/reviews/${rv}/ai-second-opinion`, { token: mod.token });
+  assert.equal(op.status, 200, JSON.stringify(op.body));
+  assert.deepEqual([op.data.creditsCharged, op.data.balance], [2, 18]);
+  assert.match(op.data.disclaimer, /moderator makes the decision/);
+  assert.ok(typeof op.data.fakeLikelihood === 'number');
+  const queue = await api('GET', '/trust/reviews/moderation', { token: mod.token });
+  assert.ok(queue.data.find((x) => x.id === rv)?.aiOpinion, 'opinion shown to moderators');
+
+  // ---- #3: an inbound lead the regexes could not read; an admin asks Serchi (paid)
+  const inbox = (await pool.query(
+    `INSERT INTO lead_ingestion_inbox (source_key, ingestion_method, raw_payload, parse_status, parse_confidence) VALUES ('portal_email', 'email_parser', $1, 'parse_failed', 20) RETURNING id`,
+    [`From: alerts@unknownportal.in\nSubject: enquiry\n\nSomeone wants a flat, call ${RUN}`]
+  )).rows[0].id;
+  const read = await api('POST', `/lead-sources/inbox/${inbox}/ai-read`, { token: mod.token });
+  assert.equal(read.status, 200, JSON.stringify(read.body));
+  assert.deepEqual([read.data.creditsCharged, read.data.balance], [1, 17]);
+  assert.ok('suggested' in read.data && /Check every field/.test(read.data.disclaimer));
+  assert.equal((await pool.query('SELECT parsed_by_ai FROM lead_ingestion_inbox WHERE id = $1', [inbox])).rows[0].parsed_by_ai, true);
+  assert.equal((await pool.query(`SELECT COUNT(*)::int AS n FROM ai_runs WHERE activity_key = 'email_lead_parse' AND user_id IS NULL`)).rows[0].n, 0, 'no unpaid email parsing');
+
+  // ---- #9 / #10: on request only, for people with access
+  assert.equal((await api('POST', `/due-diligence/documents/${nodeCryptoUuid()}/ai-analysis`, { token: mod.token })).status, 404);
+  assert.equal((await api('POST', `/wfh/manage/submissions/${nodeCryptoUuid()}/ai-second-opinion`, { token: mod.token })).status, 404);
+  assert.equal((await api('POST', `/wfh/manage/submissions/${nodeCryptoUuid()}/ai-second-opinion`, { token: b.token })).status, 403, 'staff only');
+  assert.equal((await pool.query(`SELECT COUNT(*)::int AS n FROM ai_runs WHERE activity_key IN ('document_analysis', 'field_fraud_review', 'image_contact_scan', 'image_origin_check', 'scan_transcribe', 'notice_extract') AND created_at > now() - interval '1 hour' AND user_id IS NULL`)).rows[0].n, 0, 'nothing runs on its own');
+
+  // ---- compliance wording
+  const cfg = async (k) => (await pool.query('SELECT value FROM app_config WHERE config_key = $1', [k])).rows[0]?.value;
+  assert.match(await cfg('exchange.valuation_disclaimer'), /Indicative estimate.*not a valuation/);
+  assert.equal(await cfg('matching.learning_enabled'), false, '#4 learning off in Phase 1');
+  assert.equal(await cfg('opportunity.learning_enabled'), false, '#6 learning off in Phase 1');
+  // #12: behaviour counts only with consent.
+  const irm = require('../src/services/irm.service');
+  await pool.query(`INSERT INTO investor_deal_interactions (user_id, property_id, action, city) SELECT $1, id, 'viewed', city FROM properties WHERE status = 'approved' LIMIT 3`, [a.id]).catch(() => {});
+  assert.equal((await irm.behaviourSummary(a.id)).positive, 0, 'no consent, no behaviour');
+  await api('POST', '/user/consent', { token: a.token, body: { categories: ['personalised_matching'], granted: true } });
+  assert.equal((await irm.behaviourSummary(a.id)).consent, true);
+  await api('POST', '/user/consent', { token: a.token, body: { categories: ['personalised_matching'], granted: false } });
+  assert.equal((await irm.behaviourSummary(a.id)).consent, false, 'withdrawable');
+});
+
+function nodeCryptoUuid() {
+  return require('crypto').randomUUID();
+}

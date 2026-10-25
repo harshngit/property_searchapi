@@ -117,6 +117,19 @@ async function sendInteractiveList({ to, recipient, body, buttonText, options })
   );
 }
 
+// Inbound media (a photo sent to the bot): look up its short-lived URL by id,
+// then download it with the same access token. Returns { buffer, mimetype }.
+async function downloadMedia(mediaId) {
+  if (!process.env.WHATSAPP_ACCESS_TOKEN) throw configError();
+  const auth = { Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}` };
+  const meta = await fetch(`https://graph.facebook.com/${GRAPH_VERSION}/${encodeURIComponent(mediaId)}`, { headers: auth });
+  const info = await meta.json().catch(() => ({}));
+  if (!meta.ok || !info.url) throw new Error(`Meta WhatsApp media lookup failed: ${info.error?.message || meta.statusText}`);
+  const file = await fetch(info.url, { headers: auth });
+  if (!file.ok) throw new Error(`Meta WhatsApp media download failed: ${file.statusText}`);
+  return { buffer: Buffer.from(await file.arrayBuffer()), mimetype: info.mime_type || 'image/jpeg', filename: 'whatsapp.jpg' };
+}
+
 // Meta signs every webhook POST with the app secret - see
 // https://developers.facebook.com/docs/graph-api/webhooks/getting-started#validate-payloads
 // `rawBody` must be the exact request bytes (see app.js's express.json `verify`
@@ -136,5 +149,6 @@ module.exports = {
   sendTemplate,
   sendInteractiveButtons,
   sendInteractiveList,
+  downloadMedia,
   verifySignature,
 };

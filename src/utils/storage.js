@@ -127,4 +127,18 @@ async function deleteObject(stored) {
   }
 }
 
-module.exports = { uploadBuffer, deleteObject, generateSignedReadUrl, getReadUrl, signUrls, toObjectPath };
+// Reads one of our stored objects back as a Buffer (null when it is not ours
+// or cannot be read) - e.g. to show stored photos to a model on request.
+async function downloadBuffer(stored) {
+  const objectPath = toObjectPath(stored);
+  if (!objectPath) return null;
+  try {
+    const [buf] = await getBucket().file(objectPath).download();
+    return buf;
+  } catch (err) {
+    console.error(`[storage] Failed to read object "${objectPath}": ${err.message}`);
+    return null;
+  }
+}
+
+module.exports = { uploadBuffer, deleteObject, generateSignedReadUrl, getReadUrl, signUrls, toObjectPath, downloadBuffer };

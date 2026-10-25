@@ -13,19 +13,19 @@ const { badRequest, forbidden, notFound } = require('../utils/httpError');
 //             speed, a position that never moves at all, mock-location.
 //   Photos    a fingerprint of every photo is kept; the same picture on
 //             another task is refused. A reverse image search (Google Vision
-//             web detection) and an AI check for screenshots / map imagery
-//             run when their keys are set.
+//             web detection) runs when its key is set.
 //   Family    numbers the worker declares for their household can never be
 //             submitted, and a buyer / owner who is a field partner is checked
 //             against the declared Aadhaar numbers, bank account and team.
 //   Risk      every submission gets a 0-100 fraud risk score from the signals
-//             above; a high score is always decided by a person.
+//             above (rules only - device, EXIF, geo, timestamps, image hash);
+//             a high score is always decided by a person. Staff may ask Serchi
+//             for an AI second opinion (feature #10), paid from their credits.
 //   Teams     field partners can work as a team with a shared scoreboard.
 //             Team-mates cannot be each other's buyer or owner.
 
-const orchestrator = require('./ai/orchestrator.service');
-const aiProviders = require('./ai/providers');
-const aiConfigured = () => aiProviders.configured('openai') || aiProviders.configured('claude');
+const serchi = require('./ai/serchi');
+const { downloadBuffer } = require('../utils/storage');
 const wfh = () => require('./wfh.service');
 const num = (c, key, fallback) => (Number.isFinite(Number(c[key])) ? Number(c[key]) : fallback);
 const r1 = (v) => Math.round(v * 10) / 10;
@@ -112,7 +112,7 @@ async function recordTrack(user, assignmentId, points) {
 // ------------------------------------------------------------ photos
 
 const mockSearch = () => process.env.NODE_ENV !== 'production' && process.env.WFH_REVERSE_SEARCH_MOCK === 'true';
-const providers = () => ({ reverseImageSearch: !!process.env.GOOGLE_VISION_API_KEY, aiImageCheck: aiConfigured(), aiFraudReview: aiConfigured() });
+const providers = () => ({ reverseImageSearch: !!process.env.GOOGLE_VISION_API_KEY, aiSecondOpinion: 'on request, paid from credits' });
 
 async function visionWebDetection(buffer) {
   const controller = new AbortController();
@@ -148,13 +148,6 @@ async function internetCheck(file, c) {
     checked.push('reverse_image_search');
     const web = await visionWebDetection(file.buffer);
     if (web?.found) return { found: true, source: 'reverse_image_search', where: web.where, checked };
-  }
-  if (await orchestrator.available('image_origin_check')) {
-    checked.push('ai_image_check');
-    const ai = await imageScan.originScan(file.buffer);
-    if (ai && (ai.is_screenshot || ai.is_map_or_street_view || ai.is_photo_of_screen || ai.has_stock_watermark)) {
-      return { found: true, source: 'ai_image_check', where: ai.is_map_or_street_view ? 'map or street-view imagery' : ai.is_screenshot ? 'a screenshot' : ai.is_photo_of_screen ? 'a photo of a screen' : 'a stock image', checked };
-    }
   }
   return { found: false, checked };
 }
@@ -274,24 +267,73 @@ const WEIGHTS = {
 
 const AI_SCHEMA = {
   type: 'object',
-  properties: { verdict: { type: 'string', enum: ['genuine', 'suspicious', 'likely_fraud'] }, reasoning: { type: 'string' } },
-  required: ['verdict', 'reasoning'],
+  properties: {
+    verdict: { type: 'string', enum: ['genuine', 'suspicious', 'likely_fraud'] },
+    reasoning: { type: 'string' },
+    photos_not_on_site: { type: 'boolean' },
+    photo_issue: { type: 'string', enum: ['none', 'screenshot', 'map_or_street_view', 'photo_of_screen', 'stock_or_portal_watermark'] },
+  },
+  required: ['verdict', 'reasoning', 'photos_not_on_site', 'photo_issue'],
   additionalProperties: false,
 };
+const PHOTO_ISSUE = { screenshot: 'a screenshot', map_or_street_view: 'map or street-view imagery', photo_of_screen: 'a photo of a screen', stock_or_portal_watermark: 'a stock or portal image' };
 
-// A second opinion on the signals (the "field_fraud_review" activity: the
-// cheaper model, paid by the platform). No names, numbers or addresses are sent.
-async function aiOpinion(facts) {
-  const out = await orchestrator.tryRun('field_fraud_review', {
-    entityType: 'field_task',
-    schema: AI_SCHEMA,
-    prompt:
+// Feature #10: an AI second opinion on one submission, asked for by staff and
+// paid from their AI credits (the "field_fraud_review" activity in Serchi).
+// The model sees the rule signals and up to 3 of the photos - no names,
+// numbers or addresses. It can raise a submission to a person; never clear it.
+async function secondOpinion(user, assignmentId, meta = {}) {
+  const a = (await pool.query(
+    `SELECT a.id, a.state, a.risk_score, a.risk_band, a.risk_reasons, a.track_summary, a.gps_distance_from_property_m, a.photo_urls, t.task_type
+     FROM wfh_task_assignments a JOIN wfh_tasks t ON t.id = a.task_id WHERE a.id = $1`,
+    [assignmentId]
+  )).rows[0];
+  if (!a) throw notFound('Submission not found');
+  if (a.risk_score == null) throw badRequest('This task has not been submitted yet');
+  const parts = [];
+  for (const ph of (a.photo_urls || []).slice(0, 3)) {
+    const buf = ph.path ? await downloadBuffer(ph.path) : null;
+    if (!buf) continue;
+    try {
+      const { Jimp } = require('jimp');
+      const img = await Jimp.read(buf);
+      const small = img.bitmap.width > 1024 ? img.resize({ w: 1024 }) : img;
+      parts.push({ type: 'image', mediaType: 'image/jpeg', data: (await small.getBuffer('image/jpeg', { quality: 80 })).toString('base64') });
+    } catch {
+      // not an image we can read - the signals alone are reviewed
+    }
+  }
+  parts.push({
+    type: 'text',
+    text:
       'You review field tasks for a real-estate platform that pays people a fixed amount per verified task (bringing a buyer to a property, photographing a property with the owner\'s consent, collecting a buyer\'s requirement). ' +
       'Fraud means: a visit that never happened, a faked GPS position, photos not taken at the property, or a buyer / owner who is the worker, a relative or an accomplice. ' +
+      `${parts.length ? `The ${parts.length} image(s) above are the photos the worker says they took at the property: say whether any is a screenshot, map / street-view imagery, a photo of a screen, or carries a stock or portal watermark. ` : 'No photos are attached. '}` +
       'Given the checks below, say whether this submission looks genuine, suspicious or likely fraud, and why in one or two sentences. A new worker or a single weak signal alone is not fraud.\n\n' +
-      JSON.stringify(facts),
+      JSON.stringify({ taskType: a.task_type, gpsDistanceM: a.gps_distance_from_property_m, track: a.track_summary, signals: a.risk_reasons, ruleScore: a.risk_score }),
   });
-  return out?.json ? { verdict: out.json.verdict, reasoning: String(out.json.reasoning || '').slice(0, 600), model: out.model } : null;
+  const out = await serchi.run('field_fraud_review', { user, entityType: 'field_task', entityId: a.id, schema: AI_SCHEMA, parts });
+  const ai = {
+    verdict: out.json.verdict,
+    reasoning: String(out.json.reasoning || '').slice(0, 600),
+    photoIssue: out.json.photos_not_on_site && out.json.photo_issue !== 'none' ? PHOTO_ISSUE[out.json.photo_issue] : null,
+    photosChecked: parts.length - 1,
+    model: out.model,
+    askedBy: user.id,
+    at: new Date().toISOString(),
+  };
+  const c = await wfh().cfg();
+  const review = num(c, 'risk_review_score', 60);
+  let score = a.risk_score;
+  const reasons = [...(a.risk_reasons || [])];
+  if ((ai.verdict === 'likely_fraud' || ai.photoIssue) && score < review) {
+    score = review;
+    reasons.push({ rule: 'ai_review', detail: ai.photoIssue ? `AI: a photo looks like ${ai.photoIssue}. ${ai.reasoning}` : `AI: ${ai.reasoning}`, points: 0 });
+  }
+  const band = score >= review ? 'high' : a.risk_band;
+  await pool.query('UPDATE wfh_task_assignments SET ai_assessment = $2, risk_score = $3, risk_band = $4, risk_reasons = $5 WHERE id = $1', [a.id, JSON.stringify(ai), score, band, JSON.stringify(reasons)]);
+  await auditService.log({ actor: user, action: 'wfh.ai_second_opinion', entityType: 'wfh_assignment', entityId: a.id, after: { verdict: ai.verdict, photoIssue: ai.photoIssue, creditsCharged: out.creditsCharged }, ...meta });
+  return { ...ai, riskScore: score, riskBand: band, creditsCharged: out.creditsCharged, balance: out.balance, disclaimer: out.disclaimer };
 }
 
 // Score a submission from its flags and the worker's record. Stores the score
@@ -310,14 +352,9 @@ async function assess(assignmentId, worker, flags, c) {
   const hour = Number(new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Kolkata', hour: '2-digit', hour12: false }).format(new Date(a.submitted_at))) % 24;
   if (type.gps && hour < 5) signals.push({ rule: 'odd_hours', detail: 'A visit between midnight and 5 am' });
   const reasons = signals.map((s) => ({ rule: s.rule, detail: s.detail, points: WEIGHTS[s.rule] ?? 10 })).filter((s) => s.points > 0);
-  let score = Math.min(100, reasons.reduce((sum, s) => sum + s.points, 0));
+  const score = Math.min(100, reasons.reduce((sum, s) => sum + s.points, 0));
   const review = num(c, 'risk_review_score', 60);
-  const ai = c.ai_fraud_review === false || !reasons.length ? null : await aiOpinion({ taskType: a.task_type, gpsDistanceM: a.gps_distance_from_property_m, track: a.track_summary, signals: reasons, ruleScore: score });
-  // The AI can raise a submission to a human; it never clears one.
-  if (ai?.verdict === 'likely_fraud' && score < review) {
-    score = review;
-    reasons.push({ rule: 'ai_review', detail: ai.reasoning, points: 0 });
-  }
+  const ai = null; // rules only here; staff may ask for an AI second opinion (secondOpinion)
   const band = score >= review ? 'high' : score >= num(c, 'risk_watch_score', 30) ? 'medium' : 'low';
   await pool.query('UPDATE wfh_task_assignments SET risk_score = $1, risk_band = $2, risk_reasons = $3, ai_assessment = $4 WHERE id = $5', [score, band, JSON.stringify(reasons), ai ? JSON.stringify(ai) : null, assignmentId]);
   await pool.query(
@@ -472,5 +509,5 @@ async function listTeams() {
 
 module.exports = {
   TRACK_ISSUES, RELATIONS, WEIGHTS, analyseTrack, trackOf, recordTrack, internetCheck, fingerprintProblems, storeHashes, providers,
-  family, setFamily, familyCheck, assess, fraudOverview, myTeam, createTeam, joinTeam, leaveTeam, removeMember, listTeams,
+  family, setFamily, familyCheck, assess, secondOpinion, fraudOverview, myTeam, createTeam, joinTeam, leaveTeam, removeMember, listTeams,
 };

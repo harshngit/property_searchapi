@@ -273,9 +273,14 @@ async function handleWebhook(payload) {
         let text = null;
         let buttonReplyId = null;
         let buttonReplyTitle = null;
+        let mediaId = null;
 
         if (message.type === 'text') {
           text = message.text?.body || null;
+        } else if (message.type === 'image') {
+          // A photo (property posting): the caption, if any, is read as text.
+          mediaId = message.image?.id || null;
+          text = message.image?.caption || null;
         } else if (message.type === 'interactive') {
           const reply = message.interactive?.button_reply || message.interactive?.list_reply;
           buttonReplyId = reply?.id || null;
@@ -310,19 +315,20 @@ async function handleWebhook(payload) {
           `INSERT INTO whatsapp_conversations (
              tenant_id, lead_id, customer_id, phone_number, wa_user_id, direction, message_type,
              message_body, provider_message_id, status
-           ) VALUES ($1, $2, $3, $4, $5, 'inbound', 'text', $6, $7, 'delivered')`,
+           ) VALUES ($1, $2, $3, $4, $5, 'inbound', $8, $6, $7, 'delivered')`,
           [
             lead?.tenant_id || customer?.tenant_id || null,
             lead?.id || null,
             customer?.id || null,
             phoneNumber,
             waUserId,
-            text || buttonReplyTitle || null,
+            text || buttonReplyTitle || (mediaId ? '[photo]' : null),
             message.id || null,
+            mediaId ? 'image' : 'text',
           ]
         );
 
-        inboundMessages.push({ phoneNumber, waUserId, text, buttonReplyId, buttonReplyTitle, messageId: message.id });
+        inboundMessages.push({ phoneNumber, waUserId, text, buttonReplyId, buttonReplyTitle, mediaId, messageId: message.id, profileName: (value.contacts || []).find((c) => c.wa_id === message.from || c.user_id === waUserId)?.profile?.name || null });
       }
     }
   }

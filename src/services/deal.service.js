@@ -270,6 +270,8 @@ async function changeStage(id, toStage, user, notes, { orchestrated = false, ove
     if (toStage === 'closed_won') {
       // Sec. 14.6: commission pool and split for a franchisee-territory deal.
       require('./franchise.service').safeCalculate(id);
+      // AI credits for whoever introduced the buyer, broker or lister.
+      require('./ai/wallet.service').safeOnDealClosed(id);
       const trust = require('./trust.service');
       trust.safeRecompute(deal.broker_id, 'deal_closed');
       const parties = await pool.query(

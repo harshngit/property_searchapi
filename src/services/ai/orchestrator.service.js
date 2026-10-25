@@ -6,23 +6,25 @@ const notificationService = require('../notification.service');
 const providers = require('./providers');
 const { badRequest, forbidden, notFound } = require('../../utils/httpError');
 
-// AI orchestration engine + credit wallet.
+// The engine behind Serchi (src/services/ai/serchi.js - the one AI service
+// every feature calls) + the AI credit wallet.
 //
 //   run(activity, { user, system, parts | prompt, schema, entity })
 //     1. looks up the activity: its model (simple -> OpenAI gpt-6-luna,
-//        important -> Claude Opus 5.5), credit price and who pays;
-//     2. when the user pays, takes the credits from their wallet first - not
-//        enough credits stops here with a 402 and "buy credits";
+//        important -> Claude Opus 5.5) and its credit price;
+//     2. takes the credits from the asking user's wallet first - not enough
+//        credits, or over the user's daily / monthly cap, stops here with a
+//        402 before any model is called;
 //     3. calls the model, and on failure the other provider (fallback);
-//     4. records the run with tokens and actual USD cost;
+//     4. records the run with tokens and actual cost;
 //     5. refunds the credits if no provider could answer.
-// Staff never pay; background work (fraud filters, parsing, translation) is
-// paid by the platform. 1 credit = Rs 1. Every credit movement is in the
-// append-only ledger.
+// Every AI call is paid from a user's wallet - A R Buildwel never absorbs AI
+// cost, and its own staff spend credits too (admins can grant them). Platform
+// work (safety checks, parsing, scoring) runs on rules and self-hosted tools.
+// 1 credit = Rs 1. Every credit movement is in the append-only ledger, and
+// every AI output carries its activity's disclaimer.
 
-const STAFF = ['internal_sales', 'admin', 'super_admin'];
 const ADMIN = ['admin', 'super_admin'];
-const LOW_BALANCE = 25;
 
 class InsufficientCredits extends Error {
   constructor(needed, balance, label) {
@@ -72,6 +74,29 @@ async function ledger(client, { userId, kind, credits, balanceAfter, activityKey
   );
 }
 
+// Credits sit in lots (where they came from, when they expire). A spend takes
+// from the lots that expire first, so the balance always equals the sum of
+// what is left in the lots.
+async function consumeLots(client, userId, credits) {
+  let left = credits;
+  const lots = (await client.query(
+    `SELECT id, remaining FROM ai_credit_lots WHERE user_id = $1 AND remaining > 0 ORDER BY expires_at ASC NULLS LAST, created_at ASC FOR UPDATE`,
+    [userId]
+  )).rows;
+  for (const lot of lots) {
+    if (left <= 0) break;
+    const take = Math.min(lot.remaining, left);
+    await client.query('UPDATE ai_credit_lots SET remaining = remaining - $2 WHERE id = $1', [lot.id, take]);
+    left -= take;
+  }
+}
+
+// Validity per kind of credit, from the Terms & Conditions (admin-set; null = never expires).
+async function expiryFor(kind) {
+  const days = (await configService.getConfig('ai.credit_validity_days', {}))?.[kind];
+  return Number(days) > 0 ? new Date(Date.now() + Number(days) * 86400000) : null;
+}
+
 // Take credits - only if there are enough (never below zero).
 async function debit(userId, credits, { activityKey, runId, label }) {
   await ensureWallet(userId);
@@ -87,6 +112,7 @@ async function debit(userId, credits, { activityKey, runId, label }) {
       const balance = (await pool.query('SELECT balance FROM ai_wallets WHERE user_id = $1', [userId])).rows[0]?.balance || 0;
       throw new InsufficientCredits(credits, balance, label);
     }
+    await consumeLots(client, userId, credits);
     await ledger(client, { userId, kind: 'spend', credits: -credits, balanceAfter: w.balance, activityKey, runId, note: label });
     await client.query('COMMIT');
     return w.balance;
@@ -98,6 +124,8 @@ async function debit(userId, credits, { activityKey, runId, label }) {
   }
 }
 
+// Add (or, for a negative adjustment, take) credits. Added credits open a lot
+// with the validity of their kind.
 async function credit(userId, credits, kind, { activityKey = null, runId = null, purchaseId = null, note = null, actorId = null, lifetimePurchased = false } = {}, client = null) {
   const own = !client;
   const c = client || (await pool.connect());
@@ -109,6 +137,15 @@ async function credit(userId, credits, kind, { activityKey = null, runId = null,
          lifetime_spent = lifetime_spent - CASE WHEN $4 THEN $2 ELSE 0 END, updated_at = now() WHERE user_id = $1 RETURNING balance`,
       [userId, credits, lifetimePurchased, kind === 'refund']
     )).rows[0];
+    if (credits > 0) {
+      const lotKind = ['purchase', 'grant', 'referral', 'refund'].includes(kind) ? kind : 'grant';
+      await c.query(
+        `INSERT INTO ai_credit_lots (user_id, kind, credits, remaining, expires_at, purchase_id) VALUES ($1, $2, $3, $3, $4, $5)`,
+        [userId, lotKind, credits, lotKind === 'refund' ? null : await expiryFor(lotKind), purchaseId]
+      );
+    } else if (credits < 0) {
+      await consumeLots(c, userId, -credits);
+    }
     await ledger(c, { userId, kind, credits, balanceAfter: w.balance, activityKey, runId, purchaseId, note, actorId });
     if (own) await c.query('COMMIT');
     return w.balance;
@@ -132,8 +169,11 @@ async function run(key, o = {}) {
   if ((await configService.getConfig('ai.enabled', true)) === false) throw unavailable('AI features are switched off');
   const a = await activity(key);
   if (!a.is_active) throw unavailable(`${a.label} is switched off`);
+  // No anonymous / platform-paid AI: someone asks, and their wallet pays.
+  if (!o.user?.id) throw forbidden(`${a.label} runs only when a signed-in user asks for it and pays with AI credits`);
   const parts = o.parts || [{ type: 'text', text: String(o.prompt || '') }];
-  const pays = a.payer === 'user' && a.credits > 0 && o.user && !STAFF.includes(o.user.role);
+  const pays = a.credits > 0;
+  if (pays) await assertWithinCap(o.user.id, a);
   const runId = crypto.randomUUID();
   const started = Date.now();
   await pool.query(
@@ -180,20 +220,48 @@ async function run(key, o = {}) {
     `UPDATE ai_runs SET status = 'ok', error = NULL, provider = $2, model = $3, fallback_used = $4, input_tokens = $5, output_tokens = $6, cost_usd = $7, credits_charged = $8, latency_ms = $9 WHERE id = $1`,
     [runId, used.provider, result.model, used.fallback, result.inputTokens, result.outputTokens, cost, pays ? a.credits : 0, latency]
   );
-  if (pays && balance !== null && balance < LOW_BALANCE && balance + a.credits >= LOW_BALANCE) {
-    notificationService.createNotification({ userId: o.user.id, type: 'ai_credits', title: 'AI credits running low', message: `${balance} credits left. Buy a pack to keep using AI features.`, priority: 'normal' }).catch(() => {});
+  if (pays && balance !== null) {
+    await lowBalanceAlert(o.user.id, balance, a.credits);
+    // Whoever introduced this user earns a share of what they spend.
+    require('./wallet.service').onSpend(o.user.id, a.credits).catch((err) => console.error('[ai] referral usage reward:', err.message));
   }
-  return { text: result.text, json: result.json, runId, provider: used.provider, model: result.model, fallbackUsed: used.fallback, creditsCharged: pays ? a.credits : 0, balance };
+  return { text: result.text, json: result.json, runId, provider: used.provider, model: result.model, fallbackUsed: used.fallback, creditsCharged: pays ? a.credits : 0, balance, disclaimer: await disclaimerOf(a) };
 }
 
-// For background callers that must never fail the request: null on any error.
-async function tryRun(key, o) {
-  try {
-    return await run(key, o);
-  } catch (err) {
-    if (err.statusCode !== 503) console.error(`[ai] ${key}:`, err.message);
-    return null;
+const DEFAULT_DISCLAIMER = 'AI-generated output. Indicative only - not financial or legal advice. Check it before relying on it.';
+async function disclaimerOf(a) {
+  return a.disclaimer || (await configService.getConfig('ai.default_disclaimer', DEFAULT_DISCLAIMER)) || DEFAULT_DISCLAIMER;
+}
+
+// Alert once, when a spend takes the balance below the user's (or the default) threshold.
+async function lowBalanceAlert(userId, balance, spent) {
+  const w = (await pool.query('SELECT low_balance_alert FROM ai_wallets WHERE user_id = $1', [userId])).rows[0];
+  const threshold = w?.low_balance_alert ?? Number(await configService.getConfig('ai.low_balance_alert', 25));
+  if (balance < threshold && balance + spent >= threshold) {
+    notificationService.createNotification({ userId, type: 'ai_credits', title: 'AI credits running low', message: `${balance} credits left. Buy credits to keep using AI features.`, priority: 'normal' }).catch(() => {});
   }
+}
+
+// Optional per-user daily / monthly spend caps (credits), set by the user or an admin.
+async function assertWithinCap(userId, a) {
+  const w = (await pool.query('SELECT daily_cap, monthly_cap FROM ai_wallets WHERE user_id = $1', [userId])).rows[0];
+  if (!w || (w.daily_cap == null && w.monthly_cap == null)) return;
+  const spent = (await pool.query(
+    `SELECT COALESCE(-SUM(credits) FILTER (WHERE created_at >= date_trunc('day', now() AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata'), 0)::int AS today,
+            COALESCE(-SUM(credits) FILTER (WHERE created_at >= date_trunc('month', now() AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata'), 0)::int AS month
+     FROM ai_credit_ledger WHERE user_id = $1 AND kind IN ('spend', 'refund') AND created_at >= now() - interval '32 days'`,
+    [userId]
+  )).rows[0];
+  const over = (cap, used, period) => {
+    if (cap != null && used + a.credits > cap) {
+      const err = new Error(`${a.label} needs ${a.credits} credits, which would go over your ${period} AI spend limit of ${cap} credits (${used} used). Change the limit in AI credits to continue.`);
+      err.statusCode = 402;
+      err.errors = [{ field: 'credits', code: `${period}_cap_reached`, cap, used, needed: a.credits }];
+      throw err;
+    }
+  };
+  over(w.daily_cap, spent.today, 'daily');
+  over(w.monthly_cap, spent.month, 'monthly');
 }
 
 // Is this activity usable right now (switched on, a provider configured)?
@@ -219,13 +287,12 @@ async function wallet(user) {
     pool.query('SELECT * FROM ai_wallets WHERE user_id = $1', [user.id]),
     pool.query(`SELECT l.*, a.label FROM ai_credit_ledger l LEFT JOIN ai_activities a ON a.activity_key = l.activity_key WHERE l.user_id = $1 ORDER BY l.created_at DESC LIMIT 50`, [user.id]),
     pool.query('SELECT * FROM ai_credit_packs WHERE is_active ORDER BY sort_order, price_inr'),
-    pool.query(`SELECT activity_key, label, description, credits, tier FROM ai_activities WHERE is_active AND payer = 'user' AND credits > 0 ORDER BY credits`),
+    pool.query(`SELECT activity_key, label, description, credits, tier FROM ai_activities WHERE is_active AND credits > 0 ORDER BY credits`),
   ]);
   return {
     balance: w.rows[0].balance,
     lifetimePurchased: w.rows[0].lifetime_purchased,
     lifetimeSpent: w.rows[0].lifetime_spent,
-    staffFree: STAFF.includes(user.role),
     paymentOnline: !!razorpay(),
     gstPercent: gst,
     packs: packs.rows.map((p) => packView(p, gst)),
@@ -287,7 +354,20 @@ async function markPaid(p, { paymentId = null, actor = null }) {
   try {
     await client.query('BEGIN');
     const done = (await client.query(`UPDATE ai_credit_purchases SET status = 'paid', paid_at = now(), gateway_payment_id = $2 WHERE id = $1 AND status <> 'paid' RETURNING id`, [p.id, paymentId])).rows[0];
-    if (done) await credit(p.user_id, p.credits, 'purchase', { purchaseId: p.id, note: `${p.pack_name} pack (${p.receipt_number})`, actorId: actor?.id || null, lifetimePurchased: true }, client);
+    if (done) {
+      await credit(p.user_id, p.credits, 'purchase', { purchaseId: p.id, note: `${p.pack_name} pack (${p.receipt_number})`, actorId: actor?.id || null, lifetimePurchased: true }, client);
+      // A GST tax invoice for every paid purchase (PDF on request).
+      const seq = (await client.query(`SELECT nextval('ai_credit_invoice_seq') AS n`)).rows[0].n;
+      const buyer = (await client.query(
+        `SELECT u.full_name, (SELECT v.reference FROM user_verifications v WHERE v.user_id = u.id AND v.kind = 'gst' AND v.status = 'verified' ORDER BY v.decided_at DESC NULLS LAST LIMIT 1) AS gstin
+         FROM users u WHERE u.id = $1`,
+        [p.user_id]
+      )).rows[0] || {};
+      await client.query(
+        `UPDATE ai_credit_purchases SET invoice_number = $2, invoiced_at = now(), gstin = $3, buyer_name = $4, buyer_gstin = $5 WHERE id = $1`,
+        [p.id, `AIC-INV-${new Date().getFullYear()}-${String(seq).padStart(6, '0')}`, await configService.getConfig('invoice.gstin', '07DERPR1574G2ZY'), buyer.full_name || null, buyer.gstin || null]
+      );
+    }
     await client.query('COMMIT');
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
@@ -311,7 +391,7 @@ const activityView = (a) => ({
 async function adminOverview(user) {
   assertAdmin(user);
   const gst = Number(await configService.getConfig('ai.credit_gst_percent', 18));
-  const [acts, packs, usage, revenue, prices] = await Promise.all([
+  const [acts, packs, usage, revenue, prices, rate, recent, purchases] = await Promise.all([
     pool.query('SELECT * FROM ai_activities ORDER BY tier DESC, label'),
     pool.query('SELECT * FROM ai_credit_packs ORDER BY sort_order, price_inr'),
     pool.query(
@@ -322,14 +402,33 @@ async function adminOverview(user) {
     ),
     pool.query(`SELECT COUNT(*)::int AS purchases, COALESCE(SUM(amount_inr), 0)::float AS revenue_inr, COALESCE(SUM(credits), 0)::int AS credits_sold FROM ai_credit_purchases WHERE status = 'paid' AND paid_at > now() - interval '30 days'`),
     configService.getConfig('ai.model_prices', {}),
+    configService.getConfig('ai.usd_inr_rate', 85),
+    pool.query(
+      `SELECT r.id, r.activity_key, a.label, r.model, r.status, r.input_tokens, r.output_tokens, r.cost_usd::float AS cost_usd, r.credits_charged, r.created_at, u.full_name AS user_name
+       FROM ai_runs r LEFT JOIN ai_activities a ON a.activity_key = r.activity_key LEFT JOIN users u ON u.id = r.user_id
+       ORDER BY r.created_at DESC LIMIT 100`
+    ),
+    pool.query(
+      `SELECT p.id, p.receipt_number, p.invoice_number, p.pack_name, p.credits, p.total_inr::float AS total_inr, p.gateway, p.reference, p.status, p.paid_at,
+              p.refunded_credits, p.refund_inr::float AS refund_inr, u.full_name AS user_name,
+              (SELECT l.remaining FROM ai_credit_lots l WHERE l.purchase_id = p.id AND l.kind = 'purchase' LIMIT 1) AS unused
+       FROM ai_credit_purchases p JOIN users u ON u.id = p.user_id WHERE p.status IN ('paid', 'refunded') ORDER BY p.paid_at DESC NULLS LAST LIMIT 50`
+    ),
   ]);
+  // Actual API cost in rupees against the credits charged (1 credit = Rs 1), so prices stay above cost.
+  const usdInr = Number(rate) || 85;
+  const inr = (usd) => Math.round(Number(usd || 0) * usdInr * 100) / 100;
+  const margin = (credits, usd) => ({ costInr: inr(usd), marginInr: Math.round((Number(credits || 0) - inr(usd)) * 100) / 100, belowCost: Number(credits || 0) < inr(usd) });
   return {
     providers: { openai: providers.configured('openai'), claude: providers.configured('claude') },
     activities: acts.rows.map(activityView),
     packs: packs.rows.map((p) => ({ ...packView(p, gst), active: p.is_active, sortOrder: p.sort_order })),
-    usage30d: usage.rows,
+    usage30d: usage.rows.map((u) => ({ ...u, ...margin(u.credits, u.cost_usd), costPerRunInr: u.runs ? inr(u.cost_usd / u.runs) : 0 })),
+    recentRuns: recent.rows.map((r) => ({ id: r.id, activityKey: r.activity_key, label: r.label, model: r.model, status: r.status, userName: r.user_name, inputTokens: r.input_tokens, outputTokens: r.output_tokens, creditsCharged: r.credits_charged, ...margin(r.credits_charged, r.cost_usd), at: r.created_at })),
+    purchases: purchases.rows.map((p) => ({ id: p.id, receiptNumber: p.receipt_number, invoiceNumber: p.invoice_number, packName: p.pack_name, credits: p.credits, totalInr: p.total_inr, gateway: p.gateway, reference: p.reference, status: p.status, paidAt: p.paid_at, userName: p.user_name, unusedCredits: p.unused ?? null, refundedCredits: p.refunded_credits, refundInr: p.refund_inr })),
     revenue30d: revenue.rows[0],
     modelPrices: prices,
+    usdInrRate: usdInr,
     gstPercent: gst,
   };
 }
@@ -341,7 +440,7 @@ async function updateActivity(user, key, data = {}, meta = {}) {
   const pick = (k, col) => (data[k] === undefined ? a[col] : data[k]);
   const next = {
     provider: pick('provider', 'provider'), model: pick('model', 'model'), fallback_provider: pick('fallbackProvider', 'fallback_provider') || null, fallback_model: pick('fallbackModel', 'fallback_model') || null,
-    effort: pick('effort', 'effort'), max_output_tokens: Number(pick('maxOutputTokens', 'max_output_tokens')), credits: Number(pick('credits', 'credits')), payer: pick('payer', 'payer'), is_active: pick('active', 'is_active'),
+    effort: pick('effort', 'effort'), max_output_tokens: Number(pick('maxOutputTokens', 'max_output_tokens')), credits: Number(pick('credits', 'credits')), payer: 'user', is_active: pick('active', 'is_active'),
   };
   if (!['openai', 'claude'].includes(next.provider)) throw badRequest('provider must be openai or claude');
   if (!prices[next.model]) throw badRequest(`Add a price for ${next.model} in the model price list first (ai.model_prices)`);
@@ -398,4 +497,8 @@ async function adminCredit(user, { userId, credits, packId, reference, note } = 
   return wallet({ id: userId, role: 'customer' });
 }
 
-module.exports = { run, tryRun, available, activity, activities, invalidate, InsufficientCredits, wallet, startPurchase, verifyPurchase, adminOverview, updateActivity, savePack, adminCredit };
+module.exports = {
+  run, available, activity, activities, invalidate, InsufficientCredits, wallet, startPurchase, verifyPurchase, adminOverview, updateActivity, savePack, adminCredit,
+  // for wallet.service (top-ups, referrals, expiry, refunds)
+  credit, ensureWallet, newPurchase, markPaid, packView, ledger, consumeLots,
+};

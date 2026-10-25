@@ -167,6 +167,16 @@ router.get('/inbox/:id', authorize(...ORG_ADMIN), [param('id').isUUID()], valida
  *     parameters: [{ in: path, name: id, required: true, schema: { type: string, format: uuid } }]
  *     responses: { 200: { description: Rejected } }
  */
+/**
+ * @swagger
+ * /lead-sources/inbox/{id}/ai-read:
+ *   post:
+ *     summary: Ask Serchi to read an inbound lead the regexes could not (feature #3) - suggested fields to check before resolving; paid from the asking admin's AI credits
+ *     tags: [Lead Ingestion]
+ *     security: [{ bearerAuth: [] }]
+ *     responses: { 200: { description: Suggested fields }, 402: { description: Not enough AI credits } }
+ */
+router.post('/inbox/:id/ai-read', authorize(...ORG_ADMIN), [param('id').isUUID()], validate, asyncHandler(async (req, res) => success(res, 200, 'Read by AI', await ingestion.aiReadInbox(req.user, req.params.id, meta(req)))));
 router.post('/inbox/:id/resolve', authorize(...ORG_ADMIN), [param('id').isUUID()], validate, asyncHandler(async (req, res) => success(res, 200, 'Lead created', await ingestion.resolveInbox(req.user, req.params.id, req.body || {}))));
 router.post('/inbox/:id/reject', authorize(...ORG_ADMIN), [param('id').isUUID()], validate, asyncHandler(async (req, res) => success(res, 200, 'Rejected', await ingestion.rejectInbox(req.user, req.params.id, req.body?.reason))));
 

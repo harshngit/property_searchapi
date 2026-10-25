@@ -80,6 +80,12 @@ const idp = [param('id').isUUID()];
  *     tags: [Work From Home]
  *     security: [{ bearerAuth: [] }]
  *     responses: { 200: { description: Decided } }
+ * /wfh/manage/submissions/{id}/ai-second-opinion:
+ *   post:
+ *     summary: AI second opinion on a submission's fraud signals and photos (Serchi, feature #10) - paid from the asking user's AI credits; can raise the risk, never clear it
+ *     tags: [Work From Home]
+ *     security: [{ bearerAuth: [] }]
+ *     responses: { 200: { description: Verdict }, 402: { description: Not enough AI credits } }
  * /wfh/manage/submissions/{id}/review:
  *   post:
  *     summary: Staff quality review of a photo / report task - approve or reject with a reason
@@ -245,6 +251,8 @@ router.post('/manage/tasks', authorize(...STAFF), [body('taskType').isIn(Object.
 router.post('/manage/tasks/:id/cancel', authorize(...STAFF), idp, validate, h(async (req, res) => ok(res, 'Task cancelled', await wfh.cancelTask(req.user, req.params.id, meta(req)))));
 router.get('/manage/submissions', authorize(...STAFF), h(async (req, res) => ok(res, 'Submissions', await wfh.listSubmissions(req.user, { queue: req.query.queue }))));
 router.post('/manage/submissions/:id/rep', authorize(...STAFF), [...idp, body('happened').isBoolean()], validate, h(async (req, res) => ok(res, 'Visit decided', await wfh.repDecide(req.user, req.params.id, { happened: req.body.happened === true || req.body.happened === 'true', reason: req.body.reason }))));
+// Feature #10: an AI second opinion on one submission - paid from the asking user's AI credits.
+router.post('/manage/submissions/:id/ai-second-opinion', authorize(...STAFF), idp, validate, h(async (req, res) => ok(res, 'AI second opinion', await fraud.secondOpinion(req.user, req.params.id, meta(req)))));
 router.post('/manage/submissions/:id/review', authorize(...STAFF), [...idp, body('decision').isIn(['approve', 'reject'])], validate, h(async (req, res) => ok(res, 'Task reviewed', await wfh.review(req.user, req.params.id, req.body))));
 router.get('/manage/workers', authorize(...STAFF), h(async (req, res) => ok(res, 'Field partners', await wfh.listWorkers(req.query))));
 router.post('/manage/workers/:id/kyc', authorize(...ADMIN), [...idp, body('decision').isIn(['verify', 'reject'])], validate, h(async (req, res) => ok(res, 'KYC decided', await wfh.decideKyc(req.user, req.params.id, req.body, meta(req)))));

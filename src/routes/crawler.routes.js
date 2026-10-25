@@ -75,7 +75,6 @@ router.put(
     body('maxPages').optional().isInt({ min: 1, max: 50 }),
     body('defaultListingCategory').optional().isIn(['auction', 'special_situation']),
     body('requiresLegalReview').optional().isBoolean(),
-    body('useAiParser').optional().isBoolean(),
     body('isEnabled').optional().isBoolean(),
   ],
   validate,

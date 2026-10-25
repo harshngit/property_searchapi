@@ -184,6 +184,7 @@ app.use('/api/site-config', require('./routes/siteConfig.routes'));
 app.use('/api/partner-desk', require('./routes/partnerDesk.routes'));
 app.use('/api/related-party', require('./routes/relatedParty.routes'));
 app.use('/api/ai-credits', require('./routes/aiCredits.routes'));
+app.use('/api/chat-intake', require('./routes/chatIntake.routes'));
 app.use('/api/mandates', mandateRoutes);
 app.use('/api/representatives', representativeRoutes);
 app.use('/api/lead-sources', leadSourceRoutes);

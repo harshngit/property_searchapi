@@ -72,6 +72,16 @@ router.get('/properties/:id', [param('id').isUUID()], validate, asyncHandler(asy
  *               documentUrl: { type: string, description: Existing stored path / link instead of a file }
  *     responses: { 201: { description: Document id, type and analysis } }
  */
+/**
+ * @swagger
+ * /due-diligence/documents/{id}/ai-analysis:
+ *   post:
+ *     summary: Analyse with AI (Serchi, feature #9, Claude) - classification, summary, transfer details and risk flags for one stored document; paid from the asking user's AI credits
+ *     tags: [Due Diligence]
+ *     security: [{ bearerAuth: [] }]
+ *     responses: { 200: { description: Analysis with disclaimer }, 402: { description: Not enough AI credits } }
+ */
+router.post('/documents/:id/ai-analysis', [param('id').isUUID()], validate, asyncHandler(async (req, res) => success(res, 200, 'Document analysed', await dd.aiAnalyseDocument(req.user, req.params.id, auditService.requestMeta(req)))));
 router.get('/properties/:id/documents', [param('id').isUUID()], validate, asyncHandler(async (req, res) => success(res, 200, 'Documents', await dd.listPropertyDocuments(req.user, req.params.id))));
 router.post(
   '/properties/:id/documents',

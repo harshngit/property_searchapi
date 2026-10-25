@@ -61,7 +61,7 @@ async function settings() {
   const [configured, learned, learningEnabled, thresholds, radius, similarity, mandateBoost, priceBoost, patternBoosts, ab] = await Promise.all([
     configService.getConfig('matching.weights', DEFAULT_WEIGHTS),
     configService.getConfig('matching.learned_weights', null),
-    configService.getConfig('matching.learning_enabled', true),
+    configService.getConfig('matching.learning_enabled', false),
     configService.getConfig('matching.thresholds', DEFAULT_THRESHOLDS),
     configService.getConfig('city_match_radius_km', 50),
     configService.getConfig('matching.type_similarity', {}),
@@ -81,7 +81,8 @@ async function settings() {
     similarity: similarity || {},
     mandateBoost: Number(mandateBoost) || 0,
     priceBoost: Number(priceBoost) || 0,
-    patternBoosts: patternBoosts || {},
+    // Learned conversion-pattern boosts apply only once learning is on (Phase 2).
+    patternBoosts: learningEnabled ? patternBoosts || {} : {},
     ab: ab || { enabled: false },
     geo: await geo(),
   };
@@ -1062,7 +1063,7 @@ async function runNightly() {
     }
   }
   let learning = { learned: false, reason: 'disabled' };
-  if (await configService.getConfig('matching.learning_enabled', true)) learning = await learnWeights();
+  if (await configService.getConfig('matching.learning_enabled', false)) learning = await learnWeights();
   const summary = { at: new Date().toISOString(), requirements: reqs.rows.length, matched, hot, expiry, learning: { learned: learning.learned, reason: learning.reason || null } };
   await setSystemConfig('matching.last_nightly_run', summary);
   return summary;

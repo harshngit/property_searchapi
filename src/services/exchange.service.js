@@ -11,8 +11,9 @@ const { badRequest, forbidden, notFound } = require('../utils/httpError');
 //   1  The owner raises a request on a listing of theirs: what they have,
 //      what they want instead, and what they intend to do (the
 //      reinvestment questionnaire).
-//   2  The old property gets an indicative valuation from platform data
-//      (staff may replace it with their own). Always with the disclaimer.
+//   2  The old property gets an indicative estimate from platform data
+//      (staff may replace it with their own). Always with the disclaimer, and
+//      always called an "indicative estimate" - never a valuation (#14).
 //   3  Options are worked out: a direct swap with another owner whose
 //      property fits and who wants this one (Model A), a trade-in against
 //      builder stock (Model B), and the other paths - upgrade, reinvest in
@@ -47,7 +48,7 @@ const enabled = async () => (await configService.getConfig('exchange.enabled', t
 async function settings() {
   const [tolerance, holdDays, downsize, valuation, guidance] = await Promise.all([
     configService.getConfig('exchange.value_tolerance_percent', 25), configService.getConfig('exchange.hold_and_rent_after_days', 90), configService.getConfig('exchange.downsize_max_percent', 70),
-    configService.getConfig('exchange.valuation_disclaimer', 'Indicative valuation. Verify independently before transacting.'),
+    configService.getConfig('exchange.valuation_disclaimer', 'Indicative estimate based on available platform data. It is not a valuation. Verify independently before transacting.'),
     configService.getConfig('exchange.guidance_disclaimer', 'This is indicative guidance based on available platform data. It is not financial advice. Consult a qualified financial advisor and legal counsel before transacting.'),
   ]);
   return { tolerance: Number(tolerance) || 25, holdDays: Number(holdDays) || 90, downsize: Number(downsize) || 70, valuationDisclaimer: valuation, guidanceDisclaimer: guidance };

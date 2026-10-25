@@ -600,7 +600,7 @@ async function aiReview(user, id, { focus } = {}) {
   const v = (await pool.query('SELECT * FROM document_template_versions WHERE template_id = $1 AND version = $2', [g.template_id, g.template_version])).rows[0];
   const vars = (await pool.query('SELECT * FROM template_variables WHERE template_id = $1', [g.template_id])).rows;
   const text = merge(v, vars, g.values, g.state_code, g.is_blank).map((b) => (b.kind === 'title' ? `# ${b.text}` : b.kind === 'heading' ? `## ${b.text}` : b.text)).join('\n\n');
-  const out = await require('./ai/orchestrator.service').run('agreement_review', {
+  const out = await require('./ai/serchi').run('agreement_review', {
     user,
     entityType: 'generated_document',
     entityId: g.id,

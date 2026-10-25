@@ -975,7 +975,13 @@ async function dueDiligence(propertyId, { internal = false } = {}) {
   return {
     status, sector, checklist, missingCount: missing.length,
     review: reviewItems.map(([key, label]) => ({ key, label, status: review[key]?.status || 'pending', note: internal ? review[key]?.note || null : undefined, at: review[key]?.at || null })),
-    riskFlags: flags, disclaimer: await disclaimer(),
+    riskFlags: flags,
+    // #15: the approvals / risk flags are indicative - shown with every list of flags.
+    flagsNotice: await configService.getConfig(
+      'institutional.flags_notice',
+      'These flags are indicative, from the details declared on the listing. A chartered accountant (CA) and legal counsel must verify the approvals, compliance and finances before any transaction.'
+    ),
+    disclaimer: await disclaimer(),
   };
 }
 

@@ -11,7 +11,10 @@ const { notFound } = require('../utils/httpError');
 //              document requests) - cities, categories and ticket band;
 //   quality  - the deal's own investment score.
 // It is used both ways: best deals for an investor (HNI curated feed) and
-// best investors for a deal (CRM).
+// best investors for a deal (CRM). Rule-based - no AI cost (feature #12).
+// DPDP: behaviour is used only for people who switched on "personalised
+// matching" (an optional consent, withdrawable any time); for everyone else
+// the behaviour signal stays neutral and only stated preferences count.
 
 const DEFAULT_WEIGHTS = { stated: 50, behaviour: 30, quality: 20 };
 const POSITIVE = ['viewed', 'shortlisted', 'shared', 'document_requested', 'interest_expressed'];
@@ -24,8 +27,20 @@ async function weights() {
   return { ...DEFAULT_WEIGHTS, ...(w || {}) };
 }
 
-// What an investor actually engages with over the last 180 days.
+const EMPTY_BEHAVIOUR = { positive: 0, dismissed: 0, cities: {}, categories: {}, ticketP25: null, ticketP75: null, ticketMedian: null, consent: false };
+
+// Has the person consented to behaviour-based matching (latest choice wins)?
+async function behaviourConsent(userId) {
+  const r = await pool.query(
+    `SELECT granted FROM consent_logs WHERE user_id = $1 AND category = 'personalised_matching' ORDER BY created_at DESC, id DESC LIMIT 1`,
+    [userId]
+  );
+  return r.rows[0]?.granted === true;
+}
+
+// What an investor actually engages with over the last 180 days (with consent).
 async function behaviourSummary(userId) {
+  if (!userId || !(await behaviourConsent(userId))) return { ...EMPTY_BEHAVIOUR };
   const result = await pool.query(
     `SELECT action, LOWER(city) AS city, listing_category, ticket_size
      FROM investor_deal_interactions WHERE user_id = $1 AND created_at > now() - interval '180 days'`,
@@ -46,7 +61,7 @@ async function behaviourSummary(userId) {
   }
   tickets.sort((a, b) => a - b);
   const q = (p) => (tickets.length ? tickets[Math.min(tickets.length - 1, Math.floor(p * tickets.length))] : null);
-  return { positive, dismissed, cities, categories, ticketP25: q(0.25), ticketP75: q(0.75), ticketMedian: q(0.5) };
+  return { positive, dismissed, cities, categories, ticketP25: q(0.25), ticketP75: q(0.75), ticketMedian: q(0.5), consent: true };
 }
 
 // 0-100 fit of one deal for one investor, with the reasons.
@@ -259,4 +274,4 @@ async function getSegments() {
   return { ...seg, tiers };
 }
 
-module.exports = { weights, scoreMatch, behaviourSummary, matchDealsForProfile, matchInvestorsForDeal, getIrmProfile, getSegments, tierOf };
+module.exports = { weights, scoreMatch, behaviourSummary, behaviourConsent, matchDealsForProfile, matchInvestorsForDeal, getIrmProfile, getSegments, tierOf };

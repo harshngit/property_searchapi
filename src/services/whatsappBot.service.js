@@ -9,7 +9,7 @@ const QUESTIONS = [
   {
     key: 'requirement',
     type: 'buttons',
-    body: "Hi! Welcome to PropertySerch 👋\nWhat are you looking for?",
+    body: "Hi! Welcome to PropertySerch 👋\nWhat are you looking for?\n\nYou can also type your requirement, or your property details with photos, in one message.",
     options: [
       { id: 'buy', title: 'Buy Property' },
       { id: 'rent', title: 'Rent Property' },
@@ -113,14 +113,47 @@ async function getOrCreateSession({ phoneNumber, waUserId }) {
   return { session, isFresh: false };
 }
 
+const intake = () => require('./messaging/chatIntake.service');
+
+// Free text and photos go to the shared chat intake (intent detection,
+// requirement leads, property posting) when the customer is not mid-way
+// through the question flow - or sends a photo, or types a long message where
+// the flow expected a button. Null when the question flow should answer.
+async function tryIntake({ phoneNumber, waUserId, text, mediaId, messageId, profileName }) {
+  if (!text && !mediaId) return null;
+  const existing = (await pool.query('SELECT current_step, status FROM whatsapp_bot_sessions WHERE wa_user_id = $1', [waUserId])).rows[0];
+  const active = existing?.status === 'in_progress';
+  const step = active ? QUESTIONS.find((q) => q.key === existing.current_step) : null;
+  const free = !active || mediaId || (step && step.type !== 'text' && String(text || '').trim().length >= 25);
+  if (!free) return null;
+  const photos = [];
+  if (mediaId) {
+    const photo = await metaWhatsappService.downloadMedia(mediaId).catch((err) => {
+      console.error('[whatsapp] photo download failed:', err.message);
+      return null;
+    });
+    if (photo) photos.push(photo);
+    else if (!text) return { handled: true, ignored: 'photo' };
+  }
+  const contact = { channel: 'whatsapp', phone: phoneNumber ? whatsappService.toLocalMobile(phoneNumber) : null, waUserId, name: profileName || null, messageId };
+  const r = await intake().handleMessage(contact, { text: text || '', photos });
+  if (!r.handled) return null;
+  if (existing) await pool.query(`UPDATE whatsapp_bot_sessions SET status = 'completed' WHERE wa_user_id = $1`, [waUserId]);
+  return r;
+}
+
 // Called once per inbound WhatsApp message (from the webhook controller,
 // after whatsapp.service.js has logged/parsed it). Advances that contact's
 // question flow by exactly one step, or - once every question is answered -
 // hands the collected answers to whatsapp.service.js's captureLead() and
 // sends a closing message. `waUserId` (the BSUID) is required - Meta always
 // provides it; `phoneNumber` may be null when the customer's number is hidden.
-async function handleInboundMessage({ phoneNumber, waUserId, text, buttonReplyId, buttonReplyTitle }) {
+async function handleInboundMessage({ phoneNumber, waUserId, text, buttonReplyId, buttonReplyTitle, mediaId = null, messageId = null, profileName = null }) {
   if (!waUserId) throw new Error('waUserId is required to run the WhatsApp bot flow');
+  if (!buttonReplyId) {
+    const taken = await tryIntake({ phoneNumber, waUserId, text, mediaId, messageId, profileName });
+    if (taken) return { phoneNumber, waUserId, intake: taken };
+  }
   const contact = { phoneNumber, waUserId };
   const { session, isFresh } = await getOrCreateSession(contact);
 

@@ -235,7 +235,11 @@ async function registerUser({ fullName, email, mobile, password, role, tenantId,
   // recorded as organic (OG-00001). Staff-created accounts aren't referrals.
   // Non-customer roles get their permanent code now; a customer gets theirs
   // once they pick buyer / seller / owner / tenant in onboarding.
-  if (!actingUser) await referralService.recordReferral(newUser.id, referralCode);
+  if (!actingUser) {
+    await referralService.recordReferral(newUser.id, referralCode);
+    // AI credits for whoever introduced them.
+    await require('./ai/wallet.service').safeOnJoined(newUser.id);
+  }
   const issuedCode = await referralService.ensureReferralCode(newUser.id, role);
 
   return { ...newUser, role, referral_code: issuedCode };

@@ -150,23 +150,11 @@ async function tesseract(images, langs) {
   }
 }
 
-// The "scan_transcribe" activity: the cheaper model, paid by the platform.
-async function aiTranscribe(buffer, mimetype) {
-  const data = buffer.toString('base64');
-  const out = await require('./ai/orchestrator.service').tryRun('scan_transcribe', {
-    entityType: 'scanned_document',
-    parts: [
-      mimetype === 'application/pdf' ? { type: 'pdf', data } : { type: 'image', mediaType: mimetype, data },
-      { type: 'text', text: 'Transcribe all text in this scanned document exactly as written, in reading order. Output only the transcribed text - no commentary. Keep numbers, dates and amounts exact.' },
-    ],
-  });
-  return out?.text?.trim() || null;
-}
-
 // ------------------------------------------------------------ public API
 
-// OCR a scanned PDF or an image. opts.allowAi=false keeps it local.
-async function recognise(buffer, mimetype, { allowAi = true } = {}) {
+// OCR a scanned PDF or an image - self-hosted Tesseract only (no paid AI:
+// it runs on crawler notices and uploads, feature #11).
+async function recognise(buffer, mimetype) {
   const none = { text: '', method: 'none', confidence: 0, pages: 0 };
   if (!buffer?.length) return none;
   const s = await settings();
@@ -187,11 +175,6 @@ async function recognise(buffer, mimetype, { allowAi = true } = {}) {
     console.error('[ocr] tesseract failed:', err.message);
   }
 
-  const weak = !local.text || local.confidence < s.minConfidence || (undecodable > 0 && !pages);
-  if (weak && allowAi && buffer.length < 20 * 1024 * 1024) {
-    const ai = await aiTranscribe(buffer, type);
-    if (ai) return { text: ai, method: 'ai_vision', confidence: null, pages: pages || undecodable };
-  }
   if (!local.text) return { ...none, pages, undecodable };
   return { text: local.text, method: 'tesseract', confidence: local.confidence, pages, undecodable };
 }

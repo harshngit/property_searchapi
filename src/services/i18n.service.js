@@ -208,8 +208,8 @@ async function aiDraft(admin, { language: code, app, limit = 80 }, meta = {}) {
   assertApp(app);
   const l = await language(code);
   if (l.is_source) throw badRequest('Choose a language other than English');
-  const orchestrator = require('./ai/orchestrator.service');
-  if (!(await orchestrator.available('translation'))) throw badRequest('The AI helper is not configured - download the file and translate it instead');
+  const serchi = require('./ai/serchi');
+  if (!(await serchi.available('translation'))) throw badRequest('The AI helper is not configured - download the file and translate it instead');
   const n = Math.min(Math.max(Number(limit) || 80, 1), 150);
   const missing = (
     await pool.query(
@@ -219,9 +219,9 @@ async function aiDraft(admin, { language: code, app, limit = 80 }, meta = {}) {
     )
   ).rows.map((r) => r.source_text);
   if (!missing.length) return { drafted: 0, remaining: 0 };
-  // The "translation" activity: the cheaper model, paid by the platform.
-  const run = await orchestrator.run('translation', {
-    user: null,
+  // The "translation" activity: the cheaper model, paid from the admin's AI credits.
+  const run = await serchi.run('translation', {
+    user: admin,
     entityType: 'i18n',
     prompt:
       `Translate these interface strings of an Indian real-estate platform from English into ${l.name} (${l.native_name}). ` +

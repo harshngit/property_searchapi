@@ -7,8 +7,10 @@ const { badRequest, forbidden, notFound } = require('../utils/httpError');
 
 // Engine 5 - Due Diligence Engine (Module 21) on top of the Document
 // Repository (Module 20).
-//   - Every document is classified (rule-based keywords always; an AI layer
-//     when ANTHROPIC_API_KEY is set) and scanned for risk: mortgages /
+//   - Every document is classified with rule-based keywords on upload and
+//     scanned for risk (no AI cost). The owner, broker or staff may then ask
+//     Serchi for an AI analysis (feature #9, Claude, paid from their credits):
+//     mortgages /
 //     charges, litigation, compliance notices, possession issues,
 //     unsigned / expired / inconsistent papers.
 //   - Each listing gets a checklist for its transaction (resale, under
@@ -20,7 +22,8 @@ const { badRequest, forbidden, notFound } = require('../utils/httpError');
 //   - Role visibility: owner / broker / buyer / admin each see only the
 //     documents shared with their role.
 
-const orchestrator = require('./ai/orchestrator.service');
+const serchi = require('./ai/serchi');
+const { downloadBuffer } = require('../utils/storage');
 const STAFF = ['internal_sales', 'admin', 'super_admin'];
 const TRANSFER_TYPES = ['sale_deed', 'title_document'];
 
@@ -109,10 +112,10 @@ async function extractText(buffer, mimetype) {
       // fall through to OCR
     }
     // Scanned title documents: local OCR (the AI classifier reads the file itself).
-    return (await require('./ocr.service').recognise(buffer, 'application/pdf', { allowAi: false })).text;
+    return (await require('./ocr.service').recognise(buffer, 'application/pdf')).text;
   }
   if (/^text\//.test(mimetype || '')) return buffer.toString('utf8');
-  if (/^image\//.test(mimetype || '')) return (await require('./ocr.service').recognise(buffer, mimetype, { allowAi: false })).text;
+  if (/^image\//.test(mimetype || '')) return (await require('./ocr.service').recognise(buffer, mimetype)).text;
   return '';
 }
 
@@ -143,9 +146,8 @@ async function ruleFlags(text) {
 }
 
 // The "document_analysis" activity: an important task, so Claude Opus 5.5
-// (OpenAI as fallback). It runs on every upload, so the platform pays.
-async function aiAnalyse(buffer, mimetype, text) {
-  if (!(await configService.getConfig('dd.ai_enabled', true))) return null;
+// (OpenAI as fallback), run only when a user asks and paid from their credits.
+async function aiAnalyse(user, documentId, buffer, mimetype, text) {
   const schema = {
     type: 'object',
     properties: {
@@ -181,7 +183,7 @@ async function aiAnalyse(buffer, mimetype, text) {
     content.push({ type: 'image', mediaType: mimetype, data: buffer.toString('base64') });
   } else if (text) {
     content.push({ type: 'text', text: text.slice(0, 20000) });
-  } else return null;
+  } else throw badRequest('This file cannot be read - upload a PDF or a clear image');
   content.push({
     type: 'text',
     text:
@@ -190,17 +192,16 @@ async function aiAnalyse(buffer, mimetype, text) {
       'compliance notices, possession issues, missing signatures or stamps, expired validity, or internal inconsistencies (dates, areas, names). ' +
       'This is facilitation support for A R Buildwel staff, not legal advice.',
   });
-  const out = await orchestrator.tryRun('document_analysis', { entityType: 'property_document', schema, parts: content });
-  return out?.json || null;
+  return serchi.run('document_analysis', { user, entityType: 'property_document', entityId: documentId, schema, parts: content });
 }
 
-// Classify + risk-scan one document buffer (no storage).
-async function analyse(buffer, mimetype, fileName) {
-  const text = await extractText(buffer, mimetype);
+// Classify + risk-scan one document buffer (no storage). Rules only unless
+// `ai` (the parsed AI analysis) is passed in.
+async function analyse(buffer, mimetype, fileName, { text: known = null, ai = null } = {}) {
+  const text = known ?? (await extractText(buffer, mimetype));
   const rule = ruleClassify(text, fileName);
   const flags = await ruleFlags(text);
   const dates = extractDates(text);
-  const ai = await aiAnalyse(buffer, mimetype, text);
   const type = ai?.document_type && ai.document_type !== 'other' ? ai.document_type : rule.type;
   const allFlags = [...flags, ...((ai?.risk_flags || []).map((f) => ({ ...f, source: 'ai' })))];
   return {
@@ -219,6 +220,33 @@ async function analyse(buffer, mimetype, fileName) {
     },
     flags: allFlags,
   };
+}
+
+const MIME_BY_EXT = { pdf: 'application/pdf', jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', gif: 'image/gif' };
+
+// Feature #9: "Analyse with AI" on one stored document - the owner, broker or
+// staff who can see it asks, and it is paid from their AI credits.
+async function aiAnalyseDocument(user, documentId, meta = {}) {
+  const d = (await pool.query('SELECT * FROM documents WHERE id = $1', [documentId])).rows[0];
+  if (!d) throw notFound('Document not found');
+  if (d.property_id) {
+    const { roles, staff } = await rolesFor(user, d.property_id);
+    const visible = staff || (Array.isArray(d.visible_to) && d.visible_to.some((r) => roles.includes(r)));
+    if (!visible) throw forbidden('You do not have access to this document');
+  } else if (!STAFF.includes(user.role) && d.uploaded_by !== user.id) {
+    throw forbidden('You do not have access to this document');
+  }
+  const buffer = await downloadBuffer(d.document_url);
+  if (!buffer) throw badRequest('The stored file could not be read');
+  const ext = String(d.file_name || d.document_url || '').toLowerCase().split('.').pop();
+  const mimetype = MIME_BY_EXT[ext] || (buffer.subarray(0, 5).toString('latin1') === '%PDF-' ? 'application/pdf' : 'application/octet-stream');
+  const text = await extractText(buffer, mimetype);
+  const out = await aiAnalyse(user, documentId, buffer, mimetype, text);
+  const analysis = await analyse(buffer, mimetype, d.file_name, { text, ai: out.json });
+  await saveAnalysis(documentId, analysis);
+  await auditService.log({ actor: user, action: 'document.ai_analysed', entityType: 'document', entityId: documentId, after: { type: analysis.type, flags: analysis.flags.length, creditsCharged: out.creditsCharged }, ...meta });
+  if (d.property_id) recompute(d.property_id).catch(() => {});
+  return { ...analysis, creditsCharged: out.creditsCharged, balance: out.balance, disclaimer: out.disclaimer };
 }
 
 async function saveAnalysis(documentId, a) {
@@ -511,6 +539,7 @@ async function queue() {
 
 module.exports = {
   analyse,
+  aiAnalyseDocument,
   saveAnalysis,
   rolesFor,
   listPropertyDocuments,

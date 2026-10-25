@@ -412,6 +412,23 @@ router.get('/reviews/users/:id', authorize(...STAFF), [param('id').isUUID()], va
  *       content: { application/json: { schema: { type: object, required: [action], properties: { action: { type: string, enum: [approve, reject, hide] }, note: { type: string } } } } }
  *     responses: { 200: { description: Review } }
  */
+/**
+ * @swagger
+ * /trust/reviews/{id}/ai-second-opinion:
+ *   post:
+ *     summary: AI second opinion on a review (Serchi, feature #7) - paid from the moderator's AI credits; the rule-based filter runs on every review for free
+ *     tags: [Trust & Reputation]
+ *     security: [{ bearerAuth: [] }]
+ *     responses: { 200: { description: Fake likelihood and reasons }, 402: { description: Not enough AI credits } }
+ */
+router.post(
+  '/reviews/:id/ai-second-opinion',
+  authorize(...STAFF),
+  [param('id').isUUID()],
+  validate,
+  asyncHandler(async (req, res) => success(res, 200, 'AI second opinion', await reviewService.aiSecondOpinion(req.user, req.params.id, meta(req))))
+);
+
 router.put(
   '/reviews/:id/moderate',
   authorize(...ADMIN),

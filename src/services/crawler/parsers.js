@@ -19,8 +19,6 @@ const { politeFetch, CrawlerError } = require('./fetcher');
 // source_bank, auction_reference_id, auction_portal_url, possession, area.
 // Contact details are never kept - the normaliser strips them anyway.
 
-const orchestrator = require('../ai/orchestrator.service');
-
 const clean = (v) => (v == null ? null : String(v).replace(/\s+/g, ' ').trim() || null);
 
 function absolutise(href, baseUrl) {
@@ -61,7 +59,7 @@ function dateAfter(label, text) {
 
 // Regex extraction from notice text (SARFAESI sale notices, DRT / NCLT
 // notices, newspaper public notices). Good enough for the standard
-// formats; anything missing is left for the AI parser or human review.
+// formats; anything missing is left for human review.
 function extractFromText(text) {
   const t = String(text || '');
   const pin = /\b([1-9][0-9]{5})\b/.exec(t);
@@ -80,58 +78,6 @@ function extractFromText(text) {
     area: area ? `${area[1]} ${area[2]}` : null,
     source_type: /sarfaesi/i.test(t) ? 'sarfaesi' : /nclt|insolvency|liquidat/i.test(t) ? 'nclt' : /drt|recovery\s+tribunal/i.test(t) ? 'drt' : null,
   };
-}
-
-const AI_SCHEMA = {
-  type: 'object',
-  properties: {
-    title: { anyOf: [{ type: 'string' }, { type: 'null' }] },
-    property_type: { anyOf: [{ type: 'string' }, { type: 'null' }] },
-    city: { anyOf: [{ type: 'string' }, { type: 'null' }] },
-    locality: { anyOf: [{ type: 'string' }, { type: 'null' }] },
-    pincode: { anyOf: [{ type: 'string' }, { type: 'null' }] },
-    area: { anyOf: [{ type: 'string' }, { type: 'null' }] },
-    reserve_price: { anyOf: [{ type: 'number' }, { type: 'null' }] },
-    emd_amount: { anyOf: [{ type: 'number' }, { type: 'null' }] },
-    auction_date: { anyOf: [{ type: 'string' }, { type: 'null' }] },
-    emd_deadline: { anyOf: [{ type: 'string' }, { type: 'null' }] },
-    inspection_date: { anyOf: [{ type: 'string' }, { type: 'null' }] },
-    source_bank: { anyOf: [{ type: 'string' }, { type: 'null' }] },
-    auction_reference_id: { anyOf: [{ type: 'string' }, { type: 'null' }] },
-    possession: { anyOf: [{ type: 'string' }, { type: 'null' }] },
-  },
-  required: ['title', 'reserve_price', 'auction_date', 'city'],
-  additionalProperties: false,
-};
-
-// AI parser for notices the regexes can't read (Layer 2, "complex
-// documents"), the "notice_extract" activity. Returns null when AI is off. Never asked for -
-// and the schema has no place for - names, phone numbers or emails.
-async function aiExtract(text) {
-  if (!text || text.trim().length < 40) return null;
-  const out = await orchestrator.tryRun('notice_extract', {
-    entityType: 'crawled_notice',
-    schema: AI_SCHEMA,
-    prompt:
-      'Extract the property sale / auction details from this Indian bank auction or public sale notice. ' +
-      'Prices in rupees as plain numbers (convert lakh / crore). Dates as YYYY-MM-DD (use DD-MM-YYYY Indian order when reading). ' +
-      'Use null for anything not stated. Do not include any person names, phone numbers or email addresses.\n\n' +
-      text.slice(0, 12000),
-  });
-  return out?.json || null;
-}
-
-// Fill gaps in a regex/HTML-parsed item from the AI parser when enabled.
-async function enrichWithAi(item, text, useAi) {
-  if (!useAi) return item;
-  const missing = ['reserve_price', 'auction_date', 'city', 'title'].some((k) => item[k] == null);
-  if (!missing) return item;
-  const ai = await aiExtract(text).catch(() => null);
-  if (!ai) return item;
-  const merged = { ...item };
-  for (const [k, v] of Object.entries(ai)) if (merged[k] == null && v != null) merged[k] = v;
-  merged.parsed_by_ai = true;
-  return merged;
 }
 
 // ------------------------------------------------------------ adapters
@@ -214,8 +160,8 @@ async function rss(source, { onPage }) {
 }
 
 // Text of a notice file. PDFs with a text layer are read directly; scanned
-// PDFs and images go through OCR (Tesseract, then AI vision if needed).
-// Returns { text, method: 'text' | 'tesseract' | 'ai_vision' | 'none', ocrPages }.
+// PDFs and images go through self-hosted OCR (Tesseract).
+// Returns { text, method: 'text' | 'tesseract' | 'none', ocrPages }.
 async function readNotice(buffer, mimetype = 'application/pdf') {
   const isPdf = mimetype === 'application/pdf' || buffer.subarray(0, 5).toString('latin1') === '%PDF-';
   let parseError = null;
@@ -277,12 +223,12 @@ async function parseSource(source) {
   for (const item of items) {
     const { _text, _method, ...rest } = item;
     // Table rows often hold the key facts in free text too - let the regex
-    // extractor fill any gaps before the (optional) AI parser.
+    // extractor fill any gaps (rules + self-hosted OCR only, feature #11).
     const fromText = _text ? extractFromText(_text) : {};
     const merged = { ...Object.fromEntries(Object.entries(fromText).filter(([k]) => k !== 'description' && k !== 'title')), ...Object.fromEntries(Object.entries(rest).filter(([, v]) => v != null)) };
-    enriched.push(await enrichWithAi(merged, _text, source.use_ai_parser));
+    enriched.push(merged);
   }
   return { items: enriched, raw, pages, ocrPages };
 }
 
-module.exports = { parseSource, extractFromText, aiExtract, pdfText, readNotice, enrichWithAi };
+module.exports = { parseSource, extractFromText, pdfText, readNotice };

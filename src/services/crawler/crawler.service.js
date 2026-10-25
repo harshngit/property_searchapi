@@ -5,7 +5,7 @@ const auditService = require('../audit.service');
 const opportunityService = require('../opportunity.service');
 const { uploadBuffer } = require('../../utils/storage');
 const { badRequest, notFound } = require('../../utils/httpError');
-const { parseSource, extractFromText, readNotice, enrichWithAi } = require('./parsers');
+const { parseSource, extractFromText, readNotice } = require('./parsers');
 const referenceData = require('./referenceData');
 
 // Section 23 pipeline orchestration (master_scheduler.js in the contract):
@@ -236,7 +236,7 @@ async function parseUploadedNotice(file, { sourceName, listingCategory, legalRev
   // Scanned PDFs and photos of newspaper cuttings are read with OCR.
   const { text, method, ocrPages, confidence } = await readNotice(file.buffer, isPdf ? 'application/pdf' : file.mimetype || 'text/plain');
   if (!text.trim()) throw badRequest('No readable text in this file - the scan could not be read by OCR. Try a clearer scan.');
-  const item = await enrichWithAi({ ...extractFromText(text), auction_reference_id: `upload-${Date.now()}` }, text, true);
+  const item = { ...extractFromText(text), auction_reference_id: `upload-${Date.now()}` };
   const summary = await opportunityService.ingestItems(
     [item],
     { sourceName: sourceName || 'Uploaded notice', dataSource: 'crawler', defaultCategory: listingCategory || 'auction', requiresLegalReview: String(legalReview) === 'true' },

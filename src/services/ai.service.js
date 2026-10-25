@@ -6,7 +6,7 @@ function notFound(message = 'Lead not found') {
   return err;
 }
 
-const orchestrator = require('./ai/orchestrator.service');
+const serchi = require('./ai/serchi');
 
 // Every field is required (nullable where it may be unknown) so the schema
 // also works as a strict structured output on the OpenAI model.
@@ -20,7 +20,7 @@ const INSIGHT_SCHEMA = {
     intent: { anyOf: [{ type: 'string' }, { type: 'null' }] },
     timeline: { anyOf: [{ type: 'string' }, { type: 'null' }] },
     summary: { type: 'string' },
-    score: { type: 'string', enum: ['hot', 'warm', 'cold'] },
+    score: { type: 'string', enum: ['hot', 'warm', 'nurture', 'cold'] },
     confidence: { type: 'number' },
   },
   required: ['budgetMin', 'budgetMax', 'location', 'propertyType', 'intent', 'timeline', 'summary', 'score', 'confidence'],
@@ -51,16 +51,17 @@ async function gatherLeadText(leadId) {
   return { lead, text: parts.join('\n') };
 }
 
-// Core extraction call - shared by generateLeadSummary, scoreLead, and
-// previewExtractIntent. It runs through the AI orchestrator as the
-// "lead_insight" activity (simple task: the cheaper OpenAI model, Claude as
-// fallback). A user who is not staff pays its credits; the automatic summary
-// on a new lead (no user) is on the platform. Returns null without calling
-// the model when the lead has no notes or inquiry text to read.
-async function extractInsight(leadId, user = null) {
+// Features #1 / #2 inside Serchi: AI lead qualification (intent, budget,
+// location, timeline, summary) and the HOT / WARM / NURTURE / COLD rating -
+// the "lead_insight" activity (the cheaper OpenAI model, Claude as fallback),
+// run only when a user asks and paid from their AI credits. The platform's
+// rule-based field capture and 0-100 score (events.service) stay as they
+// are and never call AI. Returns null without calling the model when the
+// lead has no notes or inquiry text to read.
+async function extractInsight(leadId, user) {
   const { text } = await gatherLeadText(leadId);
   if (!text.trim()) return null;
-  const out = await orchestrator.run('lead_insight', {
+  const out = await serchi.run('lead_insight', {
     user,
     entityType: 'lead',
     entityId: leadId,
@@ -69,11 +70,11 @@ async function extractInsight(leadId, user = null) {
       'You are qualifying a real-estate lead for a brokerage CRM. Read the notes below ' +
       'and extract the buyer/renter\'s budget range, preferred location, property type, ' +
       'intent (buy/sell/rent), and timeline if mentioned. Write a short (1-2 sentence) ' +
-      'summary, and rate the lead hot/warm/cold based on how qualified and ready-to-act ' +
-      'they sound.\n\n' +
+      'summary, and rate the lead: hot (ready to act now), warm (interested, acting within weeks), ' +
+      'nurture (interested but months away or undecided) or cold (no real intent).\n\n' +
       text,
   });
-  return { ...out.json, rawResponse: { runId: out.runId, provider: out.provider, model: out.model, creditsCharged: out.creditsCharged } };
+  return { ...out.json, rawResponse: { runId: out.runId, provider: out.provider, model: out.model, creditsCharged: out.creditsCharged }, disclaimer: out.disclaimer };
 }
 
 async function saveInsight(leadId, insight, overrideScore) {
@@ -102,7 +103,7 @@ async function saveInsight(leadId, insight, overrideScore) {
 }
 
 // POST /api/ai/lead-summary
-async function generateLeadSummary(leadId, user = null) {
+async function generateLeadSummary(leadId, user) {
   const insight = await extractInsight(leadId, user);
   if (!insight) {
     // Nothing to extract from - save a placeholder so callers of GET
@@ -113,18 +114,7 @@ async function generateLeadSummary(leadId, user = null) {
       confidence: 0,
     });
   }
-  return saveInsight(leadId, insight);
-}
-
-// Internal wrapper - called from lead.service.js right after a lead is
-// created. An AI failure (missing key, rate limit, malformed response) must
-// never break lead creation, so every error is swallowed here and logged.
-async function safeGenerateLeadSummary(leadId) {
-  try {
-    await generateLeadSummary(leadId);
-  } catch (err) {
-    console.error(`AI lead-summary failed for lead ${leadId}:`, err.message);
-  }
+  return { ...(await saveInsight(leadId, insight)), disclaimer: insight.disclaimer };
 }
 
 // Simple, tunable rule-based scorer (0-100). Not a replacement for the AI's
@@ -163,16 +153,17 @@ async function computeRuleScore(lead) {
   return budgetComponent + recencyComponent + sourceComponent;
 }
 
-const AI_SCORE_NUMERIC = { hot: 90, warm: 60, cold: 30 };
+const AI_SCORE_NUMERIC = { hot: 90, warm: 70, nurture: 45, cold: 20 };
 
 function numericToLevel(score) {
-  if (score >= 70) return 'hot';
-  if (score >= 40) return 'warm';
+  if (score >= 75) return 'hot';
+  if (score >= 55) return 'warm';
+  if (score >= 35) return 'nurture';
   return 'cold';
 }
 
 // POST /api/ai/lead-score
-async function scoreLead(leadId, user = null) {
+async function scoreLead(leadId, user) {
   const leadResult = await pool.query('SELECT * FROM leads WHERE id = $1', [leadId]);
   if (leadResult.rows.length === 0) throw notFound();
   const lead = leadResult.rows[0];
@@ -190,11 +181,11 @@ async function scoreLead(leadId, user = null) {
 
   // Blend: 60% rule-based (concrete signals) + 40% the AI's own read of intent/urgency.
   const combined = Math.round(0.6 * ruleScore + 0.4 * AI_SCORE_NUMERIC[insight.score]);
-  return saveInsight(leadId, insight, numericToLevel(combined));
+  return { ...(await saveInsight(leadId, insight, numericToLevel(combined))), disclaimer: insight.disclaimer };
 }
 
 // POST /api/ai/extract-intent - preview only, does not save
-async function previewExtractIntent(leadId, user = null) {
+async function previewExtractIntent(leadId, user) {
   const insight = await extractInsight(leadId, user);
   if (!insight) {
     return { summary: 'No notes or inquiry text available yet.', score: 'cold', confidence: 0 };
@@ -369,7 +360,7 @@ module.exports = {
   getStats,
   reviewInsight,
   generateLeadSummary,
-  safeGenerateLeadSummary,
+
   scoreLead,
   previewExtractIntent,
   getLatestInsight,
