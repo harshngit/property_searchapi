@@ -5,6 +5,7 @@ const notificationService = require('./notification.service');
 const auditService = require('./audit.service');
 const { encrypt, decrypt } = require('../utils/crypto');
 const { maskPhone } = require('../utils/masking');
+const { getReadUrl } = require('../utils/storage');
 const { badRequest, forbidden, notFound } = require('../utils/httpError');
 
 // Module 46 - Exclusive Mandate (core, build before launch).
@@ -683,14 +684,25 @@ async function updateBenefits(id, user, data, meta = {}) {
   if (done.length) {
     const label = { valuation_status: 'Valuation', due_diligence_status: 'Legal due diligence', deed_writer_waiver_status: 'Deed writer waiver' };
     const whatsappLabel = { valuation_status: 'Free Valuation Report', due_diligence_status: 'Free Due Diligence Report', deed_writer_waiver_status: 'Deed Writer waiver' };
-    const [holder, listing] = await Promise.all([
+    const docCol = { valuation_status: 'valuation_document_id', due_diligence_status: 'due_diligence_document_id' }[done[0][0]] || null;
+    const [holder, listing, docPath] = await Promise.all([
       pool.query('SELECT full_name FROM users WHERE id = $1', [m.user_id]).then((r) => r.rows[0]),
       m.listing_id ? pool.query('SELECT title FROM properties WHERE id = $1', [m.listing_id]).then((r) => r.rows[0]) : null,
+      docCol ? pool.query(`SELECT ${docCol} AS p FROM mandates WHERE id = $1`, [id]).then((r) => r.rows[0]?.p) : null,
     ]);
+    // ar_benefit_delivered was approved with a required document header -
+    // only send it over WhatsApp when the just-completed benefit actually
+    // has a report on file (the deed writer waiver has none).
+    const link = docPath ? await getReadUrl(docPath).catch(() => null) : null;
     await notify([m.user_id], {
       type: 'mandate_benefit', title: `Mandate benefit delivered: ${done.map(([k]) => label[k]).join(', ')}`,
       message: `${done.map(([k, v]) => `${label[k]} - ${v.replace('_', ' ')}`).join('; ')}`, id,
-      whatsappContent: { vars: [(holder?.full_name || '').split(' ')[0] || 'there', whatsappLabel[done[0][0]] || label[done[0][0]], listing?.title || 'your listing'] },
+      whatsappContent: link
+        ? {
+            vars: [(holder?.full_name || '').split(' ')[0] || 'there', whatsappLabel[done[0][0]] || label[done[0][0]], listing?.title || 'your listing'],
+            headerDocument: { link, filename: `${(whatsappLabel[done[0][0]] || label[done[0][0]]).replace(/\s+/g, '_')}_${m.mandate_number}.pdf` },
+          }
+        : undefined,
     });
   }
   return get(id, user);

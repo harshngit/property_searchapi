@@ -444,15 +444,11 @@ async function siteVisitReminderSweep(now = new Date()) {
       message: `Your visit${info.title ? ` for ${info.title}` : ''} is at ${when}.`,
       relatedEntityType: 'deal',
       relatedEntityId: visit.deal_id,
+      // ar_site_visit_reminder (approved wording): property.title,
+      // visit.time_display, assigned_rep.display_name - exactly 3 vars.
       whatsappContent: {
-        vars: [
-          (info.customer_name || '').split(' ')[0] || 'there',
-          info.title || 'your enquiry',
-          [info.locality, info.city].filter(Boolean).join(', ') || 'the location shared with you',
-          when,
-          info.rep_name || 'your representative',
-          info.rep_mobile || '',
-        ],
+        vars: [info.title || 'your enquiry', when, info.rep_name || 'your representative'],
+        buttonUrl: visit.id,
       },
     }).catch((err) => console.error(`Site visit reminder failed for deal ${visit.deal_id}:`, err.message));
   }

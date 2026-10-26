@@ -219,17 +219,36 @@ async function dispatch({ now = new Date(), force = false, userId } = {}) {
     const msg = render(d.content, d.areas);
     const areaNames = [...new Set((d.areas || []).map((a) => a.locality || a.city))];
     const place = areaNames.slice(0, 2).join(', ') + (areaNames.length > 2 ? ` +${areaNames.length - 2}` : '');
+    const broker = (await pool.query('SELECT full_name FROM users WHERE id = $1', [d.user_id])).rows[0];
+    const dateDisplay = new Date(d.digest_date).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' });
     await notificationService.createNotification({
       userId: d.user_id, type: 'market_digest', title: msg.title, message: msg.message,
       relatedEntityType: 'market_digest', relatedEntityId: d.id, scheduled: true,
-      whatsappContent: { vars: [place || 'your areas', String(d.item_count), msg.message.slice(0, 300)], buttonUrl: d.id },
+      // ar_daily_market_digest (approved wording): broker.first_name,
+      // broker.localities_display, digest.date_display, digest.new_listings,
+      // digest.new_requirements, digest.urgent_deals - 6 separate vars.
+      whatsappContent: {
+        vars: [
+          (broker?.full_name || '').split(' ')[0] || 'there',
+          place || 'your areas',
+          dateDisplay,
+          String(d.content.newProperties?.length || 0),
+          String(d.content.newRequirements?.length || 0),
+          String(d.content.urgentDeals?.length || 0),
+        ],
+        buttonUrl: d.id,
+      },
     });
     sent += 1;
-    if (d.content.sponsored) {
+    // ar_digest_sponsored was approved with a required image header - skip
+    // the send (not the digest itself) when the campaign has no image.
+    if (d.content.sponsored?.imageUrl) {
+      const s = d.content.sponsored;
       await notificationService.createNotification({
-        userId: d.user_id, type: 'digest_sponsored', title: 'Sponsored listing', message: d.content.sponsored,
+        userId: d.user_id, type: 'digest_sponsored', title: 'Sponsored listing', message: s.text || s.headline,
         relatedEntityType: 'market_digest', relatedEntityId: d.id, scheduled: true,
-        whatsappContent: { vars: [d.content.sponsored] },
+        // ar_digest_sponsored (approved wording): sponsor.headline, sponsor.body - plus an image header.
+        whatsappContent: { vars: [s.headline, s.body], headerImage: s.imageUrl ? { link: s.imageUrl } : undefined, buttonUrl: s.campaignId },
       }).catch((err) => console.error('[market digest] sponsored send failed:', err.message));
     }
   }

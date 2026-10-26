@@ -328,37 +328,51 @@ async function notifyStaffText(sub, title, message) {
   }
 }
 
+// ar_fee_consent_request (approved wording): user.first_name, intake.kind -
+// this flow only ever runs for sell/rent_out, i.e. a listing, never a requirement.
 async function requestFeeConsent(sub) {
   if (sub.channel !== 'whatsapp' || !['sell', 'rent_out'].includes(sub.intent)) return;
   if (!sub.contact_phone && !sub.wa_user_id) return;
-  await metaWhatsapp().sendTemplate({ ...waContactFor(sub), templateName: 'ar_fee_consent_request', variables: [sub.contact_name || 'there', sub.reference] });
+  await metaWhatsapp().sendTemplate({ ...waContactFor(sub), templateName: 'ar_fee_consent_request', variables: [sub.contact_name || 'there', 'listing'] });
   await pool.query('UPDATE chat_listing_submissions SET fee_consent_requested_at = now() WHERE id = $1', [sub.id]);
 }
 
-async function handleFeeConsentReply(contact, buttonId) {
+// buttonText is the tapped quick-reply's exact approved text ("YES, I
+// accept" / "Talk to an agent") - Meta returns that as the payload.
+async function handleFeeConsentReply(contact, buttonText) {
   const sub = await latestConsentSubmission(contact, 'AND fee_consent_requested_at IS NOT NULL AND fee_consent_response IS NULL');
   if (!sub) return false;
-  const response = buttonId === 'fc_yes' ? 'yes' : 'agent';
+  const response = buttonText === 'YES, I accept' ? 'yes' : 'agent';
   await pool.query('UPDATE chat_listing_submissions SET fee_consent_response = $2 WHERE id = $1', [sub.id, response]);
   if (response === 'agent') {
     await send(contact, 'No problem - a representative will call you shortly to go through the professional fee terms.');
     await notifyStaffText(sub, 'Seller wants to discuss the fee terms', `${sub.reference}: the poster asked to talk to a representative before agreeing to the professional fee.`);
     return true;
   }
-  await metaWhatsapp().sendTemplate({ ...waContactFor(sub), templateName: 'ar_mandate_offer', variables: [sub.contact_name || 'there'] });
+  // ar_mandate_offer (approved wording): user.first_name, intake.kind.
+  await metaWhatsapp().sendTemplate({ ...waContactFor(sub), templateName: 'ar_mandate_offer', variables: [sub.contact_name || 'there', 'listing'] });
   return true;
 }
 
-async function handleMandateOfferReply(contact, buttonId) {
+// buttonText is "MANDATE" / "STANDARD" - the tapped quick-reply's exact approved text.
+async function handleMandateOfferReply(contact, buttonText) {
   const sub = await latestConsentSubmission(contact, "AND fee_consent_response = 'yes' AND mandate_type_requested IS NULL");
   if (!sub) return false;
-  const mandateType = buttonId === 'mo_exclusive' ? 'exclusive' : 'standard';
+  const mandateType = buttonText === 'MANDATE' ? 'exclusive' : 'standard';
   await pool.query('UPDATE chat_listing_submissions SET mandate_type_requested = $2 WHERE id = $1', [sub.id, mandateType]);
-  await metaWhatsapp().sendTemplate({
-    ...waContactFor(sub),
-    templateName: 'ar_mandate_complete_link',
-    variables: [sub.contact_name || 'there', mandateType === 'exclusive' ? 'Exclusive Mandate' : 'Standard listing'],
-  });
+  if (mandateType === 'exclusive') {
+    // ar_mandate_complete_link (approved wording): user.first_name,
+    // mandate.range_label, link.ttl_hours - only applies to the Exclusive
+    // path, where a price range still needs collecting (see doc Step 3).
+    await metaWhatsapp().sendTemplate({
+      ...waContactFor(sub),
+      templateName: 'ar_mandate_complete_link',
+      variables: [sub.contact_name || 'there', 'minimum and maximum price', '24'],
+      buttonUrlSuffix: sub.id,
+    });
+  } else {
+    await send(contact, 'Noted - your property will be listed as a Standard engagement. Our team will confirm the professional fee consent when they review your listing.');
+  }
   await notifyStaffText(
     sub,
     `Seller chose ${mandateType === 'exclusive' ? 'an Exclusive Mandate' : 'Standard listing'}`,
@@ -731,7 +745,12 @@ async function approve(user, id, data = {}, meta = {}) {
   const status = (await pool.query('SELECT status FROM properties WHERE id = $1', [propertyId])).rows[0]?.status;
   const contact = { channel: s.channel, phone: s.contact_phone, waUserId: s.wa_user_id, chatId: s.telegram_chat_id };
   if (s.intent === 'institutional_sale') await send(contact, `Your institutional listing ${s.reference} is now with the A R Buildwel institutional desk. A representative will call you to complete the details.`);
-  else if (status === 'approved') await send(contact, `Your property ${s.reference} is now live: ${await siteUrl()}/properties/${propertyId}\nShare this link with buyers.`);
+  else if (status === 'approved' && s.channel === 'whatsapp' && (s.contact_phone || s.wa_user_id)) {
+    // ar_listing_live (approved wording): listing.short_title, mandate.type_label.
+    const typeLabel = s.mandate_type_requested === 'exclusive' ? 'Exclusive Mandate' : 'Standard listing';
+    await metaWhatsapp().sendTemplate({ ...waContactFor(s), templateName: 'ar_listing_live', variables: [s.parsed?.title || s.reference, typeLabel], buttonUrlSuffix: propertyId })
+      .catch(async (err) => { console.error(`[chat-intake] ar_listing_live send failed for ${s.id}:`, err.message); await send(contact, `Your property ${s.reference} is now live: ${await siteUrl()}/properties/${propertyId}\nShare this link with buyers.`); });
+  } else if (status === 'approved') await send(contact, `Your property ${s.reference} is now live: ${await siteUrl()}/properties/${propertyId}\nShare this link with buyers.`);
   else await send(contact, `Your property ${s.reference} has been accepted and is in a final check. We will message you when it is live.`);
   return { ...(await getSubmission(user, id)), propertyStatus: status };
 }

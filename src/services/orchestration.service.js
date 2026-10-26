@@ -3,6 +3,7 @@ const configService = require('./config.service');
 const notificationService = require('./notification.service');
 const auditService = require('./audit.service');
 const { formatInr } = require('../utils/price');
+const { uploadBuffer, getReadUrl } = require('../utils/storage');
 const { badRequest, forbidden, notFound } = require('../utils/httpError');
 
 // Module 40 - Transaction Orchestration Engine.
@@ -227,6 +228,15 @@ async function createInvoice(deal, kind, party, triggerDate, c) {
   }
   if (who.user_id) {
     const kindLabel = kind === 'lease' ? 'Lease' : kind === 'instalment_1' ? 'Instalment 1' : 'Instalment 2';
+    // ar_invoice_generated was approved with a required document header -
+    // generate and upload the invoice PDF so it can be attached.
+    const pdfLink = await buildInvoicePdfBuffer({ ...inv, property_title: deal.property_title || null })
+      .then((buf) => uploadBuffer(buf, 'invoices', `${number}.pdf`, 'application/pdf'))
+      .then((path) => getReadUrl(path))
+      .catch((err) => {
+        console.error(`[orchestration] invoice PDF for ${number} failed:`, err.message);
+        return null;
+      });
     await notificationService.createNotification({
       userId: who.user_id,
       type: 'invoice',
@@ -234,7 +244,7 @@ async function createInvoice(deal, kind, party, triggerDate, c) {
       message: `${kindLabel} professional fee for ${deal.property_title || 'your deal'}. Due by ${new Date(inv.due_date).toLocaleDateString('en-IN')}.`,
       relatedEntityType: 'invoice',
       relatedEntityId: inv.id,
-      whatsappContent: {
+      whatsappContent: pdfLink && {
         vars: [
           (who.full_name || '').split(' ')[0] || 'there',
           number,
@@ -242,6 +252,7 @@ async function createInvoice(deal, kind, party, triggerDate, c) {
           formatInr(inv.total_amount),
           new Date(inv.due_date).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }),
         ],
+        headerDocument: { link: pdfLink, filename: `${number.replace(/\//g, '-')}.pdf` },
         buttonUrl: inv.id,
       },
     });
@@ -460,14 +471,7 @@ async function listInvoices(user, { status, dealId } = {}) {
   return r.rows;
 }
 
-async function invoicePdf(user, invoiceId) {
-  const inv = (
-    await pool.query(
-      `SELECT i.*, p.title AS property_title, d.broker_id FROM invoices i JOIN deals d ON d.id = i.deal_id LEFT JOIN properties p ON p.id = d.property_id WHERE i.id = $1`,
-      [invoiceId]
-    )
-  ).rows[0];
-  if (!inv || (!STAFF.includes(user.role) && inv.liable_user_id !== user.id && inv.broker_id !== user.id)) throw notFound('Invoice not found');
+async function buildInvoicePdfBuffer(inv) {
   const { PDFDocument, StandardFonts, rgb } = require('pdf-lib');
   const pdf = await PDFDocument.create();
   const page = pdf.addPage([595, 842]);
@@ -514,6 +518,17 @@ async function invoicePdf(user, invoiceId) {
   }
   line(`Status: ${inv.status}${inv.payment_reference ? ` (ref ${inv.payment_reference})` : ''}`, { size: 9 });
   return Buffer.from(await pdf.save());
+}
+
+async function invoicePdf(user, invoiceId) {
+  const inv = (
+    await pool.query(
+      `SELECT i.*, p.title AS property_title, d.broker_id FROM invoices i JOIN deals d ON d.id = i.deal_id LEFT JOIN properties p ON p.id = d.property_id WHERE i.id = $1`,
+      [invoiceId]
+    )
+  ).rows[0];
+  if (!inv || (!STAFF.includes(user.role) && inv.liable_user_id !== user.id && inv.broker_id !== user.id)) throw notFound('Invoice not found');
+  return buildInvoicePdfBuffer(inv);
 }
 
 // -------------------------------------------------------------- scheduler
@@ -720,6 +735,7 @@ module.exports = {
   recordInvoicePayment,
   listInvoices,
   invoicePdf,
+  buildInvoicePdfBuffer,
   dealView,
   slaSweep,
   invoiceSweep,

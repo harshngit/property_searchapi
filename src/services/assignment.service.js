@@ -2,6 +2,7 @@ const pool = require('../config/db');
 const configService = require('./config.service');
 const management = require('./management.service');
 const notificationService = require('./notification.service');
+const { formatInr } = require('../utils/price');
 const { badRequest, forbidden, notFound } = require('../utils/httpError');
 
 // Annexure A sec. 10 + sec. 34 - Universal Inquiry Assignment Cascade.
@@ -249,12 +250,21 @@ async function notify(ids, { type, title, message, leadId, whatsappContent }) {
 async function leadDisplay(lead) {
   const [customer, property] = await Promise.all([
     lead.customer_id ? pool.query('SELECT full_name, user_id FROM customers WHERE id = $1', [lead.customer_id]).then((r) => r.rows[0]) : null,
-    lead.property_id ? pool.query('SELECT title FROM properties WHERE id = $1', [lead.property_id]).then((r) => r.rows[0]) : null,
+    lead.property_id
+      ? pool.query('SELECT title, transaction_type::text AS transaction_type, property_type::text AS property_type, bedrooms, price, price_value FROM properties WHERE id = $1', [lead.property_id]).then((r) => r.rows[0])
+      : null,
   ]);
+  const requirementSummary = property
+    ? [property.transaction_type === 'rent' ? 'Rent' : 'Buy', property.bedrooms ? `${property.bedrooms} BHK` : property.property_type, property.price || (property.price_value ? formatInr(property.price_value) : null)]
+        .filter(Boolean)
+        .join(', ')
+    : 'New enquiry';
   return {
     customerFirstName: (customer?.full_name || '').split(' ')[0] || 'there',
+    customerDisplayName: customer?.full_name || 'A lead',
     customerUserId: customer?.user_id || null,
     propertyTitle: property?.title || 'your enquiry',
+    requirementSummary,
   };
 }
 
@@ -412,8 +422,11 @@ async function place(lead, ctx, c, pick, hop, previous, reason = 'new', exitReas
     title: `${previous ? 'Inquiry transferred to you' : 'New inquiry assigned'} (hop ${hop})`,
     message: `${label}. Log first contact by ${due.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} or it moves on automatically.${ctx.exclusive ? ` Exclusive Mandate - ${c.sla.exclusive} h response SLA.` : ''}`,
     leadId: lead.id,
+    // ar_rep_new_lead (approved wording): lead.display_name,
+    // lead.requirement_summary, lead.top_locality, lead.score_display,
+    // lead.source_name, cascade.response_sla_minutes.
     whatsappContent: {
-      vars: [disp.customerFirstName, disp.propertyTitle, label, lead.score_display || lead.status || 'New', lead.source || 'Direct', String(Math.round(c.windowMinutes || 15))],
+      vars: [disp.customerDisplayName, disp.requirementSummary, ctx.locality || ctx.city || 'Location not given', lead.score_display || lead.status || 'New', lead.source || 'Direct', String(Math.round(c.windowMinutes || 15))],
       buttonUrl: lead.id,
     },
   });

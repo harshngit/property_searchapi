@@ -785,13 +785,23 @@ async function click({ campaignId, placement, variant, viewerKey, city, device }
 }
 
 // One sponsored line for a person's daily digest (counts as a "send").
+// `headline`/`body` feed ar_digest_sponsored's own two variables; `text` is
+// the combined line for in-app/push display.
 async function digestSponsor(userId) {
   try {
     const user = (await pool.query(`SELECT u.id, r.name AS role FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = $1`, [userId])).rows[0];
     const { ads } = await serve({ placement: 'digest_sponsored' }, user || null);
     if (!ads.length) return null;
     await pool.query('UPDATE ad_campaigns SET sends_used = sends_used + 1 WHERE id = $1', [ads[0].campaignId]);
-    return `Sponsored: ${[ads[0].headline, ads[0].body].filter(Boolean).join(' - ')}`.slice(0, 300);
+    const headline = (ads[0].headline || '').slice(0, 120);
+    const body = (ads[0].body || '').slice(0, 300);
+    return {
+      headline,
+      body,
+      text: `Sponsored: ${[headline, body].filter(Boolean).join(' - ')}`.slice(0, 300),
+      imageUrl: ads[0].imageUrl || null,
+      campaignId: ads[0].campaignId,
+    };
   } catch (err) {
     console.error('[ads] digest sponsor failed:', err.message);
     return null;

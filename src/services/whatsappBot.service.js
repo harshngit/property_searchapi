@@ -148,22 +148,30 @@ async function tryIntake({ phoneNumber, waUserId, text, mediaId, messageId, prof
 // hands the collected answers to whatsapp.service.js's captureLead() and
 // sends a closing message. `waUserId` (the BSUID) is required - Meta always
 // provides it; `phoneNumber` may be null when the customer's number is hidden.
+// Quick-reply buttons on an approved template return their own exact text
+// as the payload (Meta's template creation API takes no custom payload for
+// QUICK_REPLY buttons), so these three flows route on the real approved
+// button text, not an id this codebase invents.
+const LQ_BUTTONS = new Set(['Buy', 'Rent', 'Sell']);
+const FC_BUTTONS = new Set(['YES, I accept', 'Talk to an agent']);
+const MO_BUTTONS = new Set(['MANDATE', 'STANDARD']);
+
 async function handleInboundMessage({ phoneNumber, waUserId, text, buttonReplyId, buttonReplyTitle, mediaId = null, messageId = null, profileName = null }) {
   if (!waUserId) throw new Error('waUserId is required to run the WhatsApp bot flow');
-  // ar_lead_qualification's own quick-reply buttons (lq_buy / lq_rent /
-  // lq_sell) - a template reply, not a step in this file's question flow.
-  if (buttonReplyId && buttonReplyId.startsWith('lq_')) {
-    const handled = await require('./leadQualification.service').handleReply(phoneNumber, buttonReplyId);
+  // ar_lead_qualification's own quick-reply buttons - a template reply, not
+  // a step in this file's question flow.
+  if (buttonReplyTitle && LQ_BUTTONS.has(buttonReplyTitle)) {
+    const handled = await require('./leadQualification.service').handleReply(phoneNumber, buttonReplyTitle);
     if (handled) return { phoneNumber, waUserId, leadQualification: true };
   }
-  // ar_fee_consent_request / ar_mandate_offer quick-reply buttons (fc_* /
-  // mo_*) - routed to the chat listing submission they belong to.
-  if (buttonReplyId && (buttonReplyId.startsWith('fc_') || buttonReplyId.startsWith('mo_'))) {
+  // ar_fee_consent_request / ar_mandate_offer quick-reply buttons - routed
+  // to the chat listing submission they belong to.
+  if (buttonReplyTitle && (FC_BUTTONS.has(buttonReplyTitle) || MO_BUTTONS.has(buttonReplyTitle))) {
     const contact = { channel: 'whatsapp', phone: phoneNumber ? whatsappService.toLocalMobile(phoneNumber) : null, waUserId };
     const chatIntake = require('./messaging/chatIntake.service');
-    const handled = buttonReplyId.startsWith('fc_')
-      ? await chatIntake.handleFeeConsentReply(contact, buttonReplyId)
-      : await chatIntake.handleMandateOfferReply(contact, buttonReplyId);
+    const handled = FC_BUTTONS.has(buttonReplyTitle)
+      ? await chatIntake.handleFeeConsentReply(contact, buttonReplyTitle)
+      : await chatIntake.handleMandateOfferReply(contact, buttonReplyTitle);
     if (handled) return { phoneNumber, waUserId, mandateConsentFlow: true };
   }
   if (!buttonReplyId) {

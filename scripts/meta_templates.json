@@ -106,7 +106,7 @@
     "components": [
       {
         "type": "BODY",
-        "text": "Great choice, {{1}}. Please complete your Exclusive Mandate by entering your {{2}} on the secure page below. The link is valid for {{3}} hours.",
+        "text": "Hello {{1}}, please complete your Exclusive Mandate by entering your {{2}} on the mandate page below. This link is valid for {{3}} hours.",
         "example": { "body_text": [["Sanjay", "minimum and maximum price", "24"]] }
       },
       { "type": "FOOTER", "text": "A R Buildwel | PropertySerch.com" },

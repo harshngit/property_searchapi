@@ -968,17 +968,18 @@ async function sendDigests() {
       relatedEntityId: null,
     });
     // ar_digest_sponsored - sent as its own follow-up message, same as the
-    // daily market digest, when a campaign has booked the slot.
+    // daily market digest, when a campaign has booked the slot. Approved
+    // with a required image header, so skip when the campaign has none.
     const sponsored = await require('./advertising.service').digestSponsor(userId);
-    if (sponsored) {
+    if (sponsored?.imageUrl) {
       await notificationService.createNotification({
         userId,
         type: 'digest_sponsored',
         title: 'Sponsored listing',
-        message: sponsored,
+        message: sponsored.text || sponsored.headline,
         relatedEntityType: 'matches',
         relatedEntityId: null,
-        whatsappContent: { vars: [sponsored] },
+        whatsappContent: { vars: [sponsored.headline, sponsored.body], headerImage: { link: sponsored.imageUrl }, buttonUrl: sponsored.campaignId },
       }).catch((err) => console.error('[matching] sponsored digest send failed:', err.message));
     }
     await pool.query('UPDATE requirement_matches SET digest_sent_at = now() WHERE id = ANY($1::uuid[])', [list.map((l) => l.id)]);
