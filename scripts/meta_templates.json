@@ -1,0 +1,517 @@
+[
+  {
+    "name": "ar_inquiry_received",
+    "language": "en",
+    "category": "UTILITY",
+    "components": [
+      {
+        "type": "BODY",
+        "text": "Hello {{1}}, thank you for your inquiry about {{2}}.\n\nYour A R Buildwel representative {{3}} will contact you shortly.\nReference ID: {{4}}.\n\nThank you for choosing A R Buildwel.",
+        "example": { "body_text": [["Rahul", "3 BHK Flat, Dwarka Sector 12", "Neha Sharma", "INQ-20481"]] }
+      },
+      { "type": "FOOTER", "text": "A R Buildwel | PropertySerch.com" },
+      {
+        "type": "BUTTONS",
+        "buttons": [
+          { "type": "URL", "text": "View property", "url": "https://propertyserch.com/p/{{1}}", "example": ["dwarka-3bhk-20481"] }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ar_lead_qualification",
+    "language": "en",
+    "category": "UTILITY",
+    "components": [
+      {
+        "type": "BODY",
+        "text": "Hello {{1}}, thanks for your inquiry with A R Buildwel for {{2}}.\n\nTo share the right options quickly, please tell us what you are looking for.",
+        "example": { "body_text": [["Priya", "property in Rohini"]] }
+      },
+      { "type": "FOOTER", "text": "A R Buildwel | PropertySerch.com" },
+      {
+        "type": "BUTTONS",
+        "buttons": [
+          { "type": "QUICK_REPLY", "text": "Buy" },
+          { "type": "QUICK_REPLY", "text": "Rent" },
+          { "type": "QUICK_REPLY", "text": "Sell" }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ar_nurture_followup",
+    "language": "en",
+    "category": "MARKETING",
+    "components": [
+      {
+        "type": "BODY",
+        "text": "Hello {{1}}, {{2}} new properties matching your search in {{3}} were listed this week on PropertySerch.com.\n\nTap below to see them.",
+        "example": { "body_text": [["Amit", "6", "Janakpuri"]] }
+      },
+      { "type": "FOOTER", "text": "A R Buildwel | PropertySerch.com" },
+      {
+        "type": "BUTTONS",
+        "buttons": [
+          { "type": "URL", "text": "See properties", "url": "https://propertyserch.com/s/{{1}}", "example": ["janakpuri-amit-77"] },
+          { "type": "QUICK_REPLY", "text": "Stop updates" }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ar_fee_consent_request",
+    "language": "en",
+    "category": "UTILITY",
+    "components": [
+      {
+        "type": "BODY",
+        "text": "Hello {{1}}, before we take your {{2}} live, please review the A R Buildwel professional fee.\n\nSale / purchase: 1% + GST/IGST of the price, paid 50% + tax at ATS execution and 50% + tax at Sale Deed execution.\nRental: one month's gross rent + GST/IGST at agreement execution.\n\nDo you accept?",
+        "example": { "body_text": [["Sanjay", "listing"]] }
+      },
+      { "type": "FOOTER", "text": "A R Buildwel | PropertySerch.com" },
+      {
+        "type": "BUTTONS",
+        "buttons": [
+          { "type": "QUICK_REPLY", "text": "YES, I accept" },
+          { "type": "QUICK_REPLY", "text": "Talk to an agent" }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ar_mandate_offer",
+    "language": "en",
+    "category": "UTILITY",
+    "components": [
+      {
+        "type": "BODY",
+        "text": "Thank you {{1}}. Would you like an Exclusive 6-Month Mandate for your {{2}}?\n\nBenefits: Free Valuation (sellers), Free Due Diligence, Priority Listing and Matching, Deed Writer charges waived.\n\nThe professional fee stays 1% + GST/IGST either way. Benefits are service-based.",
+        "example": { "body_text": [["Sanjay", "listing"]] }
+      },
+      { "type": "FOOTER", "text": "A R Buildwel | PropertySerch.com" },
+      {
+        "type": "BUTTONS",
+        "buttons": [
+          { "type": "QUICK_REPLY", "text": "MANDATE" },
+          { "type": "QUICK_REPLY", "text": "STANDARD" }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ar_mandate_complete_link",
+    "language": "en",
+    "category": "UTILITY",
+    "components": [
+      {
+        "type": "BODY",
+        "text": "Great choice, {{1}}. Please complete your Exclusive Mandate by entering your {{2}} on the secure page below. The link is valid for {{3}} hours.",
+        "example": { "body_text": [["Sanjay", "minimum and maximum price", "24"]] }
+      },
+      { "type": "FOOTER", "text": "A R Buildwel | PropertySerch.com" },
+      {
+        "type": "BUTTONS",
+        "buttons": [
+          { "type": "URL", "text": "Complete mandate", "url": "https://propertyserch.com/m/{{1}}", "example": ["mk7Q2xP9"] }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ar_listing_live",
+    "language": "en",
+    "category": "UTILITY",
+    "components": [
+      {
+        "type": "BODY",
+        "text": "Your {{1}} is now live on PropertySerch.com under {{2}} engagement.\n\nProfessional fee: 1% + GST/IGST on deal closure (50% at ATS, 50% at Sale Deed). Share your smart link below to get more inquiries.",
+        "example": { "body_text": [["2 BHK, Pitampura", "Exclusive Mandate"]] }
+      },
+      { "type": "FOOTER", "text": "A R Buildwel | PropertySerch.com" },
+      {
+        "type": "BUTTONS",
+        "buttons": [
+          { "type": "URL", "text": "Open listing", "url": "https://propertyserch.com/l/{{1}}", "example": ["pitampura-2bhk-5512"] }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ar_mandate_expiry_reminder",
+    "language": "en",
+    "category": "UTILITY",
+    "components": [
+      {
+        "type": "BODY",
+        "text": "Hello {{1}}, your Exclusive Mandate {{2}} for {{3}} expires in {{4}} days, on {{5}}.\n\nContact your representative to renew it and keep your benefits.",
+        "example": { "body_text": [["Sanjay", "MND-1042", "2 BHK, Pitampura", "7", "22 Oct 2026"]] }
+      },
+      { "type": "FOOTER", "text": "A R Buildwel | PropertySerch.com" },
+      {
+        "type": "BUTTONS",
+        "buttons": [
+          { "type": "QUICK_REPLY", "text": "Renew mandate" },
+          { "type": "QUICK_REPLY", "text": "Call me" }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ar_match_found",
+    "language": "en",
+    "category": "UTILITY",
+    "components": [
+      {
+        "type": "BODY",
+        "text": "Hello {{1}}, we found a {{2}} match for your requirement: {{3}} in {{4}} at {{5}}.\n\nTap below to view details or book a site visit.",
+        "example": { "body_text": [["Rahul", "94%", "3 BHK Flat", "Dwarka Sector 12", "₹1.45 Cr"]] }
+      },
+      { "type": "FOOTER", "text": "A R Buildwel | PropertySerch.com" },
+      {
+        "type": "BUTTONS",
+        "buttons": [
+          { "type": "URL", "text": "View property", "url": "https://propertyserch.com/p/{{1}}", "example": ["dwarka-3bhk-20481"] },
+          { "type": "QUICK_REPLY", "text": "Book site visit" }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ar_site_visit_confirmed",
+    "language": "en",
+    "category": "UTILITY",
+    "components": [
+      {
+        "type": "BODY",
+        "text": "Hello {{1}}, your site visit is confirmed.\n\nProperty: {{2}}\nDate and time: {{3}}\nYour representative: {{4}}\n\nPlease reply if you need to change the time.",
+        "example": { "body_text": [["Rahul", "3 BHK Flat, Dwarka Sector 12", "Sat 17 Oct, 11:00 AM", "Neha Sharma"]] }
+      },
+      { "type": "FOOTER", "text": "A R Buildwel | PropertySerch.com" },
+      {
+        "type": "BUTTONS",
+        "buttons": [
+          { "type": "QUICK_REPLY", "text": "Reschedule" },
+          { "type": "QUICK_REPLY", "text": "Cancel visit" }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ar_site_visit_reminder",
+    "language": "en",
+    "category": "UTILITY",
+    "components": [
+      {
+        "type": "BODY",
+        "text": "Reminder: your site visit to {{1}} is today at {{2}}. {{3}} will meet you there.\n\nTap below for directions.",
+        "example": { "body_text": [["3 BHK Flat, Dwarka Sector 12", "11:00 AM", "Neha Sharma"]] }
+      },
+      { "type": "FOOTER", "text": "A R Buildwel | PropertySerch.com" },
+      {
+        "type": "BUTTONS",
+        "buttons": [
+          { "type": "URL", "text": "Get directions", "url": "https://propertyserch.com/v/{{1}}", "example": ["visit-88213"] }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ar_deal_stage_update",
+    "language": "en",
+    "category": "UTILITY",
+    "components": [
+      {
+        "type": "BODY",
+        "text": "Hello {{1}}, your deal {{2}} for {{3}} has moved to the {{4}} stage. Your representative will share the next steps.",
+        "example": { "body_text": [["Rahul", "DL-3307", "3 BHK Flat, Dwarka Sector 12", "Legal Coordination"]] }
+      },
+      { "type": "FOOTER", "text": "A R Buildwel | PropertySerch.com" }
+    ]
+  },
+  {
+    "name": "ar_invoice_generated",
+    "language": "en",
+    "category": "UTILITY",
+    "headerMedia": "DOCUMENT",
+    "components": [
+      {
+        "type": "BODY",
+        "text": "Hello {{1}}, invoice {{2}} for {{3}} has been generated.\n\nAmount payable: {{4}} (incl. GST)\nDue date: {{5}}\n\nThe invoice is attached.",
+        "example": { "body_text": [["Sanjay", "ARB/26-27/0142", "Professional Fee - ATS instalment, DL-3307", "₹85,550", "22 Oct 2026"]] }
+      },
+      { "type": "FOOTER", "text": "A R Buildwel | PropertySerch.com" },
+      {
+        "type": "BUTTONS",
+        "buttons": [
+          { "type": "URL", "text": "Pay now", "url": "https://propertyserch.com/pay/{{1}}", "example": ["inv0142x"] }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ar_invoice_due_reminder",
+    "language": "en",
+    "category": "UTILITY",
+    "components": [
+      {
+        "type": "BODY",
+        "text": "Hello {{1}}, a reminder that invoice {{2}} of {{3}} is due on {{4}}. Please ignore this if you have already paid.",
+        "example": { "body_text": [["Sanjay", "ARB/26-27/0142", "₹85,550", "22 Oct 2026"]] }
+      },
+      { "type": "FOOTER", "text": "A R Buildwel | PropertySerch.com" },
+      {
+        "type": "BUTTONS",
+        "buttons": [
+          { "type": "URL", "text": "Pay now", "url": "https://propertyserch.com/pay/{{1}}", "example": ["inv0142x"] }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ar_invoice_overdue",
+    "language": "en",
+    "category": "UTILITY",
+    "components": [
+      {
+        "type": "BODY",
+        "text": "Hello {{1}}, invoice {{2}} of {{3}} was due on {{4}} and is now overdue. Please clear it at the earliest so that your deal {{5}} can be closed.",
+        "example": { "body_text": [["Sanjay", "ARB/26-27/0142", "₹85,550", "22 Oct 2026", "DL-3307"]] }
+      },
+      { "type": "FOOTER", "text": "A R Buildwel | PropertySerch.com" },
+      {
+        "type": "BUTTONS",
+        "buttons": [
+          { "type": "URL", "text": "Pay now", "url": "https://propertyserch.com/pay/{{1}}", "example": ["inv0142x"] },
+          { "type": "QUICK_REPLY", "text": "Already paid" }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ar_invoice_overdue_internal",
+    "language": "en",
+    "category": "UTILITY",
+    "components": [
+      {
+        "type": "BODY",
+        "text": "Overdue: invoice {{1}} of {{2}} for deal {{3}} was due on {{4}}. Liable party: {{5}}. Please follow up.",
+        "example": { "body_text": [["ARB/26-27/0142", "₹85,550", "DL-3307", "22 Oct 2026", "Sanjay M."]] }
+      },
+      { "type": "FOOTER", "text": "A R Buildwel | PropertySerch.com" },
+      {
+        "type": "BUTTONS",
+        "buttons": [
+          { "type": "URL", "text": "Open invoice", "url": "https://propertyserch.com/crm/invoice/{{1}}", "example": ["inv0142x"] }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ar_payment_received",
+    "language": "en",
+    "category": "UTILITY",
+    "components": [
+      {
+        "type": "BODY",
+        "text": "Thank you {{1}}. We have received {{2}} against invoice {{3}} on {{4}}. Payment reference: {{5}}.\n\nThank you for choosing A R Buildwel.",
+        "example": { "body_text": [["Sanjay", "₹85,550", "ARB/26-27/0142", "20 Oct 2026", "pay_PQ81kz2"]] }
+      },
+      { "type": "FOOTER", "text": "A R Buildwel | PropertySerch.com" }
+    ]
+  },
+  {
+    "name": "ar_rep_new_lead",
+    "language": "en",
+    "category": "UTILITY",
+    "components": [
+      {
+        "type": "BODY",
+        "text": "New lead assigned: {{1}}.\n\nRequirement: {{2}}\nLocality: {{3}}\nLead score: {{4}}\nSource: {{5}}\n\nPlease contact the lead within {{6}} minutes.",
+        "example": { "body_text": [["Rahul K.", "Buy, 3 BHK, ₹1.2-1.5 Cr", "Dwarka", "HOT (92)", "99acres", "15"]] }
+      },
+      { "type": "FOOTER", "text": "A R Buildwel | PropertySerch.com" },
+      {
+        "type": "BUTTONS",
+        "buttons": [
+          { "type": "URL", "text": "Open in CRM", "url": "https://propertyserch.com/crm/lead/{{1}}", "example": ["LD-55120"] }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ar_lead_qualified_summary",
+    "language": "en",
+    "category": "UTILITY",
+    "components": [
+      {
+        "type": "BODY",
+        "text": "Lead {{1}} has been qualified via {{2}}.\n\nSummary: {{3}}\nUpdated score: {{4}}\n\nOpen the Customer 360 profile before you call.",
+        "example": { "body_text": [["Rahul K.", "AI voice call", "Buy, 3 BHK, Dwarka, ₹1.2-1.5 Cr, within 30 days, home loan, wants site visit", "HOT (95)"]] }
+      },
+      { "type": "FOOTER", "text": "A R Buildwel | PropertySerch.com" },
+      {
+        "type": "BUTTONS",
+        "buttons": [
+          { "type": "URL", "text": "Open Customer 360", "url": "https://propertyserch.com/crm/c360/{{1}}", "example": ["U-88123"] }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ar_tc_escalation",
+    "language": "en",
+    "category": "UTILITY",
+    "components": [
+      {
+        "type": "BODY",
+        "text": "Escalated lead: {{1}} ({{2}}) did not answer the AI qualification call. Please call within {{3}} minutes.",
+        "example": { "body_text": [["Rahul K.", "HOT", "30"]] }
+      },
+      { "type": "FOOTER", "text": "A R Buildwel | PropertySerch.com" },
+      {
+        "type": "BUTTONS",
+        "buttons": [
+          { "type": "URL", "text": "Open in CRM", "url": "https://propertyserch.com/crm/lead/{{1}}", "example": ["LD-55120"] }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ar_mandate_rep_ack",
+    "language": "en",
+    "category": "UTILITY",
+    "components": [
+      {
+        "type": "BODY",
+        "text": "New {{1}} assigned to you: {{2}}, {{3}}. Please acknowledge it in the CRM within {{4}} hours.",
+        "example": { "body_text": [["Exclusive Seller Mandate", "MND-1042", "2 BHK, Pitampura", "24"]] }
+      },
+      { "type": "FOOTER", "text": "A R Buildwel | PropertySerch.com" },
+      {
+        "type": "BUTTONS",
+        "buttons": [
+          { "type": "URL", "text": "Acknowledge", "url": "https://propertyserch.com/crm/mandate/{{1}}", "example": ["MND-1042"] }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ar_daily_market_digest",
+    "language": "en",
+    "category": "UTILITY",
+    "components": [
+      {
+        "type": "BODY",
+        "text": "Good morning {{1}}. Your market update for {{2}} on {{3}}:\n\nNew properties: {{4}}\nNew buyer requirements: {{5}}\nUrgent deals: {{6}}\n\nTap below for the full digest.",
+        "example": { "body_text": [["Vikas", "Rohini, Pitampura", "15 Oct", "14", "9", "2"]] }
+      },
+      { "type": "FOOTER", "text": "A R Buildwel | PropertySerch.com" },
+      {
+        "type": "BUTTONS",
+        "buttons": [
+          { "type": "URL", "text": "Open digest", "url": "https://propertyserch.com/digest/{{1}}", "example": ["2026-10-15-vk"] }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ar_digest_sponsored",
+    "language": "en",
+    "category": "MARKETING",
+    "headerMedia": "IMAGE",
+    "components": [
+      {
+        "type": "BODY",
+        "text": "Sponsored: {{1}}\n\n{{2}}\n\nTap below to know more.",
+        "example": { "body_text": [["Builder launch in Dwarka Expressway", "3 & 4 BHK homes from ₹1.8 Cr. Site visits open this weekend."]] }
+      },
+      { "type": "FOOTER", "text": "A R Buildwel | PropertySerch.com" },
+      {
+        "type": "BUTTONS",
+        "buttons": [
+          { "type": "URL", "text": "Know more", "url": "https://propertyserch.com/ad/{{1}}", "example": ["cmp-2210"] }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ar_wfh_task_assigned",
+    "language": "en",
+    "category": "UTILITY",
+    "components": [
+      {
+        "type": "BODY",
+        "text": "Task {{1}} is reserved for you for {{2}} hours.\n\nType: {{3}}\nLocality: {{4}}\nPayment: {{5}}\n\nOpen the task for steps and verification rules.",
+        "example": { "body_text": [["WT-4410", "48", "Buyer site visit", "Rohini Sector 9", "₹300"]] }
+      },
+      { "type": "FOOTER", "text": "A R Buildwel | PropertySerch.com" },
+      {
+        "type": "BUTTONS",
+        "buttons": [
+          { "type": "URL", "text": "Open task", "url": "https://propertyserch.com/wfh/task/{{1}}", "example": ["WT-4410"] }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ar_wfh_rep_confirm",
+    "language": "en",
+    "category": "UTILITY",
+    "components": [
+      {
+        "type": "BODY",
+        "text": "A WFH worker has submitted a buyer visit at {{1}} for task {{2}}. Please confirm or reject within {{3}} hours.",
+        "example": { "body_text": [["Rohini Sector 9", "WT-4410", "24"]] }
+      },
+      { "type": "FOOTER", "text": "A R Buildwel | PropertySerch.com" },
+      {
+        "type": "BUTTONS",
+        "buttons": [
+          { "type": "URL", "text": "Review visit", "url": "https://propertyserch.com/crm/wfh/{{1}}", "example": ["WT-4410"] }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ar_wfh_task_result",
+    "language": "en",
+    "category": "UTILITY",
+    "components": [
+      {
+        "type": "BODY",
+        "text": "Task {{1}} has been {{2}}. {{3}}\n\nThank you for working with A R Buildwel.",
+        "example": { "body_text": [["WT-4410", "verified", "₹300 has been added to your earnings."]] }
+      },
+      { "type": "FOOTER", "text": "A R Buildwel | PropertySerch.com" }
+    ]
+  },
+  {
+    "name": "ar_fee_consent_record",
+    "language": "en",
+    "category": "UTILITY",
+    "headerMedia": "DOCUMENT",
+    "components": [
+      {
+        "type": "BODY",
+        "text": "Hello {{1}}, attached is your Professional Fee Consent Record for {{2}}, verified on {{3}}. Please keep it for your records.",
+        "example": { "body_text": [["Sanjay", "MND-1042", "15 Oct 2026, 4:10 PM"]] }
+      },
+      { "type": "FOOTER", "text": "A R Buildwel | PropertySerch.com" }
+    ]
+  },
+  {
+    "name": "ar_benefit_delivered",
+    "language": "en",
+    "category": "UTILITY",
+    "headerMedia": "DOCUMENT",
+    "components": [
+      {
+        "type": "BODY",
+        "text": "Hello {{1}}, your {{2}} for {{3}} is ready. The report is attached.",
+        "example": { "body_text": [["Sanjay", "Free Valuation Report", "2 BHK, Pitampura"]] }
+      },
+      { "type": "FOOTER", "text": "A R Buildwel | PropertySerch.com" }
+    ]
+  }
+]
