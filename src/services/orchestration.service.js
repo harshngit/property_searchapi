@@ -226,13 +226,24 @@ async function createInvoice(deal, kind, party, triggerDate, c) {
     deal[col] = inv.id;
   }
   if (who.user_id) {
+    const kindLabel = kind === 'lease' ? 'Lease' : kind === 'instalment_1' ? 'Instalment 1' : 'Instalment 2';
     await notificationService.createNotification({
       userId: who.user_id,
       type: 'invoice',
       title: `Invoice ${number} - ${formatInr(inv.total_amount)}`,
-      message: `${kind === 'lease' ? 'Lease' : kind === 'instalment_1' ? 'Instalment 1' : 'Instalment 2'} professional fee for ${deal.property_title || 'your deal'}. Due by ${new Date(inv.due_date).toLocaleDateString('en-IN')}.`,
+      message: `${kindLabel} professional fee for ${deal.property_title || 'your deal'}. Due by ${new Date(inv.due_date).toLocaleDateString('en-IN')}.`,
       relatedEntityType: 'invoice',
       relatedEntityId: inv.id,
+      whatsappContent: {
+        vars: [
+          (who.full_name || '').split(' ')[0] || 'there',
+          number,
+          `Professional Fee - ${kindLabel}, ${deal.id}`,
+          formatInr(inv.total_amount),
+          new Date(inv.due_date).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }),
+        ],
+        buttonUrl: inv.id,
+      },
     });
   }
   await logEvent(deal.id, 'invoice', { detail: { invoiceId: inv.id, number, kind, party, total: Number(inv.total_amount) } });
@@ -406,6 +417,20 @@ async function recordInvoicePayment(user, invoiceId, { reference, waive = false,
   );
   await auditService.log({ actor: user, action: waive ? 'invoice.waived' : 'invoice.paid', entityType: 'invoice', entityId: invoiceId, after: { reference, note }, ...meta });
   await logEvent(inv.deal_id, 'invoice', { detail: { invoiceId, status: waive ? 'waived' : 'paid' }, actorId: user.id });
+  // ar_payment_received - waived invoices skip this (nothing was actually paid).
+  if (!waive && inv.liable_user_id) {
+    await notificationService.createNotification({
+      userId: inv.liable_user_id,
+      type: 'payment_received',
+      title: `Payment received - ${formatInr(inv.total_amount)}`,
+      message: `Against invoice ${inv.invoice_number}.`,
+      relatedEntityType: 'invoice',
+      relatedEntityId: invoiceId,
+      whatsappContent: {
+        vars: [(inv.liable_name || '').split(' ')[0] || 'there', formatInr(inv.total_amount), inv.invoice_number, new Date().toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }), reference || 'N/A'],
+      },
+    }).catch(() => {});
+  }
   return evaluate(inv.deal_id, { actor: user });
 }
 
@@ -527,12 +552,15 @@ async function invoiceSweep() {
   const r = await pool.query(
     `UPDATE invoices SET status = 'overdue', overdue_alerted_at = now()
      WHERE status = 'invoiced' AND due_date < CURRENT_DATE AND overdue_alerted_at IS NULL
-     RETURNING id, deal_id, invoice_number, liable_user_id, total_amount`
+     RETURNING id, deal_id, invoice_number, liable_user_id, liable_name, total_amount, due_date`
   );
   const admins = r.rows.length ? (await pool.query(`SELECT u.id FROM users u JOIN roles r ON r.id = u.role_id WHERE r.name IN ('admin', 'super_admin') AND u.status = 'active'`)).rows.map((x) => x.id) : [];
   for (const inv of r.rows) {
     const deal = (await pool.query(`SELECT d.broker_id, l.assigned_to FROM deals d LEFT JOIN leads l ON l.id = d.lead_id WHERE d.id = $1`, [inv.deal_id])).rows[0] || {};
-    for (const uid of new Set([inv.liable_user_id, deal.broker_id, deal.assigned_to, ...admins].filter(Boolean))) {
+    const dueDate = new Date(inv.due_date).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+    // ar_invoice_overdue to the debtor; ar_invoice_overdue_internal (different
+    // template, no "Pay now" button) to broker/rep/admins.
+    for (const uid of new Set([inv.liable_user_id].filter(Boolean))) {
       await notificationService.createNotification({
         userId: uid,
         type: 'invoice_overdue',
@@ -540,11 +568,54 @@ async function invoiceSweep() {
         message: `${formatInr(inv.total_amount)} is past its due date.`,
         relatedEntityType: 'invoice',
         relatedEntityId: inv.id,
+        whatsappContent: {
+          vars: [(inv.liable_name || '').split(' ')[0] || 'there', inv.invoice_number, formatInr(inv.total_amount), dueDate, inv.deal_id],
+          buttonUrl: inv.id,
+        },
+      });
+    }
+    for (const uid of new Set([deal.broker_id, deal.assigned_to, ...admins].filter(Boolean))) {
+      await notificationService.createNotification({
+        userId: uid,
+        type: 'invoice_overdue_internal',
+        title: `Invoice ${inv.invoice_number} overdue`,
+        message: `${formatInr(inv.total_amount)} is past its due date.`,
+        relatedEntityType: 'invoice',
+        relatedEntityId: inv.id,
+        whatsappContent: {
+          vars: [inv.invoice_number, formatInr(inv.total_amount), inv.deal_id, dueDate, inv.liable_name || 'the liable party'],
+          buttonUrl: inv.id,
+        },
       });
     }
     await logEvent(inv.deal_id, 'invoice_overdue', { detail: { invoiceId: inv.id } });
   }
-  return { overdue: r.rows.length };
+
+  // ar_invoice_due_reminder - 7 days before due (and again on the due date
+  // itself, per the doc - the 6-8 day window plus the separate overdue
+  // check above between them cover both without double-sending).
+  const soon = await pool.query(
+    `UPDATE invoices SET due_soon_alerted_at = now()
+     WHERE status = 'invoiced' AND due_date BETWEEN CURRENT_DATE AND CURRENT_DATE + 7 AND due_soon_alerted_at IS NULL
+     RETURNING id, deal_id, invoice_number, liable_user_id, liable_name, total_amount, due_date`
+  );
+  for (const inv of soon.rows) {
+    if (!inv.liable_user_id) continue;
+    await notificationService.createNotification({
+      userId: inv.liable_user_id,
+      type: 'invoice_due_soon',
+      title: `Invoice ${inv.invoice_number} due soon`,
+      message: `${formatInr(inv.total_amount)} is due on ${new Date(inv.due_date).toLocaleDateString('en-IN')}.`,
+      relatedEntityType: 'invoice',
+      relatedEntityId: inv.id,
+      whatsappContent: {
+        vars: [(inv.liable_name || '').split(' ')[0] || 'there', inv.invoice_number, formatInr(inv.total_amount), new Date(inv.due_date).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })],
+        buttonUrl: inv.id,
+      },
+    }).catch(() => {});
+  }
+
+  return { overdue: r.rows.length, dueSoon: soon.rows.length };
 }
 
 async function healthSweep() {

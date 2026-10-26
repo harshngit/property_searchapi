@@ -83,10 +83,10 @@ async function staffIds(roles = STAFF) {
   ).rows.map((r) => r.id);
 }
 
-async function notify(userIds, { type, title, message, id }) {
+async function notify(userIds, { type, title, message, id, whatsappContent }) {
   for (const userId of new Set(userIds.filter(Boolean))) {
     await notificationService
-      .createNotification({ userId, type, title, message, relatedEntityType: 'mandate', relatedEntityId: id })
+      .createNotification({ userId, type, title, message, relatedEntityType: 'mandate', relatedEntityId: id, whatsappContent })
       .catch(() => {});
   }
 }
@@ -265,11 +265,14 @@ async function createForPost(client, { user, customerId, kind, targetId, mandate
 // After commit: tell A R staff an Exclusive Mandate is waiting.
 async function afterCreate(mandate, label) {
   if (!isExclusive(mandate.mandate_type)) return;
+  const c = await cfg();
+  const typeLabel = `Exclusive ${isSeller(mandate.mandate_type) ? 'Seller' : 'Buyer'} Mandate`;
   await notify(await staffIds(), {
     type: 'mandate_pending_ack',
     title: `Exclusive Mandate awaiting acknowledgement (${mandate.mandate_number})`,
     message: `${isSeller(mandate.mandate_type) ? 'Seller' : 'Buyer'} mandate on ${label}. Acknowledge to activate benefits.`,
     id: mandate.id,
+    whatsappContent: { vars: [typeLabel, mandate.mandate_number, label, String(c.sla.exclusive)], buttonUrl: mandate.id },
   });
 }
 
@@ -679,9 +682,15 @@ async function updateBenefits(id, user, data, meta = {}) {
   const done = Object.entries(changed).filter(([, v]) => ['completed', 'report_uploaded', 'utilised'].includes(v));
   if (done.length) {
     const label = { valuation_status: 'Valuation', due_diligence_status: 'Legal due diligence', deed_writer_waiver_status: 'Deed writer waiver' };
+    const whatsappLabel = { valuation_status: 'Free Valuation Report', due_diligence_status: 'Free Due Diligence Report', deed_writer_waiver_status: 'Deed Writer waiver' };
+    const [holder, listing] = await Promise.all([
+      pool.query('SELECT full_name FROM users WHERE id = $1', [m.user_id]).then((r) => r.rows[0]),
+      m.listing_id ? pool.query('SELECT title FROM properties WHERE id = $1', [m.listing_id]).then((r) => r.rows[0]) : null,
+    ]);
     await notify([m.user_id], {
       type: 'mandate_benefit', title: `Mandate benefit delivered: ${done.map(([k]) => label[k]).join(', ')}`,
       message: `${done.map(([k, v]) => `${label[k]} - ${v.replace('_', ' ')}`).join('; ')}`, id,
+      whatsappContent: { vars: [(holder?.full_name || '').split(' ')[0] || 'there', whatsappLabel[done[0][0]] || label[done[0][0]], listing?.title || 'your listing'] },
     });
   }
   return get(id, user);
@@ -716,10 +725,17 @@ async function sweep() {
     const marks = c.warnDays.filter((d) => daysLeft <= d);
     await pool.query(`UPDATE mandates SET expiry_warnings_sent = $2 WHERE id = $1`, [m.id, JSON.stringify([...new Set([...sent, ...marks])])]);
     await logEvent(m.id, 'expiry_warning', { detail: { days_left: daysLeft, step } });
+    const [holder, listing] = await Promise.all([
+      pool.query('SELECT full_name FROM users WHERE id = $1', [m.user_id]).then((r) => r.rows[0]),
+      m.listing_id ? pool.query('SELECT title FROM properties WHERE id = $1', [m.listing_id]).then((r) => r.rows[0]) : null,
+    ]);
     await notify([m.user_id, m.assigned_rep_id], {
       type: `mandate_expiry_${step <= 1 ? '1d' : step <= 7 ? '7d' : '30d'}`,
       title: `Mandate ${m.mandate_number} expires in ${daysLeft} day${daysLeft === 1 ? '' : 's'}`,
       message: `Ends on ${new Date(m.mandate_end_date).toLocaleDateString('en-IN')}.`, id: m.id,
+      whatsappContent: {
+        vars: [(holder?.full_name || '').split(' ')[0] || 'there', m.mandate_number, listing?.title || 'your mandate', String(daysLeft), new Date(m.mandate_end_date).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })],
+      },
     });
     warned += 1;
   }

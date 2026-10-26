@@ -391,6 +391,20 @@ async function createOtp(identifier, purpose, userId = null) {
     // environment - fall through silently so local/dev testing keeps
     // working off the debug OTP echo in auth.controller.js, with no MSG91
     // account required.
+
+    // ar_otp_verification - WhatsApp in parallel with SMS, never instead of
+    // it (Authentication category, Meta-fixed wording). Best-effort only:
+    // SMS above is already the OTP's real delivery channel.
+    if (process.env.WHATSAPP_ACCESS_TOKEN) {
+      const digits = identifier.replace(/\D/g, '').slice(-10);
+      if (digits.length === 10) {
+        require('./metaWhatsapp.service').sendTemplate({
+          to: `91${digits}`,
+          templateName: process.env.WHATSAPP_OTP_TEMPLATE_NAME || 'ar_otp_verification',
+          variables: [otpCode],
+        }).catch((err) => console.error('[auth] WhatsApp OTP send failed:', err.message));
+      }
+    }
   }
   // NOTE: email identifiers aren't delivered yet - see the SMTP TODO above.
 

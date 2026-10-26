@@ -158,7 +158,8 @@ function render(content, areas) {
   }
   if (content.urgentDeals.length) lines.push(`Urgent: ${content.urgentDeals.slice(0, 2).map((d) => `${d.title} (${d.where})${d.auctionDate ? ` - auction ${new Date(d.auctionDate).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', timeZone: 'Asia/Kolkata' })}` : ''}`).join('; ')}`);
   if (content.marketAlerts.length) lines.push(`Market: ${content.marketAlerts.slice(0, 2).map((a) => `${a.where} ${a.changePercent > 0 ? 'up' : 'down'} ${Math.abs(a.changePercent)}% (Rs ${a.ratePerSqft.toLocaleString('en-IN')}/sq ft)`).join('; ')}`);
-  if (content.sponsored) lines.push(content.sponsored);
+  // ar_digest_sponsored goes out as its own follow-up WhatsApp message (see
+  // dispatch()), not appended here, so it isn't duplicated across channels.
   return { title: `Today in ${place}: ${parts.join(', ')}`.slice(0, 200), message: lines.join('\n') };
 }
 
@@ -216,8 +217,21 @@ async function dispatch({ now = new Date(), force = false, userId } = {}) {
     // Claim it first, so two ticks never send the same digest twice.
     if (!(await pool.query('UPDATE market_digests SET sent_at = now() WHERE id = $1 AND sent_at IS NULL', [d.id])).rowCount) continue;
     const msg = render(d.content, d.areas);
-    await notificationService.createNotification({ userId: d.user_id, type: 'market_digest', title: msg.title, message: msg.message, relatedEntityType: 'market_digest', relatedEntityId: d.id, scheduled: true });
+    const areaNames = [...new Set((d.areas || []).map((a) => a.locality || a.city))];
+    const place = areaNames.slice(0, 2).join(', ') + (areaNames.length > 2 ? ` +${areaNames.length - 2}` : '');
+    await notificationService.createNotification({
+      userId: d.user_id, type: 'market_digest', title: msg.title, message: msg.message,
+      relatedEntityType: 'market_digest', relatedEntityId: d.id, scheduled: true,
+      whatsappContent: { vars: [place || 'your areas', String(d.item_count), msg.message.slice(0, 300)], buttonUrl: d.id },
+    });
     sent += 1;
+    if (d.content.sponsored) {
+      await notificationService.createNotification({
+        userId: d.user_id, type: 'digest_sponsored', title: 'Sponsored listing', message: d.content.sponsored,
+        relatedEntityType: 'market_digest', relatedEntityId: d.id, scheduled: true,
+        whatsappContent: { vars: [d.content.sponsored] },
+      }).catch((err) => console.error('[market digest] sponsored send failed:', err.message));
+    }
   }
   return { enabled: true, open: true, date: win.date, sent };
 }

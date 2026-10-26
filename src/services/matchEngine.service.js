@@ -356,6 +356,7 @@ async function notifyHot(req, listing, row) {
   if (!row.notified_at) {
     const buyer = await requirementOwner(req);
     if (buyer && buyer !== listing.created_by) {
+      const buyerName = (await pool.query('SELECT full_name FROM users WHERE id = $1', [buyer])).rows[0]?.full_name?.split(' ')[0] || 'there';
       await notificationService.createNotification({
         userId: buyer,
         type: 'match_alert',
@@ -363,6 +364,10 @@ async function notifyHot(req, listing, row) {
         message: `A listing in ${[listing.locality, listing.city].filter(Boolean).join(', ')} matches your requirement - ${row.score}% match.`,
         relatedEntityType: 'property',
         relatedEntityId: listing.id,
+        whatsappContent: {
+          vars: [buyerName, `${row.score}%`, listing.property_type || 'Property', [listing.locality, listing.city].filter(Boolean).join(', '), formatInr(listing.price_value || listing.price)],
+          buttonUrl: listing.id,
+        },
       });
     }
     await pool.query('UPDATE requirement_matches SET notified_at = now() WHERE id = $1', [row.id]);
@@ -953,15 +958,29 @@ async function sendDigests() {
   for (const r of rows.rows) (byUser.get(r.user_id) || byUser.set(r.user_id, []).get(r.user_id)).push(r);
   for (const [userId, list] of byUser) {
     const top = list.sort((a, b) => b.score - a.score).slice(0, 3);
+    const summary = top.map((t) => `${t.title} (${[t.locality, t.city].filter(Boolean).join(', ')}) - ${t.score}%`).join(' · ');
     await notificationService.createNotification({
       userId,
       type: 'match_digest',
       title: `${list.length} new Warm match${list.length === 1 ? '' : 'es'} for you`,
-      // Module 17: one sponsored line per digest, when a campaign has booked the slot.
-      message: [top.map((t) => `${t.title} (${[t.locality, t.city].filter(Boolean).join(', ')}) - ${t.score}%`).join(' · '), await require('./advertising.service').digestSponsor(userId)].filter(Boolean).join('\n'),
+      message: summary,
       relatedEntityType: 'matches',
       relatedEntityId: null,
     });
+    // ar_digest_sponsored - sent as its own follow-up message, same as the
+    // daily market digest, when a campaign has booked the slot.
+    const sponsored = await require('./advertising.service').digestSponsor(userId);
+    if (sponsored) {
+      await notificationService.createNotification({
+        userId,
+        type: 'digest_sponsored',
+        title: 'Sponsored listing',
+        message: sponsored,
+        relatedEntityType: 'matches',
+        relatedEntityId: null,
+        whatsappContent: { vars: [sponsored] },
+      }).catch((err) => console.error('[matching] sponsored digest send failed:', err.message));
+    }
     await pool.query('UPDATE requirement_matches SET digest_sent_at = now() WHERE id = ANY($1::uuid[])', [list.map((l) => l.id)]);
   }
   return { users: byUser.size, matches: rows.rows.length };

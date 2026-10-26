@@ -20,6 +20,7 @@ function badRequest(message) {
 // used to log an activity (e.g. a negotiation round) without changing stage.
 // Contract pipeline (Lead -> ... -> Closure) - see dealStages.js.
 const STAGE_TRANSITIONS = require('./dealStages').TRANSITIONS;
+const STAGE_LABEL = require('./dealStages').LABELS;
 
 const TERMINAL_STAGES = ['closed_won', 'closed_lost'];
 
@@ -251,6 +252,29 @@ async function changeStage(id, toStage, user, notes, { orchestrated = false, ove
     await logStageChange(client, id, fromStage, toStage, user.id, notes);
 
     await client.query('COMMIT');
+    // ar_deal_stage_update - tell the customer (if they have a login) that
+    // their deal moved, same pattern as notifyCustomerOfVisit above.
+    if (toStage !== fromStage) {
+      pool.query(
+        `SELECT c.user_id, c.full_name AS customer_name, p.title FROM deals d
+         LEFT JOIN customers c ON c.id = d.customer_id
+         LEFT JOIN properties p ON p.id = d.property_id
+         WHERE d.id = $1`,
+        [id]
+      ).then(async (r) => {
+        const row = r.rows[0];
+        if (!row?.user_id) return;
+        await notificationService.createNotification({
+          userId: row.user_id,
+          type: 'deal_stage_update',
+          title: `Your deal moved to ${STAGE_LABEL[toStage] || toStage}`,
+          message: `${row.title ? `For ${row.title}. ` : ''}Your A R Buildwel representative will share the next steps.`,
+          relatedEntityType: 'deal',
+          relatedEntityId: id,
+          whatsappContent: { vars: [(row.customer_name || '').split(' ')[0] || 'there', id, row.title || 'your deal', STAGE_LABEL[toStage] || toStage] },
+        });
+      }).catch((err) => console.error(`[deal] stage notification failed for deal ${id}:`, err.message));
+    }
     if (!orchestrated && !closesDeal) orchestration.safeEvaluate(id);
     // The enquiry this deal came from follows it to Won / Lost.
     if (closesDeal && toStage !== fromStage && deal.lead_id) {
@@ -298,9 +322,11 @@ async function changeStage(id, toStage, user, notes, { orchestrated = false, ove
 async function notifyCustomerOfVisit(dealId, visit, kind) {
   try {
     const info = await pool.query(
-      `SELECT c.user_id, p.title FROM deals d
+      `SELECT c.user_id, c.full_name AS customer_name, p.title, rep.full_name AS rep_name
+       FROM deals d
        JOIN customers c ON c.id = d.customer_id
        LEFT JOIN properties p ON p.id = d.property_id
+       LEFT JOIN users rep ON rep.id = d.assigned_rep_id
        WHERE d.id = $1`,
       [dealId]
     );
@@ -324,6 +350,11 @@ async function notifyCustomerOfVisit(dealId, visit, kind) {
       message: text[1],
       relatedEntityType: 'deal',
       relatedEntityId: dealId,
+      // ar_site_visit_confirmed only covers scheduled/rescheduled - cancelled
+      // and completed fall back to the generic template, no specific one exists.
+      whatsappContent: ['scheduled', 'rescheduled'].includes(kind)
+        ? { vars: [(row.customer_name || '').split(' ')[0] || 'there', row.title || 'your enquiry', when, row.rep_name || 'your representative'] }
+        : undefined,
     });
   } catch (err) {
     console.error(`Visit notification failed for deal ${dealId}:`, err.message);
@@ -382,6 +413,59 @@ async function updateSiteVisit(dealId, visitId, data) {
   return result.rows[0];
 }
 
+// ar_site_visit_reminder - 2 hours before a scheduled visit, once. Checked
+// on a tight interval since the window is narrow; reminder_sent_at guards
+// against double-sends across ticks.
+async function siteVisitReminderSweep(now = new Date()) {
+  const due = (await pool.query(
+    `UPDATE site_visits SET reminder_sent_at = now()
+     WHERE status = 'scheduled' AND reminder_sent_at IS NULL
+       AND scheduled_at BETWEEN $1 AND $1::timestamptz + interval '2 hours'
+     RETURNING id, deal_id, scheduled_at`,
+    [now]
+  )).rows;
+  for (const visit of due) {
+    const info = (await pool.query(
+      `SELECT c.user_id, c.full_name AS customer_name, p.title, p.locality, p.city, rep.full_name AS rep_name, rep.mobile AS rep_mobile
+       FROM deals d JOIN customers c ON c.id = d.customer_id
+       LEFT JOIN properties p ON p.id = d.property_id
+       LEFT JOIN users rep ON rep.id = d.assigned_rep_id
+       WHERE d.id = $1`,
+      [visit.deal_id]
+    )).rows[0];
+    if (!info?.user_id) continue;
+    const when = new Date(visit.scheduled_at).toLocaleString('en-IN', {
+      timeZone: 'Asia/Kolkata', hour: 'numeric', minute: '2-digit',
+    });
+    await notificationService.createNotification({
+      userId: info.user_id,
+      type: 'site_visit_reminder',
+      title: 'Site visit in 2 hours',
+      message: `Your visit${info.title ? ` for ${info.title}` : ''} is at ${when}.`,
+      relatedEntityType: 'deal',
+      relatedEntityId: visit.deal_id,
+      whatsappContent: {
+        vars: [
+          (info.customer_name || '').split(' ')[0] || 'there',
+          info.title || 'your enquiry',
+          [info.locality, info.city].filter(Boolean).join(', ') || 'the location shared with you',
+          when,
+          info.rep_name || 'your representative',
+          info.rep_mobile || '',
+        ],
+      },
+    }).catch((err) => console.error(`Site visit reminder failed for deal ${visit.deal_id}:`, err.message));
+  }
+  return { sent: due.length };
+}
+
+let timer = null;
+function startScheduler() {
+  if (timer) return;
+  timer = setInterval(() => siteVisitReminderSweep().catch((err) => console.error('[deal] site visit reminder sweep failed:', err.message)), 10 * 60 * 1000);
+  timer.unref?.();
+}
+
 // Logs an offer/negotiation round as a same-stage deal_stage_history entry
 // (does not change the deal's stage - use PUT /:id/stage for that).
 async function logNegotiation(dealId, { offerAmount, notes }, user) {
@@ -419,4 +503,6 @@ module.exports = {
   recordBooking,
   closeDeal,
   STAGE_TRANSITIONS,
+  siteVisitReminderSweep,
+  startScheduler,
 };

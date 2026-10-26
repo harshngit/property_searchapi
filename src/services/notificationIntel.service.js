@@ -89,7 +89,7 @@ function categorySql(category, params) {
 // ------------------------------------------------------------ settings
 
 async function settings() {
-  const [routing, defaults, quiet, cap, burst, engagement, retry, weeklyDay, template] = await Promise.all([
+  const [routing, defaults, quiet, cap, burst, engagement, retry, weeklyDay, template, templates] = await Promise.all([
     configService.getConfig('notifications.routing', null),
     configService.getConfig('notifications.default_prefs', null),
     configService.getConfig('notifications.quiet_default', null),
@@ -99,6 +99,9 @@ async function settings() {
     configService.getConfig('notifications.retry_seconds', null),
     configService.getConfig('notifications.weekly_day', 1),
     configService.getConfig('notifications.whatsapp_template', 'ps_notification'),
+    // Per-type template registry (client-approved spec) - see migration 085.
+    // `_default` falls back to the single generic template above.
+    configService.getConfig('notifications.whatsapp_templates', null),
   ]);
   const hhmm = (v) => (/^([01]\d|2[0-3]):[0-5]\d$/.test(String(v || '')) ? String(v) : null);
   return {
@@ -111,7 +114,13 @@ async function settings() {
     retry: Array.isArray(retry) && retry.length ? retry.map(Number).filter((s) => s > 0) : [10, 60, 300],
     weeklyDay: Number(weeklyDay) >= 0 && Number(weeklyDay) <= 6 ? Number(weeklyDay) : 1,
     template: String(template || 'ps_notification'),
+    templates: templates && typeof templates === 'object' ? templates : {},
   };
+}
+
+// Which approved WhatsApp template name to use for this notification type.
+function templateFor(cfg, type) {
+  return cfg.templates[type] || cfg.templates._default || cfg.template;
 }
 
 // ------------------------------------------------------------ channels
@@ -162,7 +171,15 @@ async function send(channel, ctx, msg, cfg) {
     return;
   }
   if (channel === 'whatsapp') {
-    await require('./metaWhatsapp.service').sendTemplate({ to: mobileOf(ctx.mobile), templateName: cfg.template, variables: [title, body || title] });
+    const content = msg.whatsappContent || {};
+    await require('./metaWhatsapp.service').sendTemplate({
+      to: mobileOf(ctx.mobile),
+      templateName: templateFor(cfg, msg.type),
+      variables: Array.isArray(content.vars) ? content.vars : [title, body || title],
+      buttonUrlSuffix: content.buttonUrl || undefined,
+      headerDocument: content.headerDocument || undefined,
+      headerImage: content.headerImage || undefined,
+    });
   } else if (channel === 'sms') {
     await msg91('https://control.msg91.com/api/v5/flow/', { template_id: process.env.MSG91_NOTIFY_TEMPLATE_ID, short_url: '0', recipients: [{ mobiles: mobileOf(ctx.mobile), TITLE: title.slice(0, 60), BODY: body.slice(0, 100) }] });
   } else if (channel === 'email') {
@@ -388,14 +405,14 @@ async function dispatch(n, { alreadySent = [], now = new Date(), scheduled = fal
   for (const ch of usable) {
     // A row being sent right now is leased for 30 seconds so the queue worker leaves it alone.
     rows.push((await pool.query(
-      `INSERT INTO notification_deliveries (notification_id, user_id, channel, type, priority, title, body, status, reason, next_attempt_at, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
-      [n.id, n.user_id, ch, n.type, n.priority, n.title, n.message || null, hold ? 'held' : 'queued', reason, hold || new Date(Date.now() + 30000), now]
+      `INSERT INTO notification_deliveries (notification_id, user_id, channel, type, priority, title, body, status, reason, next_attempt_at, created_at, whatsapp_content)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
+      [n.id, n.user_id, ch, n.type, n.priority, n.title, n.message || null, hold ? 'held' : 'queued', reason, hold || new Date(Date.now() + 30000), now, n.whatsapp_content ? JSON.stringify(n.whatsapp_content) : null]
     )).rows[0]);
   }
   if (hold) return { route: 'held', reason, until: hold, channels: usable };
   const outcome = [];
-  for (const row of rows) outcome.push({ channel: row.channel, ...(await attempt([row], ctx, { title: n.title, body: n.message, type: n.type, priority: n.priority }, cfg)) });
+  for (const row of rows) outcome.push({ channel: row.channel, ...(await attempt([row], ctx, { title: n.title, body: n.message, type: n.type, priority: n.priority, whatsappContent: n.whatsapp_content }, cfg)) });
   return { route: 'instant', channels: usable, outcome };
 }
 
@@ -432,8 +449,11 @@ async function processQueue({ now = new Date(), limit = 300, userId } = {}) {
     for (const rows of groups.values()) {
       const ctx = await context(rows[0].user_id);
       if (!ctx) continue;
-      let msg = { title: rows[0].title, body: rows[0].body, type: rows[0].type, priority: rows[0].priority };
+      let msg = { title: rows[0].title, body: rows[0].body, type: rows[0].type, priority: rows[0].priority, whatsappContent: rows[0].whatsapp_content };
       if (rows.length > 1) {
+        // Several held notifications combined into one summary message -
+        // no single structured template applies, so this intentionally
+        // drops back to the generic [title, body] template.
         batches += 1;
         const titles = rows.map((r) => r.title);
         msg = { title: `${rows.length} updates from PropertySerch`, body: titles.slice(0, 5).join(' • ') + (titles.length > 5 ? ` • and ${titles.length - 5} more` : ''), type: 'notification_batch', priority: 'normal' };

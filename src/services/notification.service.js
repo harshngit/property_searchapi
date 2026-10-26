@@ -60,14 +60,14 @@ async function listNotifications(userId, filters, page, limit) {
 // owns the notifications table.
 // `priority` overrides the priority worked out from the type; `alreadySent`
 // names channels the caller has delivered on itself (so they are not repeated).
-async function createNotification({ userId, tenantId, type, title, message, relatedEntityType, relatedEntityId, priority, alreadySent, scheduled }, client = pool) {
+async function createNotification({ userId, tenantId, type, title, message, relatedEntityType, relatedEntityId, priority, alreadySent, scheduled, whatsappContent }, client = pool) {
   const intel = require('./notificationIntel.service');
   const kind = intel.classify({ type, title, priority });
   const result = await client.query(
-    `INSERT INTO notifications (user_id, tenant_id, type, title, message, related_entity_type, related_entity_id, category, priority, persistent)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+    `INSERT INTO notifications (user_id, tenant_id, type, title, message, related_entity_type, related_entity_id, category, priority, persistent, whatsapp_content)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
      RETURNING *`,
-    [userId, tenantId || null, type, String(title || '').slice(0, 200), message || null, relatedEntityType || null, relatedEntityId || null, kind.category, kind.priority, kind.persistent && !!relatedEntityId]
+    [userId, tenantId || null, type, String(title || '').slice(0, 200), message || null, relatedEntityType || null, relatedEntityId || null, kind.category, kind.priority, kind.persistent && !!relatedEntityId, whatsappContent ? JSON.stringify(whatsappContent) : null]
   );
   // Module 43: decide what also leaves the app (push, WhatsApp, SMS, email), now or in a digest.
   intel.onCreated(result.rows[0], { alreadySent: alreadySent || [], scheduled: scheduled === true });

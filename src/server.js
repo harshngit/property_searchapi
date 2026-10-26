@@ -39,6 +39,10 @@ server.listen(PORT, () => {
   }
   // Module 46: mandate expiry reminders (30 / 7 / 1 days) and expiry.
   if (process.env.MANDATE_JOBS_DISABLED !== 'true') require('./services/mandate.service').startScheduler();
+  // ar_site_visit_reminder: 2 hours before a scheduled visit (every 10 minutes).
+  if (process.env.DEAL_JOBS_DISABLED !== 'true') require('./services/deal.service').startScheduler();
+  // ar_lead_qualification reminder + ar_tc_escalation on no-answer (hourly).
+  if (process.env.LEAD_QUALIFICATION_JOBS_DISABLED !== 'true') require('./services/leadQualification.service').startScheduler();
   // Sec. 34: assignment cascade - missed windows, departed reps, response SLA.
   if (process.env.ASSIGNMENT_JOBS_DISABLED !== 'true') require('./services/assignment.service').startScheduler();
   // Engine 2: pull reconciliation for every push+pull / pull lead source.

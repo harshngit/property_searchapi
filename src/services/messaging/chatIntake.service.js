@@ -295,6 +295,78 @@ async function notifyStaff(sub) {
 const whereContact = (c) =>
   c.channel === 'telegram' ? ['telegram_chat_id = $1', c.chatId] : c.waUserId ? ['wa_user_id = $1', c.waUserId] : ['contact_phone = $1', c.phone];
 
+// ------------------------------------------------------------- mandate interest (WhatsApp only)
+//
+// ar_fee_consent_request -> ar_mandate_offer -> ar_mandate_complete_link.
+// A WhatsApp seller/rent-out poster here has no app account, so this never
+// touches mandate.service.js's OTP/pricing pipeline (account-based by
+// design) - it only records what the seller chose on their submission; the
+// real OTP consent + mandate row is created when staff review the listing
+// through the existing REST flow.
+const metaWhatsapp = () => require('../metaWhatsapp.service');
+const toInternational = (phone) => require('../whatsapp.service').toInternationalMobile(phone);
+
+function waContactFor(sub) {
+  return sub.contact_phone ? { to: toInternational(sub.contact_phone) } : { recipient: sub.wa_user_id };
+}
+
+async function latestConsentSubmission(contact, extraSql) {
+  const [cond, value] = whereContact(contact);
+  if (value == null) return null;
+  return (
+    await pool.query(
+      `SELECT * FROM chat_listing_submissions WHERE channel = $2 AND ${cond} AND status = 'pending_review' ${extraSql} ORDER BY created_at DESC LIMIT 1`,
+      [value, contact.channel]
+    )
+  ).rows[0] || null;
+}
+
+async function notifyStaffText(sub, title, message) {
+  const users = await pool.query(`SELECT u.id FROM users u JOIN roles r ON r.id = u.role_id WHERE r.name IN ('admin', 'super_admin') AND u.status = 'active'`);
+  for (const u of users.rows) {
+    await notificationService.createNotification({ userId: u.id, type: 'chat_listing', title, message, relatedEntityType: 'chat_listing', relatedEntityId: sub.id }).catch(() => {});
+  }
+}
+
+async function requestFeeConsent(sub) {
+  if (sub.channel !== 'whatsapp' || !['sell', 'rent_out'].includes(sub.intent)) return;
+  if (!sub.contact_phone && !sub.wa_user_id) return;
+  await metaWhatsapp().sendTemplate({ ...waContactFor(sub), templateName: 'ar_fee_consent_request', variables: [sub.contact_name || 'there', sub.reference] });
+  await pool.query('UPDATE chat_listing_submissions SET fee_consent_requested_at = now() WHERE id = $1', [sub.id]);
+}
+
+async function handleFeeConsentReply(contact, buttonId) {
+  const sub = await latestConsentSubmission(contact, 'AND fee_consent_requested_at IS NOT NULL AND fee_consent_response IS NULL');
+  if (!sub) return false;
+  const response = buttonId === 'fc_yes' ? 'yes' : 'agent';
+  await pool.query('UPDATE chat_listing_submissions SET fee_consent_response = $2 WHERE id = $1', [sub.id, response]);
+  if (response === 'agent') {
+    await send(contact, 'No problem - a representative will call you shortly to go through the professional fee terms.');
+    await notifyStaffText(sub, 'Seller wants to discuss the fee terms', `${sub.reference}: the poster asked to talk to a representative before agreeing to the professional fee.`);
+    return true;
+  }
+  await metaWhatsapp().sendTemplate({ ...waContactFor(sub), templateName: 'ar_mandate_offer', variables: [sub.contact_name || 'there'] });
+  return true;
+}
+
+async function handleMandateOfferReply(contact, buttonId) {
+  const sub = await latestConsentSubmission(contact, "AND fee_consent_response = 'yes' AND mandate_type_requested IS NULL");
+  if (!sub) return false;
+  const mandateType = buttonId === 'mo_exclusive' ? 'exclusive' : 'standard';
+  await pool.query('UPDATE chat_listing_submissions SET mandate_type_requested = $2 WHERE id = $1', [sub.id, mandateType]);
+  await metaWhatsapp().sendTemplate({
+    ...waContactFor(sub),
+    templateName: 'ar_mandate_complete_link',
+    variables: [sub.contact_name || 'there', mandateType === 'exclusive' ? 'Exclusive Mandate' : 'Standard listing'],
+  });
+  await notifyStaffText(
+    sub,
+    `Seller chose ${mandateType === 'exclusive' ? 'an Exclusive Mandate' : 'Standard listing'}`,
+    `${sub.reference}: agreed to the professional fee and requested ${mandateType === 'exclusive' ? 'an Exclusive Mandate' : 'a Standard listing'}. Complete the OTP consent and mandate when you review this listing.`
+  );
+  return true;
+}
+
 async function latestOpenSubmission(contact) {
   const minutes = Number(await configService.getConfig('chat_intake.photo_window_minutes', 60)) || 60;
   const [cond, value] = whereContact(contact);
@@ -502,6 +574,7 @@ async function handleMessage(contact, { text = '', photos = [], reply = true, as
   if (LISTING_INTENTS.includes(r.intent)) {
     const sub = await createSubmission(contact, r, body, photos);
     await say(listingReply(sub));
+    if (sub.intent !== 'institutional_sale') await requestFeeConsent(sub).catch((err) => console.error(`[chat-intake] fee consent request failed for ${sub.id}:`, err.message));
     if (!sub.contact_phone && contact.channel === 'telegram') {
       await log(contact, body, photos.length, r, 'needs_phone', { submissionId: sub.id });
       return { handled: true, routedTo: 'listing', intent: r.intent, submissionId: sub.id, reference: sub.reference, needsPhone: true };
@@ -705,4 +778,6 @@ module.exports = {
   intakeLog,
   LISTING_INTENTS,
   REQUIREMENT_INTENTS,
+  handleFeeConsentReply,
+  handleMandateOfferReply,
 };

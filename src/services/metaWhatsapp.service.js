@@ -60,10 +60,27 @@ async function sendText({ to, recipient, body }) {
 // `variables` (plain strings) map 1:1 to the template's {{1}}, {{2}}, ...
 // body placeholders. The template itself must already be approved in Meta
 // Business Manager under this exact name.
-async function sendTemplate({ to, recipient, templateName, languageCode, variables = [] }) {
-  const components = variables.length
-    ? [{ type: 'body', parameters: variables.map((value) => ({ type: 'text', text: String(value) })) }]
-    : undefined;
+//
+// `buttonUrlSuffix`: for a template whose one button is "Visit website" with
+// a dynamic URL (e.g. https://propertyserch.com/p/{{1}}), the value to fill
+// in for that button's own {{1}} - a separate placeholder namespace from the
+// body's, per Meta's template format.
+// `headerDocument`/`headerImage`: for a template with a document (PDF) or
+// image header - `{ link, filename? }`. Exactly one should be set, matching
+// however the template itself was approved.
+async function sendTemplate({ to, recipient, templateName, languageCode, variables = [], buttonUrlSuffix, headerDocument, headerImage }) {
+  const components = [];
+  if (headerDocument) {
+    components.push({ type: 'header', parameters: [{ type: 'document', document: { link: headerDocument.link, filename: headerDocument.filename || undefined } }] });
+  } else if (headerImage) {
+    components.push({ type: 'header', parameters: [{ type: 'image', image: { link: headerImage.link } }] });
+  }
+  if (variables.length) {
+    components.push({ type: 'body', parameters: variables.map((value) => ({ type: 'text', text: String(value) })) });
+  }
+  if (buttonUrlSuffix) {
+    components.push({ type: 'button', sub_type: 'url', index: '0', parameters: [{ type: 'text', text: String(buttonUrlSuffix) }] });
+  }
 
   return callGraphApi(
     addRecipient(
@@ -72,7 +89,7 @@ async function sendTemplate({ to, recipient, templateName, languageCode, variabl
         template: {
           name: templateName,
           language: { code: languageCode || process.env.WHATSAPP_TEMPLATE_LANGUAGE || 'en_US' },
-          ...(components ? { components } : {}),
+          ...(components.length ? { components } : {}),
         },
       },
       { to, recipient }

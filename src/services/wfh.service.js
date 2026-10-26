@@ -286,7 +286,18 @@ async function accept(user, taskId, meta = {}) {
     )).rows[0];
     await client.query(`UPDATE wfh_tasks SET status = 'locked' WHERE id = $1`, [taskId]);
     await client.query('COMMIT');
-    await notificationService.createNotification({ userId: user.id, type: 'wfh', title: `Task accepted: ${t.title}`, message: `Reserved for you until ${new Date(a.lock_expires_at).toLocaleString('en-IN')}. Open it for what to do and how it is verified.`, relatedEntityType: 'wfh_assignment', relatedEntityId: a.id }).catch(() => {});
+    await notificationService.createNotification({
+      userId: user.id,
+      type: 'wfh_task_assigned',
+      title: `Task accepted: ${t.title}`,
+      message: `Reserved for you until ${new Date(a.lock_expires_at).toLocaleString('en-IN')}. Open it for what to do and how it is verified.`,
+      relatedEntityType: 'wfh_assignment',
+      relatedEntityId: a.id,
+      whatsappContent: {
+        vars: [t.id, String(n(c, 'lock_hours', 48)), TYPES[t.task_type]?.label || t.task_type, t.locality || t.city || '', `₹${num(t.payment_amount)?.toLocaleString('en-IN') || t.payment_amount}`],
+        buttonUrl: t.id,
+      },
+    }).catch(() => {});
     return assignmentView(user, a.id);
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
@@ -575,7 +586,15 @@ async function advance(id) {
     )).rows[0]?.user_id || null;
     await pool.query(`UPDATE wfh_task_assignments SET rep_id = $1, rep_due_at = now() + ($2 || ' hours')::interval WHERE id = $3`, [rep, String(n(c, 'rep_confirm_hours', 24)), id]);
     const tell = rep ? [rep] : (await pool.query(`SELECT u.id FROM users u JOIN roles r ON r.id = u.role_id WHERE r.name IN ('admin', 'super_admin') AND u.status = 'active'`)).rows.map((r) => r.id);
-    for (const u of tell) await notificationService.createNotification({ userId: u, type: 'wfh', title: 'Field partner submitted a buyer visit', message: `${a.worker_name} reports a buyer visit at ${a.locality || a.city || 'the property'}. Please confirm.`, relatedEntityType: 'wfh_assignment', relatedEntityId: id }).catch(() => {});
+    for (const u of tell) await notificationService.createNotification({
+      userId: u,
+      type: 'wfh_rep_confirm',
+      title: 'Field partner submitted a buyer visit',
+      message: `${a.worker_name} reports a buyer visit at ${a.locality || a.city || 'the property'}. Please confirm.`,
+      relatedEntityType: 'wfh_assignment',
+      relatedEntityId: id,
+      whatsappContent: { vars: [a.locality || a.city || 'the property', a.id, String(n(c, 'rep_confirm_hours', 24))], buttonUrl: a.id },
+    }).catch(() => {});
   }
   // 'review' waits in the staff queue; 'listing' waits for the listing to go live (see sweep).
   return null;
@@ -646,7 +665,15 @@ async function pass(id, staff) {
   await pool.query('UPDATE wfh_workers SET total_earned = total_earned + $1, updated_at = now() WHERE user_id = $2', [amount, a.worker_id]);
   await recomputeRates(a.worker_id);
   await require('./gamification.service').award(a.worker_id, 'wfh_task_verified', { entityId: id, city: a.city }).then((ok) => ok && require('./gamification.service').refreshProfile(a.worker_id)).catch(() => {});
-  await notificationService.createNotification({ userId: a.worker_id, type: 'wfh', title: `Task verified: Rs ${amount.toLocaleString('en-IN')} earned`, message: `${a.title} passed verification. It will be in your next monthly payout.`, relatedEntityType: 'wfh_assignment', relatedEntityId: id }).catch(() => {});
+  await notificationService.createNotification({
+    userId: a.worker_id,
+    type: 'wfh_task_result',
+    title: `Task verified: Rs ${amount.toLocaleString('en-IN')} earned`,
+    message: `${a.title} passed verification. It will be in your next monthly payout.`,
+    relatedEntityType: 'wfh_assignment',
+    relatedEntityId: id,
+    whatsappContent: { vars: [a.task_id, 'verified', `₹${amount.toLocaleString('en-IN')} has been added to your earnings.`] },
+  }).catch(() => {});
   if (staff) await auditService.log({ actor: staff, action: 'wfh.task_verified', entityType: 'wfh_assignment', entityId: id, after: { amount, leadId } });
   return { passed: true, amount, leadId };
 }
@@ -665,7 +692,15 @@ async function fail(id, staff, reason, { didNotHappen = false } = {}) {
       await pool.query(`INSERT INTO user_flags (user_id, reason, detail) VALUES ($1, 'wfh_visits_did_not_happen', $2)`, [a.worker_id, JSON.stringify({ rejections: count })]);
     }
   }
-  await notificationService.createNotification({ userId: a.worker_id, type: 'wfh', title: `Task not approved: ${a.title}`, message: String(reason).slice(0, 200), relatedEntityType: 'wfh_assignment', relatedEntityId: id }).catch(() => {});
+  await notificationService.createNotification({
+    userId: a.worker_id,
+    type: 'wfh_task_result',
+    title: `Task not approved: ${a.title}`,
+    message: String(reason).slice(0, 200),
+    relatedEntityType: 'wfh_assignment',
+    relatedEntityId: id,
+    whatsappContent: { vars: [a.task_id, 'not approved', String(reason).slice(0, 200)] },
+  }).catch(() => {});
   if (staff) await auditService.log({ actor: staff, action: 'wfh.task_rejected', entityType: 'wfh_assignment', entityId: id, after: { reason, didNotHappen } });
   return { passed: false };
 }

@@ -150,6 +150,22 @@ async function tryIntake({ phoneNumber, waUserId, text, mediaId, messageId, prof
 // provides it; `phoneNumber` may be null when the customer's number is hidden.
 async function handleInboundMessage({ phoneNumber, waUserId, text, buttonReplyId, buttonReplyTitle, mediaId = null, messageId = null, profileName = null }) {
   if (!waUserId) throw new Error('waUserId is required to run the WhatsApp bot flow');
+  // ar_lead_qualification's own quick-reply buttons (lq_buy / lq_rent /
+  // lq_sell) - a template reply, not a step in this file's question flow.
+  if (buttonReplyId && buttonReplyId.startsWith('lq_')) {
+    const handled = await require('./leadQualification.service').handleReply(phoneNumber, buttonReplyId);
+    if (handled) return { phoneNumber, waUserId, leadQualification: true };
+  }
+  // ar_fee_consent_request / ar_mandate_offer quick-reply buttons (fc_* /
+  // mo_*) - routed to the chat listing submission they belong to.
+  if (buttonReplyId && (buttonReplyId.startsWith('fc_') || buttonReplyId.startsWith('mo_'))) {
+    const contact = { channel: 'whatsapp', phone: phoneNumber ? whatsappService.toLocalMobile(phoneNumber) : null, waUserId };
+    const chatIntake = require('./messaging/chatIntake.service');
+    const handled = buttonReplyId.startsWith('fc_')
+      ? await chatIntake.handleFeeConsentReply(contact, buttonReplyId)
+      : await chatIntake.handleMandateOfferReply(contact, buttonReplyId);
+    if (handled) return { phoneNumber, waUserId, mandateConsentFlow: true };
+  }
   if (!buttonReplyId) {
     const taken = await tryIntake({ phoneNumber, waUserId, text, mediaId, messageId, profileName });
     if (taken) return { phoneNumber, waUserId, intake: taken };

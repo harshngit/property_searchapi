@@ -235,12 +235,27 @@ async function adminIds() {
   return (await pool.query(`SELECT u.id FROM users u JOIN roles r ON r.id = u.role_id WHERE r.name = ANY($1) AND u.status = 'active'`, [ADMIN])).rows.map((r) => r.id);
 }
 
-async function notify(ids, { type, title, message, leadId }) {
+async function notify(ids, { type, title, message, leadId, whatsappContent }) {
   for (const userId of new Set(ids.filter(Boolean))) {
     await notificationService
-      .createNotification({ userId, type, title, message, relatedEntityType: 'lead', relatedEntityId: leadId })
+      .createNotification({ userId, type, title, message, relatedEntityType: 'lead', relatedEntityId: leadId, whatsappContent })
       .catch(() => {});
   }
+}
+
+// Customer/property display fields for the WhatsApp templates - not loaded
+// by leadContext() (it only needs ids for routing), so fetched here, only
+// when actually about to notify someone.
+async function leadDisplay(lead) {
+  const [customer, property] = await Promise.all([
+    lead.customer_id ? pool.query('SELECT full_name, user_id FROM customers WHERE id = $1', [lead.customer_id]).then((r) => r.rows[0]) : null,
+    lead.property_id ? pool.query('SELECT title FROM properties WHERE id = $1', [lead.property_id]).then((r) => r.rows[0]) : null,
+  ]);
+  return {
+    customerFirstName: (customer?.full_name || '').split(' ')[0] || 'there',
+    customerUserId: customer?.user_id || null,
+    propertyTitle: property?.title || 'your enquiry',
+  };
 }
 
 async function logEvent(leadId, { hop, kind, route = null, from = null, to = null, actor = null, detail = {} }, client = pool) {
@@ -390,12 +405,36 @@ async function place(lead, ctx, c, pick, hop, previous, reason = 'new', exitReas
 
   const label = `${ctx.locality ? `${ctx.locality}, ` : ''}${ctx.city || 'location not given'}`;
   const tl = await teamLeaderOf(pick.userId);
+  const disp = await leadDisplay(lead);
+  const rep = (await pool.query('SELECT full_name FROM users WHERE id = $1', [pick.userId])).rows[0];
   await notify([pick.userId, tl], {
     type: 'inquiry_assigned',
     title: `${previous ? 'Inquiry transferred to you' : 'New inquiry assigned'} (hop ${hop})`,
     message: `${label}. Log first contact by ${due.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} or it moves on automatically.${ctx.exclusive ? ` Exclusive Mandate - ${c.sla.exclusive} h response SLA.` : ''}`,
     leadId: lead.id,
+    whatsappContent: {
+      vars: [disp.customerFirstName, disp.propertyTitle, label, lead.score_display || lead.status || 'New', lead.source || 'Direct', String(Math.round(c.windowMinutes || 15))],
+      buttonUrl: lead.id,
+    },
   });
+  // ar_inquiry_received - the enquirer's own confirmation, only when they
+  // have a linked login account to notify (a guest/phone-only enquiry has
+  // nowhere in-app to receive it, and WhatsApp-specific delivery for those
+  // is handled by the WhatsApp bot flow itself, not this cascade).
+  if (!previous && disp.customerUserId) {
+    await notify([disp.customerUserId], {
+      type: 'inquiry_received',
+      title: `Thanks for your enquiry about ${disp.propertyTitle}`,
+      message: `Your A R Buildwel representative ${rep?.full_name || 'will'} will contact you shortly.`,
+      leadId: lead.id,
+      whatsappContent: { vars: [disp.customerFirstName, disp.propertyTitle, rep?.full_name || 'A representative', lead.id], buttonUrl: lead.property_id || lead.id },
+    });
+  }
+  // ar_lead_qualification - a general enquiry with no linked listing has no
+  // known purpose yet; a lead tied to a property already implies buy/rent.
+  if (!previous && !lead.property_id) {
+    require('./leadQualification.service').sendQualification(lead).catch((err) => console.error(`[lead qualification] send failed for lead ${lead.id}:`, err.message));
+  }
   if (previous && reason === 'missed') {
     await notify([previous, await teamLeaderOf(previous)], {
       type: 'inquiry_missed', title: 'Inquiry window missed', message: `No first contact was logged in time - the inquiry (${label}) moved to the next representative.`, leadId: lead.id,
@@ -660,4 +699,5 @@ module.exports = {
   upsertRep,
   listBrokerMappings,
   mapBroker,
+  leastBusy,
 };
