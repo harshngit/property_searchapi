@@ -175,6 +175,7 @@ app.use('/api/onboarding', require('./routes/onboarding.routes'));
 app.use('/api/cobroke', require('./routes/cobroke.routes'));
 app.use('/api/v1', publicApiRoutes);
 app.use('/api/market', marketRoutes);
+app.use('/api/market-intel', require('./routes/marketIntel.routes'));
 app.use('/api/market-digest', require('./routes/marketDigest.routes'));
 app.use('/api/fields', require('./routes/field.routes'));
 app.use('/api/coupons', require('./routes/coupon.routes'));

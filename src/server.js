@@ -63,6 +63,8 @@ server.listen(PORT, () => {
   if (process.env.NOTIFICATION_JOBS_DISABLED !== 'true') require('./services/notificationIntel.service').startScheduler();
   // Daily market digest for brokers (sec. 20.4): compiled and sent in its posting windows.
   if (process.env.MARKET_DIGEST_JOBS_DISABLED !== 'true') require('./services/marketDigest.service').startScheduler();
+  // Engine 6: the monthly area market snapshot (the history the trend and Phase 2 learn from).
+  if (process.env.MARKET_INTEL_JOBS_DISABLED !== 'true') require('./services/marketIntel/areaIntel.service').startScheduler();
   // AI credit wallet: credits past their validity (per the T&C) expire, hourly.
   if (process.env.AI_WALLET_JOBS_DISABLED !== 'true') require('./services/ai/wallet.service').startScheduler();
   // Section 35: load the suspended / removed accounts the auth middleware turns away.

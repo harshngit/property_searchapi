@@ -7165,3 +7165,107 @@ test('paid AI buttons (Serchi): review second opinion (#7), read an inbound lead
 function nodeCryptoUuid() {
   return require('crypto').randomUUID();
 }
+
+test('Engine 6 market intelligence (rule-based): area price trend, growth and investment potential scores with recommendations, monthly snapshots for Phase 2, recommended areas, budget portfolio, buyer intent and broker forecasts, non-advisory disclaimer', async () => {
+  const A = ctx.admin.token;
+  const ICITY = `Intel City ${RUN}`;
+  const lister = await createUser('broker', 'intel-lister');
+  const customers = require('../src/services/customer.service');
+  const cust = async (n) => customers.findOrCreateCustomerByContact({ fullName: `Intel buyer ${n} ${RUN}`, mobile: `7${String(Math.floor(Math.random() * 1e9)).padStart(9, '0')}` });
+  const listing = async (loc, price, area, tx = 'sell', extra = {}) =>
+    (await pool.query(
+      `INSERT INTO properties (created_by, broker_id, title, property_type, transaction_type, price, price_value, area_sqft, city, locality, status, estimated_rent_monthly)
+       VALUES ($1, $1, $2, 'apartment', $3, $4, $5, $6, $7, $8, 'approved', $9) RETURNING id`,
+      [lister.id, `${loc} flat ${RUN} ${Math.random().toString(36).slice(2, 6)}`, tx, String(price), price, area, ICITY, loc, extra.rent || null]
+    )).rows[0].id;
+
+  // "Hot Sector": cheaper than the city, many buyers, good rents. "Cold Sector": dear, few buyers.
+  const hot = [];
+  for (let i = 0; i < 4; i += 1) hot.push(await listing('Hot Sector', 6000000 + i * 100000, 1200, 'sell', { rent: 30000 }));
+  await listing('Hot Sector', 28000, 1200, 'rent');
+  for (let i = 0; i < 4; i += 1) await listing('Cold Sector', 18000000 + i * 100000, 1200);
+  for (let i = 0; i < 8; i += 1) {
+    const c = await cust(i);
+    await pool.query(`INSERT INTO requirements (customer_id, purpose, city, localities, budget_max, status, fee_consent_at) VALUES ($1, 'buy', $2, '["Hot Sector"]'::jsonb, 8000000, 'active', now())`, [c.id, ICITY]);
+    await pool.query(`INSERT INTO leads (customer_id, property_id, status, source) VALUES ($1, $2, 'new', 'website')`, [c.id, hot[i % 4]]);
+  }
+  // Last year's snapshot: Hot Sector prices were 10% lower -> a rising trend.
+  await pool.query(
+    `INSERT INTO area_market_snapshots (city, locality, period, listings_sell, median_price_sqft) VALUES ($1, 'Hot Sector', (date_trunc('month', now()) - interval '12 months')::date, 3, $2)`,
+    [ICITY, Math.round((6150000 / 1200) * 0.9)]
+  );
+
+  // ---- area report: trend, scores, recommendation, disclaimer
+  const rep = await api('GET', `/market-intel/areas?city=${encodeURIComponent(ICITY)}`);
+  assert.equal(rep.status, 200, JSON.stringify(rep.body));
+  const hotA = rep.data.areas.find((a) => a.locality === 'Hot Sector');
+  const coldA = rep.data.areas.find((a) => a.locality === 'Cold Sector');
+  assert.ok(hotA && coldA, JSON.stringify(rep.data.areas.map((a) => a.locality)));
+  assert.equal(hotA.trend, 'rising', JSON.stringify(hotA));
+  assert.ok(hotA.trendPercent > 5);
+  assert.ok(hotA.growthScore > coldA.growthScore && hotA.potentialScore > coldA.potentialScore, `${hotA.potentialScore} vs ${coldA.potentialScore}`);
+  assert.equal(rep.data.areas[0].locality, 'Hot Sector', 'sorted by investment potential');
+  assert.match(hotA.summary, /price appreciation trend/);
+  assert.ok(hotA.reasons.some((r) => /active buyers per live listing/.test(r)));
+  assert.match(rep.data.disclaimer, /not financial advice/);
+  const one = await api('GET', `/market-intel/area?city=${encodeURIComponent(ICITY)}&locality=Hot%20Sector`);
+  assert.equal(one.data.locality, 'Hot Sector');
+  assert.equal((await api('GET', `/market-intel/area?city=${encodeURIComponent(ICITY)}&locality=Nowhere`)).data.recommendation, 'Not enough data yet');
+
+  // ---- recommended areas
+  const recd = await api('GET', `/market-intel/recommended?city=${encodeURIComponent(ICITY)}`);
+  assert.ok(recd.data.areas.every((a) => a.potentialScore >= recd.data.recommendMinScore - 20));
+  assert.ok(!recd.data.areas.some((a) => a.locality === 'Cold Sector' && a.potentialScore < recd.data.recommendMinScore - 20));
+
+  // ---- monthly snapshot (Phase 2 history); admin only
+  assert.equal((await api('POST', '/market-intel/snapshots', { token: lister.token })).status, 403);
+  const snap = await api('POST', '/market-intel/snapshots', { token: A });
+  assert.equal(snap.status, 200);
+  const row = (await pool.query(`SELECT * FROM area_market_snapshots WHERE city = $1 AND locality = 'Hot Sector' AND period = date_trunc('month', now())::date`, [ICITY])).rows[0];
+  assert.ok(row && row.listings_sell === 4 && row.demand_requirements === 8 && Number(row.median_price_sqft) > 0);
+
+  // ---- budget portfolio (signed in): within budget, one listing per area, disclaimer
+  assert.equal((await api('POST', '/market-intel/portfolio', { body: { budget: 15000000 } })).status, 401);
+  const pf = await api('POST', '/market-intel/portfolio', { token: lister.token, body: { budget: 15000000, city: ICITY, risk: 'balanced' } });
+  assert.equal(pf.status, 200, JSON.stringify(pf.body));
+  assert.ok(pf.data.holdings.length >= 1 && pf.data.invested <= 15000000);
+  assert.equal(new Set(pf.data.holdings.map((h) => h.locality)).size, pf.data.holdings.length, 'spread across areas');
+  assert.equal(pf.data.holdings[0].locality, 'Hot Sector');
+  assert.match(pf.data.disclaimer, /not financial advice/);
+  assert.equal((await api('POST', '/market-intel/portfolio', { token: lister.token, body: { budget: 1000 } })).status, 422, 'budget too small');
+
+  // ---- buyer intent: lead score + momentum; brokers see only their own buyers
+  const c1 = await cust('intent');
+  await pool.query(`INSERT INTO lead_scores (customer_id, score, category) VALUES ($1, 72, 'warm') ON CONFLICT (customer_id) DO UPDATE SET score = 72, category = 'warm'`, [c1.id]);
+  await pool.query(`INSERT INTO leads (customer_id, property_id, status, source, assigned_to) VALUES ($1, $2, 'new', 'website', $3)`, [c1.id, hot[0], lister.id]);
+  for (const t of ['property_view', 'site_visit_requested', 'offer_made']) {
+    await pool.query(`INSERT INTO events (event_id, event_timestamp, event_type, source_track, customer_id, properties_json) VALUES (gen_random_uuid(), now(), $1, 'server', $2, '{}'::jsonb)`, [t, c1.id]);
+  }
+  const intentStaff = await api('GET', '/market-intel/buyer-intent?limit=200', { token: ctx.sales.token });
+  assert.equal(intentStaff.status, 200, JSON.stringify(intentStaff.body));
+  const mine = await api('GET', '/market-intel/buyer-intent', { token: lister.token });
+  const b = mine.data.items.find((x) => x.customerId === c1.id);
+  assert.ok(b, 'the broker sees the buyer on their lead');
+  assert.ok(b.intentScore > 72 && b.band === 'likely' && b.reasons.some((r) => /offer/.test(r)), JSON.stringify(b));
+  const other = await createUser('broker', 'intel-other');
+  assert.ok(!(await api('GET', '/market-intel/buyer-intent', { token: other.token })).data.items.some((x) => x.customerId === c1.id), 'not another broker\'s buyer');
+  assert.equal((await api('GET', '/market-intel/buyer-intent', { token: (await createUser('customer', 'intel-cust')).token })).status, 403);
+
+  // ---- broker forecast from the open pipeline; stored for later checking
+  const dc = await cust('deal');
+  await pool.query(`INSERT INTO deals (customer_id, broker_id, property_id, stage, deal_value) VALUES ($1, $2, $3, 'negotiation', 6000000), ($1, $2, $3, 'inquiry', 6000000)`, [dc.id, lister.id, hot[1]]);
+  const fc = await api('GET', '/market-intel/broker-forecast', { token: lister.token });
+  assert.equal(fc.status, 200, JSON.stringify(fc.body));
+  assert.equal(fc.data.brokers.length, 1, 'a broker sees only themselves');
+  const me = fc.data.brokers[0];
+  assert.equal(me.openDeals, 2);
+  assert.ok(me.expectedClosures > 0 && me.expectedClosures < 2);
+  const odds = Object.fromEntries(fc.data.stageOdds.map((o) => [o.stage, o.closeChancePercent]));
+  assert.ok(odds.negotiation > odds.inquiry, 'later stages close more often');
+  assert.equal((await pool.query(`SELECT COUNT(*)::int AS n FROM broker_forecasts WHERE broker_id = $1 AND computed_on = CURRENT_DATE`, [lister.id])).rows[0].n, 1);
+  const all = await api('GET', '/market-intel/broker-forecast', { token: A });
+  assert.ok(all.data.brokers.some((x) => x.brokerId === lister.id));
+
+  // No AI was called for any of it.
+  assert.equal((await pool.query(`SELECT COUNT(*)::int AS n FROM ai_runs WHERE created_at > now() - interval '5 minutes' AND entity_type IN ('market_area', 'portfolio')`)).rows[0].n, 0);
+});
