@@ -42,6 +42,31 @@ function init(httpServer) {
     socket.on('thread:leave', (threadId) => {
       socket.leave(`thread:${threadId}`);
     });
+
+    // WhatsApp inbox: the business number is shared, so there's no
+    // per-thread participant list to check like chat.service.js's threads -
+    // every authenticated staff member with inbox access can join the
+    // overview room. `whatsapp:open` additionally joins one contact's room
+    // (room key = phone number or BSUID, whichever the contact is known by)
+    // so an open conversation gets new messages pushed live.
+    socket.on('whatsapp:join', () => socket.join('whatsapp:inbox'));
+
+    socket.on('whatsapp:open', async ({ phoneNumber, waUserId } = {}) => {
+      const key = phoneNumber || waUserId;
+      if (!key) return;
+      try {
+        // Lazy require: whatsapp.service.js also requires this module (to emit).
+        await require('../services/whatsapp.service').assertInboxAccess(socket.user, { phoneNumber, waUserId });
+        socket.join(`whatsapp:contact:${key}`);
+      } catch {
+        // Different tenant's contact - no-op, nothing joined.
+      }
+    });
+
+    socket.on('whatsapp:close', ({ phoneNumber, waUserId } = {}) => {
+      const key = phoneNumber || waUserId;
+      if (key) socket.leave(`whatsapp:contact:${key}`);
+    });
   });
 
   return io;

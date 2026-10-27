@@ -293,6 +293,39 @@ router.get(
 
 /**
  * @swagger
+ * /whatsapp/thread:
+ *   get:
+ *     summary: One contact's full WhatsApp message history, chronologically
+ *     description: Allowed roles broker, agency_admin, internal_sales, admin, super_admin.
+ *     tags: [WhatsApp]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: phoneNumber
+ *         schema: { type: string }
+ *       - in: query
+ *         name: waUserId
+ *         schema: { type: string }
+ *     responses:
+ *       200:
+ *         description: Thread fetched successfully
+ *       400:
+ *         description: phoneNumber or waUserId is required
+ *       404:
+ *         description: Conversation not found
+ */
+router.get(
+  '/thread',
+  authenticate,
+  authorize(...WHATSAPP_ROLES),
+  [query('phoneNumber').optional({ nullable: true }).isString(), query('waUserId').optional({ nullable: true }).isString()],
+  validate,
+  whatsappController.thread
+);
+
+/**
+ * @swagger
  * /whatsapp/share-property:
  *   post:
  *     summary: Send a property-share template message to a lead's contact number

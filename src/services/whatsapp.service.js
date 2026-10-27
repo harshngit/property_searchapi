@@ -239,6 +239,65 @@ async function getConversations(leadId, user) {
   return result.rows;
 }
 
+// Lazy require (realtime/socket.js doesn't require this file, so this one
+// is safe at top level too, but kept lazy for consistency with the pattern
+// chat.service.js uses). `getIo()` returns null until the HTTP server has
+// called init() - the `?.` makes every emit a no-op until then.
+function emitInboxUpdate(row, customerName) {
+  const io = require('../realtime/socket').getIo();
+  if (!io) return;
+  const key = row.phone_number || row.wa_user_id;
+  const payload = {
+    phoneNumber: row.phone_number,
+    waUserId: row.wa_user_id,
+    name: customerName || row.phone_number || 'Unknown contact',
+    direction: row.direction,
+    messageType: row.message_type,
+    templateName: row.template_name,
+    message: row.message_body,
+    status: row.status,
+    createdAt: row.created_at,
+  };
+  io.to('whatsapp:inbox').emit('whatsapp:new_message', payload);
+  if (key) io.to(`whatsapp:contact:${key}`).emit('whatsapp:message', payload);
+}
+
+// Shared by the REST thread endpoint and the socket 'whatsapp:open' handler -
+// brokers/agency_admins may only open a contact that belongs to their tenant;
+// internal staff can open anything. Throws (caught by the caller) when not.
+async function assertInboxAccess(user, { phoneNumber, waUserId }) {
+  if (isAdmin(user.role) || user.role === 'internal_sales') return;
+  const row = phoneNumber
+    ? (await pool.query('SELECT tenant_id FROM customers WHERE mobile = $1', [toLocalMobile(phoneNumber)])).rows[0]
+    : waUserId
+    ? (await pool.query('SELECT tenant_id FROM customers WHERE wa_user_id = $1', [waUserId])).rows[0]
+    : null;
+  // An unknown contact (no customer row yet) has no tenant to check against -
+  // let it through rather than blocking staff from a genuinely new lead.
+  if (row && row.tenant_id && row.tenant_id !== user.tenant_id) throw notFound('Conversation not found');
+}
+
+// GET /api/whatsapp/thread - one contact's full message history, chronological.
+async function getThread(user, { phoneNumber, waUserId }) {
+  if (!phoneNumber && !waUserId) throw badRequest('phoneNumber or waUserId is required');
+  await assertInboxAccess(user, { phoneNumber, waUserId });
+  const conditions = [];
+  const params = [];
+  if (phoneNumber) {
+    params.push(phoneNumber);
+    conditions.push(`phone_number = $${params.length}`);
+  }
+  if (waUserId) {
+    params.push(waUserId);
+    conditions.push(`wa_user_id = $${params.length}`);
+  }
+  const result = await pool.query(
+    `SELECT * FROM whatsapp_conversations WHERE ${conditions.join(' OR ')} ORDER BY created_at ASC LIMIT 200`,
+    params
+  );
+  return result.rows;
+}
+
 // GET /api/whatsapp/inbox - one row per contact, most recent message first,
 // for the staff inbox view. The business WhatsApp number is shared across
 // the platform, so brokers/agency_admins see their own tenant's contacts;
@@ -282,9 +341,9 @@ async function sendInboxReply(user, { phoneNumber, waUserId, body }) {
   if (!body || !String(body).trim()) throw badRequest('Message body is required');
   const contact = resolveContact({ phoneNumber, waUserId });
   const linked = phoneNumber
-    ? (await pool.query('SELECT id, tenant_id FROM customers WHERE mobile = $1', [toLocalMobile(phoneNumber)])).rows[0]
+    ? (await pool.query('SELECT id, tenant_id, full_name FROM customers WHERE mobile = $1', [toLocalMobile(phoneNumber)])).rows[0]
     : waUserId
-    ? (await pool.query('SELECT id, tenant_id FROM customers WHERE wa_user_id = $1', [waUserId])).rows[0]
+    ? (await pool.query('SELECT id, tenant_id, full_name FROM customers WHERE wa_user_id = $1', [waUserId])).rows[0]
     : null;
 
   let providerMessageId = null;
@@ -304,6 +363,7 @@ async function sendInboxReply(user, { phoneNumber, waUserId, body }) {
      RETURNING *`,
     [linked?.tenant_id || null, linked?.id || null, phoneNumber || null, waUserId || null, String(body).slice(0, 4000), providerMessageId, status]
   );
+  emitInboxUpdate(result.rows[0], linked?.full_name || null);
 
   if (sendError) throw sendError;
   return result.rows[0];
@@ -362,13 +422,13 @@ async function handleWebhook(payload) {
 
         let customer = null;
         if (phoneNumber) {
-          const byPhone = await pool.query('SELECT id, tenant_id FROM customers WHERE mobile = $1 LIMIT 1', [
+          const byPhone = await pool.query('SELECT id, tenant_id, full_name FROM customers WHERE mobile = $1 LIMIT 1', [
             toLocalMobile(phoneNumber),
           ]);
           customer = byPhone.rows[0] || null;
         }
         if (!customer && waUserId) {
-          const byWaUserId = await pool.query('SELECT id, tenant_id FROM customers WHERE wa_user_id = $1 LIMIT 1', [waUserId]);
+          const byWaUserId = await pool.query('SELECT id, tenant_id, full_name FROM customers WHERE wa_user_id = $1 LIMIT 1', [waUserId]);
           customer = byWaUserId.rows[0] || null;
         }
 
@@ -381,11 +441,12 @@ async function handleWebhook(payload) {
           lead = leadResult.rows[0] || null;
         }
 
-        await pool.query(
+        const logged = await pool.query(
           `INSERT INTO whatsapp_conversations (
              tenant_id, lead_id, customer_id, phone_number, wa_user_id, direction, message_type,
              message_body, provider_message_id, status
-           ) VALUES ($1, $2, $3, $4, $5, 'inbound', $8, $6, $7, 'delivered')`,
+           ) VALUES ($1, $2, $3, $4, $5, 'inbound', $8, $6, $7, 'delivered')
+           RETURNING *`,
           [
             lead?.tenant_id || customer?.tenant_id || null,
             lead?.id || null,
@@ -397,6 +458,7 @@ async function handleWebhook(payload) {
             mediaId ? 'image' : 'text',
           ]
         );
+        emitInboxUpdate(logged.rows[0], customer?.full_name || null);
 
         inboundMessages.push({ phoneNumber, waUserId, text, buttonReplyId, buttonReplyTitle, mediaId, messageId: message.id, profileName: (value.contacts || []).find((c) => c.wa_id === message.from || c.user_id === waUserId)?.profile?.name || null });
       }
@@ -562,4 +624,6 @@ module.exports = {
   handleWebhook,
   listInbox,
   sendInboxReply,
+  getThread,
+  assertInboxAccess,
 };

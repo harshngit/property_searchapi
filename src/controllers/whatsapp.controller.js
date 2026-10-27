@@ -121,6 +121,16 @@ async function templates(req, res, next) {
   }
 }
 
+// GET /api/whatsapp/thread - one contact's full message history.
+async function thread(req, res, next) {
+  try {
+    const rows = await whatsappService.getThread(req.user, req.query);
+    return success(res, 200, 'Thread fetched successfully', rows);
+  } catch (err) {
+    next(err);
+  }
+}
+
 module.exports = {
   sendTemplate,
   verifyWebhook,
@@ -132,4 +142,5 @@ module.exports = {
   inbox,
   inboxReply,
   templates,
+  thread,
 };
