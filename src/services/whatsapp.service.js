@@ -239,6 +239,76 @@ async function getConversations(leadId, user) {
   return result.rows;
 }
 
+// GET /api/whatsapp/inbox - one row per contact, most recent message first,
+// for the staff inbox view. The business WhatsApp number is shared across
+// the platform, so brokers/agency_admins see their own tenant's contacts;
+// internal staff see everything.
+async function listInbox(user, { limit = 30 } = {}) {
+  const cap = Math.min(Number(limit) || 30, 100);
+  const tenantFilter = isAdmin(user.role) || user.role === 'internal_sales' ? '' : 'WHERE c.tenant_id = $1';
+  const params = tenantFilter ? [user.tenant_id] : [];
+  const result = await pool.query(
+    `SELECT DISTINCT ON (COALESCE(c.customer_id::text, c.wa_user_id, c.phone_number))
+       c.id, c.lead_id, c.customer_id, c.phone_number, c.wa_user_id, c.direction, c.message_type,
+       c.template_name, c.message_body, c.status, c.created_at,
+       cu.full_name AS customer_name
+     FROM whatsapp_conversations c
+     LEFT JOIN customers cu ON cu.id = c.customer_id
+     ${tenantFilter}
+     ORDER BY COALESCE(c.customer_id::text, c.wa_user_id, c.phone_number), c.created_at DESC`,
+    params
+  );
+  return result.rows
+    .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+    .slice(0, cap)
+    .map((r) => ({
+      leadId: r.lead_id,
+      customerId: r.customer_id,
+      phoneNumber: r.phone_number,
+      waUserId: r.wa_user_id,
+      name: r.customer_name || r.phone_number || 'Unknown contact',
+      lastMessage: r.template_name ? `Template: ${r.template_name}` : (r.message_body || ''),
+      lastMessageAt: r.created_at,
+      unread: r.direction === 'inbound',
+      lastDirection: r.direction,
+      lastStatus: r.status,
+    }));
+}
+
+// POST /api/whatsapp/inbox/reply - a plain text reply within the 24-hour
+// customer-service window (no template). phoneNumber or waUserId identifies
+// who to reply to; lead/customer linkage is best-effort for display only.
+async function sendInboxReply(user, { phoneNumber, waUserId, body }) {
+  if (!body || !String(body).trim()) throw badRequest('Message body is required');
+  const contact = resolveContact({ phoneNumber, waUserId });
+  const linked = phoneNumber
+    ? (await pool.query('SELECT id, tenant_id FROM customers WHERE mobile = $1', [toLocalMobile(phoneNumber)])).rows[0]
+    : waUserId
+    ? (await pool.query('SELECT id, tenant_id FROM customers WHERE wa_user_id = $1', [waUserId])).rows[0]
+    : null;
+
+  let providerMessageId = null;
+  let status = 'sent';
+  let sendError = null;
+  try {
+    const sent = await metaWhatsappService.sendText({ ...contact, body: String(body).slice(0, 4000) });
+    providerMessageId = sent.providerMessageId;
+  } catch (err) {
+    status = 'failed';
+    sendError = err;
+  }
+
+  const result = await pool.query(
+    `INSERT INTO whatsapp_conversations (tenant_id, customer_id, phone_number, wa_user_id, direction, message_type, message_body, provider_message_id, status)
+     VALUES ($1, $2, $3, $4, 'outbound', 'text', $5, $6, $7)
+     RETURNING *`,
+    [linked?.tenant_id || null, linked?.id || null, phoneNumber || null, waUserId || null, String(body).slice(0, 4000), providerMessageId, status]
+  );
+
+  if (sendError) throw sendError;
+  return result.rows[0];
+}
+
 // POST /api/whatsapp/webhook - Meta calls this directly. Signature is
 // checked by middlewares/metaSignature.js before this runs. Meta's real
 // payload is deeply nested: entry[].changes[].value.{messages[],statuses[]}.
@@ -490,4 +560,6 @@ module.exports = {
   acknowledgeLeadEndpoint,
   getConversations,
   handleWebhook,
+  listInbox,
+  sendInboxReply,
 };

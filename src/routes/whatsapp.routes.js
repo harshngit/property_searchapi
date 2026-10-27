@@ -1,5 +1,5 @@
 const express = require('express');
-const { body, param } = require('express-validator');
+const { body, param, query } = require('express-validator');
 const router = express.Router();
 
 const whatsappController = require('../controllers/whatsapp.controller');
@@ -200,6 +200,95 @@ router.get(
   [param('leadId').isUUID().withMessage('Invalid lead id')],
   validate,
   whatsappController.getConversations
+);
+
+/**
+ * @swagger
+ * /whatsapp/inbox:
+ *   get:
+ *     summary: Recent WhatsApp conversations, one row per contact, most recent first
+ *     description: Allowed roles broker, agency_admin, internal_sales, admin, super_admin.
+ *     tags: [WhatsApp]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: limit
+ *         schema: { type: integer, minimum: 1, maximum: 100 }
+ *     responses:
+ *       200:
+ *         description: Inbox fetched successfully
+ */
+router.get(
+  '/inbox',
+  authenticate,
+  authorize(...WHATSAPP_ROLES),
+  [query('limit').optional().isInt({ min: 1, max: 100 })],
+  validate,
+  whatsappController.inbox
+);
+
+/**
+ * @swagger
+ * /whatsapp/inbox/reply:
+ *   post:
+ *     summary: Send a plain-text WhatsApp reply to a contact (within the 24-hour window, no template)
+ *     description: Allowed roles broker, agency_admin, internal_sales, admin, super_admin.
+ *     tags: [WhatsApp]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [body]
+ *             properties:
+ *               phoneNumber: { type: string }
+ *               waUserId: { type: string }
+ *               body: { type: string }
+ *     responses:
+ *       201:
+ *         description: Reply sent successfully
+ *       422:
+ *         description: Validation failed
+ */
+router.post(
+  '/inbox/reply',
+  authenticate,
+  authorize(...WHATSAPP_ROLES),
+  [
+    body('phoneNumber').optional({ nullable: true }).isString(),
+    body('waUserId').optional({ nullable: true }).isString(),
+    body('body').notEmpty().withMessage('body is required').isString().isLength({ max: 4000 }),
+    body().custom((value) => {
+      if (!value.phoneNumber && !value.waUserId) throw new Error('phoneNumber or waUserId is required');
+      return true;
+    }),
+  ],
+  validate,
+  whatsappController.inboxReply
+);
+
+/**
+ * @swagger
+ * /whatsapp/templates:
+ *   get:
+ *     summary: Live approval status of every WhatsApp template on this account, straight from Meta
+ *     description: Allowed roles broker, agency_admin, internal_sales, admin, super_admin.
+ *     tags: [WhatsApp]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Templates fetched successfully
+ */
+router.get(
+  '/templates',
+  authenticate,
+  authorize(...WHATSAPP_ROLES),
+  whatsappController.templates
 );
 
 /**

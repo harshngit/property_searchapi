@@ -147,6 +147,22 @@ async function downloadMedia(mediaId) {
   return { buffer: Buffer.from(await file.arrayBuffer()), mimetype: info.mime_type || 'image/jpeg', filename: 'whatsapp.jpg' };
 }
 
+// Current approval status of every template on this WABA (name, status,
+// category) - the same read-only call WhatsApp Manager itself shows.
+async function listTemplates() {
+  if (!process.env.WHATSAPP_ACCESS_TOKEN || !process.env.WHATSAPP_BUSINESS_ACCOUNT_ID) throw configError();
+  const out = [];
+  let url = `https://graph.facebook.com/${GRAPH_VERSION}/${process.env.WHATSAPP_BUSINESS_ACCOUNT_ID}/message_templates?fields=name,status,category,language&limit=100`;
+  while (url) {
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}` } });
+    const data = await res.json();
+    if (!res.ok) throw new Error(`Meta WhatsApp API error: ${data.error?.message || res.statusText}`);
+    out.push(...(data.data || []));
+    url = data.paging?.next || null;
+  }
+  return out;
+}
+
 // Meta signs every webhook POST with the app secret - see
 // https://developers.facebook.com/docs/graph-api/webhooks/getting-started#validate-payloads
 // `rawBody` must be the exact request bytes (see app.js's express.json `verify`
@@ -168,4 +184,5 @@ module.exports = {
   sendInteractiveList,
   downloadMedia,
   verifySignature,
+  listTemplates,
 };

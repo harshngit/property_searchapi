@@ -1,5 +1,6 @@
 const whatsappService = require('../services/whatsapp.service');
 const whatsappBotService = require('../services/whatsappBot.service');
+const metaWhatsappService = require('../services/metaWhatsapp.service');
 const { success } = require('../utils/response');
 
 // POST /api/whatsapp/send-template
@@ -90,6 +91,36 @@ async function acknowledgeLead(req, res, next) {
   }
 }
 
+// GET /api/whatsapp/inbox
+async function inbox(req, res, next) {
+  try {
+    const rows = await whatsappService.listInbox(req.user, { limit: req.query.limit });
+    return success(res, 200, 'Inbox fetched successfully', rows);
+  } catch (err) {
+    next(err);
+  }
+}
+
+// POST /api/whatsapp/inbox/reply
+async function inboxReply(req, res, next) {
+  try {
+    const message = await whatsappService.sendInboxReply(req.user, req.body);
+    return success(res, 201, 'Reply sent successfully', message);
+  } catch (err) {
+    next(err);
+  }
+}
+
+// GET /api/whatsapp/templates - live approval status straight from Meta.
+async function templates(req, res, next) {
+  try {
+    const rows = await metaWhatsappService.listTemplates();
+    return success(res, 200, 'Templates fetched successfully', rows);
+  } catch (err) {
+    next(err);
+  }
+}
+
 module.exports = {
   sendTemplate,
   verifyWebhook,
@@ -98,4 +129,7 @@ module.exports = {
   getConversations,
   shareProperty,
   acknowledgeLead,
+  inbox,
+  inboxReply,
+  templates,
 };
