@@ -84,7 +84,7 @@ async function getOrCreateSession({ phoneNumber, waUserId }) {
   const inserted = await pool.query(
     `INSERT INTO whatsapp_bot_sessions (phone_number, wa_user_id, current_step, answers, status)
      VALUES ($1, $2, $3, '{}'::jsonb, 'in_progress')
-     ON CONFLICT (wa_user_id) DO NOTHING
+     ON CONFLICT (wa_user_id) WHERE wa_user_id IS NOT NULL DO NOTHING
      RETURNING *`,
     [phoneNumber, waUserId, QUESTIONS[0].key]
   );
