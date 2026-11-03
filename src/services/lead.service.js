@@ -90,6 +90,13 @@ async function listLeads(user, filters, page, limit) {
     params.push(filters.dateTo);
     where.push(`l.created_at <= $${params.length}`);
   }
+  // By customer name or listing title - never by phone or email, so a broker
+  // cannot use search to confirm a buyer's contact details.
+  if (filters.search) {
+    params.push(`%${filters.search}%`);
+    where.push(`(EXISTS (SELECT 1 FROM customers sc WHERE sc.id = l.customer_id AND sc.full_name ILIKE $${params.length})
+      OR EXISTS (SELECT 1 FROM properties sp WHERE sp.id = l.property_id AND sp.title ILIKE $${params.length}))`);
+  }
 
   const whereClause = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const offset = (page - 1) * limit;

@@ -156,8 +156,8 @@ const options = {
             occupancy_percent: { type: 'number', nullable: true },
             yield_percent: { type: 'number', nullable: true },
             yield_qualifier: { type: 'string', nullable: true },
-            city: { type: 'string', example: 'Mumbai' },
-            locality: { type: 'string', nullable: true, example: 'Bandra West' },
+            city: { type: 'string', example: 'City name' },
+            locality: { type: 'string', nullable: true, example: 'Locality name' },
             address: { type: 'string', nullable: true },
             latitude: { type: 'number', nullable: true },
             longitude: { type: 'number', nullable: true },
@@ -230,8 +230,8 @@ const options = {
             occupancyPercent: { type: 'number' },
             yieldPercent: { type: 'number' },
             yieldQualifier: { type: 'string' },
-            city: { type: 'string', example: 'Mumbai' },
-            locality: { type: 'string', example: 'Bandra West' },
+            city: { type: 'string', example: 'City name' },
+            locality: { type: 'string', example: 'Locality name' },
             address: { type: 'string', example: '12 Carter Road' },
             latitude: { type: 'number', example: 19.0596 },
             longitude: { type: 'number', example: 72.8295 },
@@ -320,7 +320,7 @@ const options = {
             builder_id: { type: 'string', format: 'uuid' },
             name: { type: 'string', example: 'Skyline Residency' },
             description: { type: 'string', nullable: true },
-            city: { type: 'string', example: 'Pune' },
+            city: { type: 'string', example: 'City name' },
             locality: { type: 'string', nullable: true },
             address: { type: 'string', nullable: true },
             status: {
@@ -337,7 +337,7 @@ const options = {
           properties: {
             name: { type: 'string', example: 'Skyline Residency' },
             description: { type: 'string', example: 'A premium 2/3 BHK residential project.' },
-            city: { type: 'string', example: 'Pune' },
+            city: { type: 'string', example: 'City name' },
             locality: { type: 'string', example: 'Baner' },
             address: { type: 'string', example: 'Baner Road' },
             builderId: {
@@ -784,17 +784,6 @@ const options = {
             gateway: { type: 'string', enum: ['razorpay', 'payu', 'manual'], example: 'razorpay' },
           },
         },
-        PaymentWebhookRequest: {
-          type: 'object',
-          required: ['gatewayOrderId', 'gatewaySignature', 'status'],
-          description: 'Shape of the payload a payment gateway would POST to the webhook.',
-          properties: {
-            gatewayOrderId: { type: 'string', example: 'stub_order_abc123' },
-            gatewayPaymentId: { type: 'string', example: 'pay_xyz789' },
-            gatewaySignature: { type: 'string', example: 'sig_mocked' },
-            status: { type: 'string', enum: ['success', 'failed', 'refunded'] },
-          },
-        },
         Milestone: {
           type: 'object',
           properties: {
@@ -879,7 +868,7 @@ const options = {
             waUserId: { type: 'string', example: 'US.13491208655302741918', nullable: true, description: "Meta's Business-Scoped User ID (BSUID) - present on every WhatsApp contact, phone or not." },
             name: { type: 'string', example: 'Rahul Sharma' },
             requirement: { type: 'string', example: 'Buy Property', description: 'Buy / Rent / Investment' },
-            location: { type: 'string', example: 'Mumbai' },
+            location: { type: 'string', example: 'City name' },
             budget: { type: 'string', example: '1Cr-2Cr', description: 'Free text - "50L-1Cr", "2Cr+", "1 crore" are all parsed' },
             propertyType: { type: 'string', example: '2 BHK' },
             notes: { type: 'string', example: 'Prefers a call after 6pm' },

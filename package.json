@@ -9,7 +9,8 @@
     "migrate": "node src/db/runMigrations.js",
     "seed:superadmin": "node src/db/seedSuperAdmin.js",
     "vapid:generate": "node -e \"const k=require('./src/services/push.service').generateVapidKeys();console.log('VAPID_PUBLIC_KEY='+k.publicKey+'\\nVAPID_PRIVATE_KEY='+k.privateKey)\"",
-    "test": "node --test --test-concurrency=1 tests/"
+    "test": "node --test --test-concurrency=1 tests/",
+    "lint:geo": "node scripts/checkHardcodedGeo.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.32.1",
@@ -26,6 +27,7 @@
     "helmet": "^7.1.0",
     "jimp": "^1.6.1",
     "jsonwebtoken": "^9.0.2",
+    "jsqr": "^1.4.0",
     "morgan": "^1.10.0",
     "multer": "^2.2.0",
     "pdf-lib": "^1.17.1",
@@ -38,6 +40,7 @@
     "uuid": "^9.0.1"
   },
   "devDependencies": {
-    "nodemon": "^3.1.4"
+    "nodemon": "^3.1.4",
+    "qrcode": "^1.5.4"
   }
 }

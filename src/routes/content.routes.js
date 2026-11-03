@@ -203,7 +203,7 @@ const articleValidators = (isCreate) => [
  *             required: [personName, quote]
  *             properties:
  *               personName: { type: string }
- *               personRole: { type: string, example: "Home buyer, Gurugram" }
+ *               personRole: { type: string, example: "Home buyer" }
  *               city: { type: string }
  *               quote: { type: string }
  *               rating: { type: integer, minimum: 1, maximum: 5 }

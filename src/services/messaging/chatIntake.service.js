@@ -63,7 +63,6 @@ function detectIntent(text) {
 }
 
 let cityCache = { at: 0, rows: [] };
-const CITY_ALIASES = { gurgaon: 'gurugram', bangalore: 'bengaluru', bombay: 'mumbai', calcutta: 'kolkata', madras: 'chennai', 'new delhi': 'delhi', poona: 'pune' };
 async function cities() {
   if (Date.now() - cityCache.at < 10 * 60 * 1000) return cityCache.rows;
   const rows = (await pool.query('SELECT city_name FROM cities')).rows.map((r) => r.city_name);
@@ -126,7 +125,9 @@ async function parseFields(text, intent) {
     }
   }
   if (!out.city) {
-    for (const [alias, canonical] of Object.entries(CITY_ALIASES)) {
+    const aliases = (await configService.getConfig('geo.city_aliases', {})) || {};
+    const pairs = Object.entries(aliases).flatMap(([canonical, names]) => (Array.isArray(names) ? names : []).map((alias) => [alias, canonical]));
+    for (const [alias, canonical] of pairs) {
       if (new RegExp(`\\b${alias}\\b`).test(lower)) {
         out.city = list.find((c) => c.toLowerCase() === canonical) || canonical.replace(/\b\w/g, (c) => c.toUpperCase());
         break;

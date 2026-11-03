@@ -237,7 +237,7 @@ router.put(
  *                 type: array
  *                 items:
  *                   type: object
- *                   example: { title: "3 BHK flat, Rajouri Garden", bank: "State Bank of India", reserve_price: "1.2 Cr", emd: "12 Lakh", auction_date: "28/10/2026 11:30 AM", city: "Delhi", locality: "Rajouri Garden", area: "1450 sq ft", possession: "Physical", auction_id: "SBI-DL-2291" }
+ *                   example: { title: "3 BHK flat", bank: "State Bank of India", reserve_price: "1.2 Cr", emd: "12 Lakh", auction_date: "28/10/2026 11:30 AM", city: "Delhi", locality: "Rajouri Garden", area: "1450 sq ft", possession: "Physical", auction_id: "SBI-DL-2291" }
  *     responses:
  *       201: { description: Per-item outcome summary }
  */

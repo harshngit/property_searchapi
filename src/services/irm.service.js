@@ -237,6 +237,8 @@ async function getIrmProfile(profileId) {
     dealRooms: Object.fromEntries(rooms.rows.map((r) => [r.status, r.n])),
     alerts: Object.fromEntries(alerts.rows.map((r) => [r.status, r.n])),
     portfolio: portfolio.rows[0],
+    // Rule-based fit ranking (no paid model) - indicative, never investment advice.
+    matchDisclaimers: await require('./disclaimer.service').getDisclaimers(['investment_guidance', 'ai_output']),
     aiMatches: await Promise.all(matches.map(async (m) => ({ score: m.score, reasons: m.reasons, deal: await signUrls(m.deal, 'primary_image') }))),
   };
 }

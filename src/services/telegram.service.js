@@ -28,7 +28,7 @@ const LISTING_STEPS = [
 ];
 
 const PHONE_STEP = { key: 'intake_phone', text: 'Please share your mobile number so your A R Buildwel representative can call you.', contact: true };
-const POST_HINT = 'Send your property details in one message - type, BHK, area, price and location (e.g. "Selling 3 BHK flat, 1650 sq ft, Sector 57 Gurugram, 1.6 Cr") - and then the photos.';
+const POST_HINT = 'Send your property details in one message - type, BHK, area, price and location (e.g. "Selling 3 BHK flat, 1650 sq ft, your locality and city, 1.6 Cr") - and then the photos.';
 const intake = () => require('./messaging/chatIntake.service');
 
 function token() {

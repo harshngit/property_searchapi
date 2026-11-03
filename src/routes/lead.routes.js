@@ -81,6 +81,7 @@ router.get(
     query('status').optional().isIn(LEAD_STATUSES),
     query('assignedTo').optional().isUUID(),
     query('source').optional().isIn(LEAD_SOURCES),
+    query('search').optional().isString().isLength({ max: 120 }),
     query('dateFrom').optional().isISO8601(),
     query('dateTo').optional().isISO8601(),
   ],

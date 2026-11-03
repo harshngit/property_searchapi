@@ -303,7 +303,7 @@ async function invoicePdf(user, purchaseId) {
   y -= 6;
   line(`Taxable value: ${money(p.amount_inr)}`);
   line(`CGST @ ${gst.cgst}%: ${money(half)}    SGST @ ${gst.sgst}%: ${money(Number(p.gst_inr) - half)}`);
-  line(`(or IGST @ ${gst.igst}%: ${money(p.gst_inr)} for supplies outside Delhi)`, { size: 9 });
+  line(`(or IGST @ ${gst.igst}%: ${money(p.gst_inr)} for inter-state supplies)`, { size: 9 });
   line(`Total: ${money(p.total_inr)}`, { size: 13, f: bold });
   y -= 6;
   line(`Paid by ${p.gateway === 'razorpay' ? 'Razorpay' : p.gateway === 'upi' ? 'UPI' : p.gateway === 'bank' ? 'bank transfer' : 'transfer recorded by A R Buildwel'}${p.reference ? ` (ref ${p.reference})` : ''}${p.gateway_payment_id ? ` (payment ${p.gateway_payment_id})` : ''}`, { size: 9 });

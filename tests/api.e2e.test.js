@@ -657,6 +657,15 @@ test('CRM gaps: payments list/stats, AI insights/stats/review, trend report, unr
   assert.ok(Array.isArray(payments.data.items));
   const stats = await api('GET', '/payments/stats', { token: A });
   assert.ok('collected_amount' in stats.data);
+  // CRM top-bar search: leads by customer name or listing, never by phone.
+  const cust = await require('../src/services/customer.service').findOrCreateCustomerByContact({ fullName: `Searchable Sharma ${RUN}`, mobile: `7${String(Math.floor(Math.random() * 1e9)).padStart(9, '0')}` });
+  await pool.query(`INSERT INTO leads (customer_id, status, source) VALUES ($1, 'new', 'website')`, [cust.id]);
+  const byName = await api('GET', `/leads?search=${encodeURIComponent(`Searchable Sharma ${RUN}`)}`, { token: A });
+  assert.deepEqual(byName.data.items.map((l) => l.customer_id), [cust.id]);
+  assert.equal((await api('GET', `/leads?search=${cust.mobile}`, { token: A })).data.items.length, 0, 'not searchable by phone');
+  // No gateway for deal payments (contract): the old stub routes are gone.
+  assert.equal((await api('POST', '/payments/webhook', { body: { gatewayOrderId: 'x', gatewaySignature: 'any', status: 'success' } })).status, 404);
+  assert.equal((await api('POST', '/payments/initiate', { token: A, body: {} })).status, 404);
 
   const trend = await api('GET', '/reports/trend?days=7', { token: A });
   assert.equal(trend.data.series.length, 7);
@@ -3175,7 +3184,9 @@ test('advertising: eligibility approval + AV code, rate card, GST invoice, payme
   await api('POST', `/ads/campaigns/${dg.data.id}/review`, { token: A, body: { decision: 'approve' } });
   await pool.query(`UPDATE ad_campaigns SET status = 'ended' WHERE id <> $1 AND status = 'approved' AND placements ? 'digest_sponsored'`, [dg.data.id]);
   const line = await require('../src/services/advertising.service').digestSponsor(ctx.customer.id);
-  assert.match(line, new RegExp(`^Sponsored: Digest offer ${RUN}`));
+  // An object since the approved WhatsApp template (headline + body as variables).
+  assert.match(line.text, new RegExp(`^Sponsored: Digest offer ${RUN}`));
+  assert.equal(line.headline, `Digest offer ${RUN}`);
   assert.equal((await api('GET', `/ads/campaigns/${dg.data.id}`, { token: V })).data.sendsUsed, 1);
 
   // Admin: revenue dashboard, advertiser list, suggestions; sweep ends finished campaigns.
@@ -7268,4 +7279,132 @@ test('Engine 6 market intelligence (rule-based): area price trend, growth and in
 
   // No AI was called for any of it.
   assert.equal((await pool.query(`SELECT COUNT(*)::int AS n FROM ai_runs WHERE created_at > now() - interval '5 minutes' AND entity_type IN ('market_area', 'portfolio')`)).rows[0].n, 0);
+});
+
+test('optional paid AI beside the rules: Exchange condition check on the indicative estimate (#14), institutional approvals review with Claude (#15); the rule outputs are unchanged', async () => {
+  const A = ctx.admin.token;
+  // ---- #14: the owner asks; paid from their credits; the estimate itself stays
+  const owner = await createUser('customer', 'aiex-owner');
+  const other = await createUser('customer', 'aiex-other');
+  const flat = (await pool.query(
+    `INSERT INTO properties (created_by, title, property_type, transaction_type, city, locality, bedrooms, area_sqft, price, price_value, status, age_of_property, furnishing)
+     VALUES ($1, $2, 'apartment', 'sell', $3, 'Central', 2, 1000, 'x', 7000000, 'approved', '10+ years', 'semi-furnished') RETURNING id`,
+    [owner.id, `AI exchange flat ${RUN}`, `AI Ex City ${RUN}`]
+  )).rows[0].id;
+  const req = await api('POST', '/exchange/requests', { token: owner.token, body: { oldPropertyId: flat, reinvestmentIntent: 'guidance' } });
+  assert.equal(req.status, 201, JSON.stringify(req.body));
+  const X = req.data.id;
+  const base = req.data.oldPropertyValuation;
+  assert.ok(base > 0);
+  assert.equal(req.data.guidance.aiEstimate, null, 'nothing until asked');
+  assert.equal((await api('POST', `/exchange/requests/${X}/ai-estimate`, { token: owner.token })).status, 402, 'no credits, no model call');
+  assert.equal((await api('POST', `/exchange/requests/${X}/ai-estimate`, { token: other.token })).status, 403);
+  await api('POST', '/ai-credits/admin/credit', { token: A, body: { userId: owner.id, credits: 10, note: 'exchange check' } });
+  const est = await api('POST', `/exchange/requests/${X}/ai-estimate`, { token: owner.token });
+  assert.equal(est.status, 200, JSON.stringify(est.body));
+  assert.deepEqual([est.data.creditsCharged, est.data.balance], [3, 7]);
+  assert.equal(est.data.baseEstimate, base);
+  assert.ok(Math.abs(est.data.adjustmentPercent) <= 15, 'clamped');
+  assert.equal(est.data.adjustedEstimate, Math.round(base * (1 + est.data.adjustmentPercent / 100)));
+  assert.match(est.data.disclaimer, /indicative estimate.*not a valuation/i);
+  const after = await api('GET', `/exchange/requests/${X}`, { token: owner.token });
+  assert.equal(after.data.oldPropertyValuation, base, 'the estimate is not replaced');
+  assert.equal(after.data.guidance.aiEstimate.adjustedEstimate, est.data.adjustedEstimate);
+  assert.equal(after.data.guidance.aiEstimate.stale, false);
+  // A staff change to the estimate marks the AI check as stale.
+  await api('PUT', `/exchange/requests/${X}/valuation`, { token: A, body: { value: base + 500000, note: 'Site visit by the representative' } });
+  assert.equal((await api('GET', `/exchange/requests/${X}`, { token: owner.token })).data.guidance.aiEstimate.stale, true);
+
+  // ---- #15: staff ask Claude to review the approvals; staff pay too
+  const created = await api('POST', '/institutional/listings', {
+    token: ctx.sales.token,
+    body: {
+      institutionName: `AI Review School ${RUN}`, assetClass: 'k12_school', boardAffiliation: 'CBSE', yearEstablished: 2001, city: `AI Inst City ${RUN}`, locality: 'Campus Area',
+      address: '1 School Road', latitude: 26.9, longitude: 75.8, campusAreaAcres: 2, studentEnrollment: 500, nocStatus: 'pending',
+      approvals: [{ name: 'CBSE affiliation', status: 'valid' }], landOwnership: 'owned', dealType: 'full_sale', askingPriceCr: 20, annualRevenueCr: 5, ebitdaCr: 2,
+    },
+  });
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  const P = created.data.id;
+  const reviewer = await createUser('admin', 'aiinst-staff');
+  const ddBefore = (await api('GET', `/institutional/manage/listings/${P}/due-diligence`, { token: reviewer.token })).data;
+  assert.equal(ddBefore.aiReview, null);
+  assert.equal((await api('POST', `/institutional/manage/listings/${P}/ai-approvals-review`, { token: owner.token })).status, 403, 'staff only');
+  assert.equal((await api('POST', `/institutional/manage/listings/${P}/ai-approvals-review`, { token: reviewer.token })).status, 402, 'staff pay from their own credits');
+  await api('POST', '/ai-credits/admin/credit', { token: A, body: { userId: reviewer.id, credits: 40, note: 'approvals review' } });
+  const rev = await api('POST', `/institutional/manage/listings/${P}/ai-approvals-review`, { token: reviewer.token });
+  assert.equal(rev.status, 200, JSON.stringify(rev.body));
+  assert.deepEqual([rev.data.creditsCharged, rev.data.balance], [30, 10]);
+  assert.match(rev.data.disclaimer, /chartered accountant.*legal counsel/i);
+  const run = (await pool.query(`SELECT provider, model, user_id FROM ai_runs WHERE activity_key = 'institutional_approvals_review' AND entity_id = $1 AND status = 'ok'`, [P])).rows[0];
+  assert.deepEqual([run.provider, run.model, run.user_id], ['claude', 'claude-opus-5-5', reviewer.id]);
+  const ddAfter = (await api('GET', `/institutional/manage/listings/${P}/due-diligence`, { token: reviewer.token })).data;
+  assert.ok(ddAfter.aiReview && ddAfter.aiReview.disclaimer);
+  assert.deepEqual(ddAfter.riskFlags, ddBefore.riskFlags, 'rule-based flags untouched');
+  assert.ok(ddAfter.riskFlags.every((f) => f.source === 'rules'));
+  assert.ok(ddAfter.riskFlags.some((f) => /NOC is pending/.test(f.detail)));
+  // The public listing never carries the staff AI review.
+  assert.ok(!('aiReview' in ((await api('GET', `/institutional/listings/${P}`)).data?.dueDiligence || {})) || (await api('GET', `/institutional/listings/${P}`)).data.dueDiligence.aiReview === undefined);
+});
+
+test('acceptance gates: images showing contact details or a QR code are blocked by self-hosted OCR / QR reading with no AI call (#8); no hardcoded places in any app', async () => {
+  const { Jimp, loadFont } = require('jimp');
+  const fonts = require('jimp/fonts');
+  const imageScan = require('../src/services/imageScan.service');
+  const fraud = require('../src/services/fraud.service');
+  const font = await loadFont(fonts.SANS_64_BLACK);
+  // A plain property-photo-sized image with printed text on it.
+  const picture = async (lines) => {
+    const img = new Jimp({ width: 1400, height: 200 + lines.length * 110, color: 0xffffffff });
+    lines.forEach((text, i) => img.print({ font, x: 40, y: 60 + i * 100, text }));
+    return img.getBuffer('image/png');
+  };
+  const aiBefore = (await pool.query('SELECT COUNT(*)::int AS n FROM ai_runs')).rows[0].n;
+
+  const blocked = [
+    ['mobile number', ['Call 9876543210'], 'phone'],
+    ['spaced mobile', ['Call 98765 43210'], 'phone'],
+    ['with country code', ['+91 9876543210'], 'phone'],
+    ['landline', ['Office 011 41234567'], 'phone'],
+    ['email', ['sales@example.com'], 'email'],
+    ['website', ['www.example.com'], 'url'],
+    ['WhatsApp mention', ['WhatsApp us today'], 'whatsapp'],
+    ['street address', ['House No 42 Main Road'], 'address'],
+    ['PIN code', ['Pincode 110027'], 'address'],
+  ];
+  for (const [label, lines, kind] of blocked) {
+    const a = await imageScan.analyse(await picture(lines));
+    assert.notEqual(a.scan.status, 'clean', `${label}: ${JSON.stringify(a.scan)}`);
+    assert.ok(a.scan.reasons.join(' ').includes(kind), `${label} names ${kind}: ${JSON.stringify(a.scan)}`);
+    assert.equal(a.scan.ai, false);
+  }
+  // A clear read is refused before the file is stored (422).
+  await assert.rejects(fraud.screenUpload(await picture(['Call 9876543210'])), (e) => e.statusCode === 422 && /Contact details/.test(e.message));
+
+  // A QR code (WhatsApp link, UPI id) pasted onto a photo is blocked, as is a small one in a corner.
+  const QR = require('qrcode');
+  for (const [payload, size, at] of [['https://wa.me/919800000000', 300, [1100, 600]], ['upi://pay?pa=someone@bank', 160, [20, 20]]]) {
+    const photo = new Jimp({ width: 1600, height: 1000, color: 0xb0a080ff });
+    photo.composite(await Jimp.read(await QR.toBuffer(payload, { width: size })), ...at);
+    const a = await imageScan.analyse(await photo.getBuffer('image/jpeg'));
+    assert.equal(a.scan.status, 'blocked', `QR ${payload}: ${JSON.stringify(a.scan)}`);
+    assert.ok(a.scan.qr && /QR code/.test(a.scan.reasons.join(' ')));
+    assert.equal(a.scan.ai, false);
+  }
+
+  // Ordinary images and numbers that are not contact details stay clean.
+  const clean = [
+    ['no text', new Jimp({ width: 800, height: 800, color: 0x3366ccff })],
+  ];
+  for (const [label, img] of clean) assert.equal((await imageScan.analyse(await img.getBuffer('image/png'))).scan.status, 'clean', label);
+  for (const lines of [['3 BHK Flat'], ['Price 1.6 Crore'], ['Area 1650 sq ft']]) {
+    const a = await imageScan.analyse(await picture(lines));
+    assert.ok(!/Contact details/.test(a.scan.reasons.join(' ')), `${lines}: ${JSON.stringify(a.scan)}`);
+  }
+  assert.equal((await pool.query('SELECT COUNT(*)::int AS n FROM ai_runs')).rows[0].n, aiBefore, 'no AI call');
+
+  // Static analysis gate.
+  const { spawnSync } = require('child_process');
+  const lint = spawnSync(process.execPath, ['scripts/checkHardcodedGeo.js'], { cwd: require('path').join(__dirname, '..'), encoding: 'utf8' });
+  assert.equal(lint.status, 0, lint.stderr);
 });

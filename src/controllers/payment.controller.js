@@ -1,26 +1,6 @@
 const paymentService = require('../services/payment.service');
 const { success } = require('../utils/response');
 
-// POST /api/payments/initiate
-async function initiatePayment(req, res, next) {
-  try {
-    const { payment, gatewayOrder } = await paymentService.initiatePayment(req.body, req.user);
-    return success(res, 201, 'Payment initiated successfully', { payment, gatewayOrder });
-  } catch (err) {
-    next(err);
-  }
-}
-
-// POST /api/payments/webhook (public)
-async function handleWebhook(req, res, next) {
-  try {
-    const payment = await paymentService.handleWebhook(req.body);
-    return success(res, 200, 'Webhook processed successfully', payment);
-  } catch (err) {
-    next(err);
-  }
-}
-
 // GET /api/payments/:id
 async function getPayment(req, res, next) {
   try {
@@ -105,8 +85,6 @@ async function getPaymentStats(req, res, next) {
 module.exports = {
   listPayments,
   getPaymentStats,
-  initiatePayment,
-  handleWebhook,
   getPayment,
   getPaymentsByDeal,
   getMilestonesByDeal,

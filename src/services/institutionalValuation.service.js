@@ -186,7 +186,7 @@ async function compute(l) {
     impliedEbitdaMultiple: asking && ebitda ? round(asking / ebitda, 1) : null,
     impliedRevenueMultiple: asking && revenue ? round(asking / revenue, 1) : null,
     ebitdaLinked, assetBased, replacementCost: replacement, enrollmentTrend: trend, exitPotential: exit, benchmarking: bench,
-    basis: 'Self-reported figures and platform parameters. Indicative only - not a certified valuation.',
+    basis: 'Self-reported figures and platform parameters. Indicative only - not a certified valuation. Get a registered valuer, a CA and legal counsel before any decision.',
     computedAt: new Date().toISOString(),
   };
 }

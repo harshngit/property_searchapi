@@ -162,16 +162,7 @@ async function getCircleRate({ cityId, localityId, propertyType }) {
 
 // Listings store the city as typed, so a city can appear under an older or
 // alternate name as well.
-const CITY_ALIASES = {
-  delhi: ['new delhi'],
-  gurugram: ['gurgaon'],
-  bengaluru: ['bangalore'],
-  mumbai: ['bombay'],
-  kolkata: ['calcutta'],
-  chennai: ['madras'],
-  visakhapatnam: ['vizag'],
-  goa: ['panaji', 'panjim'],
-};
+const cityAliases = async () => (await require('./config.service').getConfig('geo.city_aliases', {})) || {};
 
 // Largest distance at which a city with listings still counts as "near"
 // the visitor when their own city has none.
@@ -204,9 +195,10 @@ async function findNearestCity(lat, lng) {
   );
   if (!near.rows.length) return { city: null, listingCity: null };
 
+  const aliases = await cityAliases();
   const namesFor = (cityName) => {
     const key = cityName.toLowerCase();
-    return [key, ...(CITY_ALIASES[key] || [])];
+    return [key, ...(aliases[key] || [])];
   };
   const allNames = near.rows.flatMap((row) => namesFor(row.city_name));
   const counts = await pool.query(

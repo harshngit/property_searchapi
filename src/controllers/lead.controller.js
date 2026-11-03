@@ -26,6 +26,7 @@ async function listLeads(req, res, next) {
       source: req.query.source,
       dateFrom: req.query.dateFrom,
       dateTo: req.query.dateTo,
+      search: req.query.search,
     };
 
     const { items, pagination } = await leadService.listLeads(req.user, filters, page, limit);

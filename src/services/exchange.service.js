@@ -286,6 +286,8 @@ async function detail(user, id) {
     ...shape(e, user),
     guidance: {
       oldPropertyValuation: old, valuationDisclaimer: s.valuationDisclaimer,
+      // #14: the optional AI condition check, beside (never instead of) the estimate.
+      aiEstimate: aiEstimateView(e),
       targetTypicalValue: targetTypical, targetBasis: targetTypical ? `Median of ${typical.listings} live listings matching what you want` : 'Not enough live listings to estimate',
       estimatedGap: old !== null && targetTypical !== null ? targetTypical - old : null,
       recommended: [...order.filter((k) => opts.options.some((o) => o.kind === k)), ...opts.options.map((o) => o.kind).filter((k) => !order.includes(k))],
@@ -295,6 +297,91 @@ async function detail(user, id) {
     legs: legs.map((l) => ({ dealId: l.id, stage: l.stage, dealValue: n(l.deal_value), property: l.title, linkedDealId: l.linked_deal_id })),
     feeNote: 'Professional fee: 1% + GST on the gross value of each leg, each leg invoiced separately - 50% at the Agreement to Sell and 50% at the Sale Deed.',
   };
+}
+
+// ------------------------------------------------------------ #14 AI condition check (paid, optional)
+
+// The owner (or staff) may ask Serchi to read the old property's condition
+// details and suggest a small adjustment to the indicative estimate. Paid
+// from the asker's AI credits. The rule / staff estimate is never changed:
+// the AI figure is stored on its own, clamped, and always disclaimed.
+const AI_ESTIMATE_SCHEMA = {
+  type: 'object',
+  properties: {
+    adjustment_percent: { type: 'number' },
+    condition: { type: 'string', enum: ['typical', 'better_than_typical', 'worse_than_typical', 'unclear'] },
+    factors: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: { factor: { type: 'string' }, effect: { type: 'string', enum: ['up', 'down', 'neutral'] }, note: { type: 'string' } },
+        required: ['factor', 'effect', 'note'],
+        additionalProperties: false,
+      },
+    },
+    reasoning: { type: 'string' },
+  },
+  required: ['adjustment_percent', 'condition', 'factors', 'reasoning'],
+  additionalProperties: false,
+};
+
+function aiEstimateView(e) {
+  const r = e.ai_estimate_review;
+  if (!r) return null;
+  // Asked against an estimate that has since changed: show it, but say so.
+  return { ...r, stale: n(e.old_property_valuation) !== r.baseEstimate };
+}
+
+async function aiEstimate(user, id, meta = {}) {
+  const e = await load(id);
+  assertAccess(user, e);
+  if (!OPEN.includes(e.status)) throw badRequest('This request is closed');
+  const base = n(e.old_property_valuation);
+  if (!(base > 0)) throw badRequest('There is no indicative estimate yet - your representative will add one first');
+  const p = (await pool.query(
+    `SELECT property_type::text AS property_type, bedrooms, bathrooms, area_sqft, carpet_area_sqft, age_of_property, floor_number, total_floors, furnishing, facing,
+            possession_status, parking_spots, gated_community, amenities, tags, left(description, 1500) AS description
+     FROM properties WHERE id = $1`,
+    [e.old_property_id]
+  )).rows[0];
+  const max = Math.abs(Number(await configService.getConfig('exchange.ai_adjust_max_percent', 15))) || 15;
+  const facts = Object.fromEntries(Object.entries(p || {}).filter(([, v]) => v !== null && v !== '' && !(Array.isArray(v) && !v.length)));
+  const out = await require('./ai/serchi').run('exchange_estimate_adjust', {
+    user,
+    entityType: 'exchange_request',
+    entityId: id,
+    schema: AI_ESTIMATE_SCHEMA,
+    system:
+      'You help an Indian property platform give owners an indicative estimate of their property for an exchange. You never value a property. ' +
+      `Given an area-rate estimate and the property's own details, suggest a condition adjustment between -${max} and +${max} percent (0 when the details say nothing unusual), ` +
+      'list the factors that move it, and explain briefly. Never mention contact details or people.',
+    prompt: JSON.stringify({
+      indicativeEstimateInr: base,
+      estimateSource: e.valuation_source,
+      estimateBasis: e.valuation_basis,
+      city: e.old_city,
+      locality: e.old_locality,
+      property: facts,
+      ownerNotes: e.notes ? String(e.notes).slice(0, 800) : null,
+    }),
+  });
+  const raw = Number(out.json?.adjustment_percent);
+  const pct = Math.round(Math.max(-max, Math.min(max, Number.isFinite(raw) ? raw : 0)) * 10) / 10;
+  const review = {
+    baseEstimate: base,
+    adjustmentPercent: pct,
+    adjustedEstimate: Math.round(base * (1 + pct / 100)),
+    condition: out.json?.condition || 'unclear',
+    factors: (out.json?.factors || []).slice(0, 8).map((f) => ({ factor: String(f.factor).slice(0, 80), effect: f.effect, note: String(f.note).slice(0, 200) })),
+    reasoning: String(out.json?.reasoning || '').slice(0, 800),
+    model: out.model,
+    askedBy: user.id,
+    at: new Date().toISOString(),
+    disclaimer: out.disclaimer,
+  };
+  await pool.query('UPDATE exchange_requests SET ai_estimate_review = $2 WHERE id = $1', [id, JSON.stringify(review)]);
+  await auditService.log({ actor: user, action: 'exchange.ai_estimate', entityType: 'exchange_request', entityId: id, after: { adjustmentPercent: pct, credits: out.creditsCharged }, ...meta });
+  return { ...review, stale: false, creditsCharged: out.creditsCharged, balance: out.balance };
 }
 
 // ------------------------------------------------------------ owner actions
@@ -467,4 +554,4 @@ async function summary() {
   return r;
 }
 
-module.exports = { INTENTS, OPTION_LABEL, myListings, create, list, detail, options, expressInterest, cancel, setValuation, confirmInterest, declineInterest, closeLinked, summary };
+module.exports = { INTENTS, OPTION_LABEL, myListings, create, list, detail, options, aiEstimate, expressInterest, cancel, setValuation, confirmInterest, declineInterest, closeLinked, summary };

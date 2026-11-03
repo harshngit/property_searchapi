@@ -982,7 +982,94 @@ async function dueDiligence(propertyId, { internal = false } = {}) {
       'These flags are indicative, from the details declared on the listing. A chartered accountant (CA) and legal counsel must verify the approvals, compliance and finances before any transaction.'
     ),
     disclaimer: await disclaimer(),
+    // The optional paid AI review (#15), kept apart from the rule-based flags above.
+    aiReview: internal ? l.ai_approvals_review || null : undefined,
   };
+}
+
+// #15 optional AI review of the approvals (Claude, paid from the asker's AI
+// credits). Reads the declared approvals and up to 3 approval documents from
+// the data room. Stored on its own and shown beside the rule-based flags -
+// it never adds to, removes or changes them.
+const APPROVAL_DOC_TYPES = ['regulatory_approval', 'noc', 'trust_deed', 'title_documents', 'land_records'];
+const APPROVALS_SCHEMA = {
+  type: 'object',
+  properties: {
+    summary: { type: 'string' },
+    missing_or_unclear: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: { approval: { type: 'string' }, issue: { type: 'string', enum: ['missing', 'expired', 'pending', 'inconsistent', 'unclear'] }, severity: { type: 'string', enum: ['low', 'medium', 'high'] }, detail: { type: 'string' } },
+        required: ['approval', 'issue', 'severity', 'detail'],
+        additionalProperties: false,
+      },
+    },
+    document_findings: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: { document: { type: 'string' }, finding: { type: 'string' }, severity: { type: 'string', enum: ['low', 'medium', 'high'] } },
+        required: ['document', 'finding', 'severity'],
+        additionalProperties: false,
+      },
+    },
+    questions_for_seller: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['summary', 'missing_or_unclear', 'document_findings', 'questions_for_seller'],
+  additionalProperties: false,
+};
+
+async function aiApprovalsReview(user, propertyId, meta = {}) {
+  if (!isStaff(user)) throw forbidden('A R staff only');
+  const l = await row(propertyId);
+  const docs = (await pool.query(
+    `SELECT d.id, d.document_type, d.title, v.object_path, v.file_name, v.mime_type
+     FROM deal_room_documents d
+     JOIN LATERAL (SELECT * FROM deal_room_document_versions v WHERE v.document_id = d.id AND v.status = 'approved' ORDER BY v.version DESC LIMIT 1) v ON true
+     WHERE d.property_id = $1 AND d.is_active AND d.document_type = ANY($2::text[])
+     ORDER BY array_position($2::text[], d.document_type::text), d.created_at DESC LIMIT 3`,
+    [propertyId, APPROVAL_DOC_TYPES]
+  )).rows;
+  if (!(l.approvals || []).length && !docs.length) throw badRequest('Declare the approvals on the listing or add an approval document to the data room first');
+  const { downloadBuffer } = require('../utils/storage');
+  const parts = [];
+  const read = [];
+  for (const d of docs) {
+    const buffer = await downloadBuffer(d.object_path).catch(() => null);
+    if (!buffer) continue;
+    const mime = d.mime_type || '';
+    const name = `${DOC_LABEL[d.document_type] || d.document_type}: ${d.title || d.file_name}`;
+    if ((mime.includes('pdf') || buffer.subarray(0, 5).toString('latin1') === '%PDF-') && buffer.length < 10 * 1024 * 1024) parts.push({ type: 'pdf', data: buffer.toString('base64') });
+    else if (/^image\/(jpeg|png|webp|gif)$/.test(mime) && buffer.length < 5 * 1024 * 1024) parts.push({ type: 'image', mediaType: mime, data: buffer.toString('base64') });
+    else continue;
+    parts.push({ type: 'text', text: `The document above is "${name}".` });
+    read.push(name);
+  }
+  parts.push({
+    type: 'text',
+    text:
+      `An institutional asset is listed for sale in India: a ${ASSET_CLASSES[l.asset_class] || l.asset_class} in ${l.city || 'India'} (deal type: ${l.deal_type || 'not given'}, land: ${l.land_ownership || 'not given'}, NOC: ${l.noc_status || 'not given'}). ` +
+      `Declared approvals: ${JSON.stringify(l.approvals || [])}. Approvals usually expected for this kind of institution: ${JSON.stringify(EXPECTED_APPROVALS[l.asset_class] || [])}. ` +
+      'List approvals that look missing, expired, pending or inconsistent with the documents, findings from each document (names, dates, validity, conditions), ' +
+      'and questions to put to the seller. This is working support for A R Buildwel staff; a CA and legal counsel verify everything. Do not give legal or financial advice.',
+  });
+  const out = await require('./ai/serchi').run('institutional_approvals_review', { user, entityType: 'institutional_listing', entityId: propertyId, schema: APPROVALS_SCHEMA, parts });
+  const j = out.json || {};
+  const review = {
+    summary: String(j.summary || '').slice(0, 1200),
+    missingOrUnclear: (j.missing_or_unclear || []).slice(0, 20),
+    documentFindings: (j.document_findings || []).slice(0, 20),
+    questionsForSeller: (j.questions_for_seller || []).slice(0, 12).map((q) => String(q).slice(0, 300)),
+    documentsRead: read,
+    model: out.model,
+    askedBy: user.id,
+    at: new Date().toISOString(),
+    disclaimer: out.disclaimer,
+  };
+  await pool.query('UPDATE institutional_listings SET ai_approvals_review = $2 WHERE property_id = $1', [propertyId, JSON.stringify(review)]);
+  await auditService.log({ actor: user, action: 'institutional.ai_approvals_review', entityType: 'institutional_listing', entityId: propertyId, after: { documents: read.length, credits: out.creditsCharged }, ...meta });
+  return { ...review, creditsCharged: out.creditsCharged, balance: out.balance };
 }
 
 async function reviewDueDiligence(user, propertyId, { key, status, note }, meta = {}) {
@@ -1032,5 +1119,5 @@ module.exports = {
   createListing, updateListing, listPublic, getListing, myListings, listForStaff,
   getBuyerProfile, saveBuyerProfile, listBuyers, decideBuyer, buyerCapacityDocumentUrl,
   expressInterest, staffCreateDeal, onLeadCreated, act, addOffer, decideOffer, closeDeal, dealView, listDeals, myDeals, evaluate, evaluateBuyerDeals, summary,
-  dueDiligence, reviewDueDiligence, listComparables, addComparable, removeComparable,
+  dueDiligence, reviewDueDiligence, aiApprovalsReview, listComparables, addComparable, removeComparable,
 };

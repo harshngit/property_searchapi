@@ -1,4 +1,3 @@
-const crypto = require('crypto');
 const pool = require('../config/db');
 const { isAdmin } = require('../utils/ownership');
 
@@ -31,109 +30,9 @@ async function assertDealTenantAccess(dealId, user) {
   return result.rows[0];
 }
 
-// POST /api/payments/initiate
-// Creates a `payments` row (status='initiated') and returns a stubbed
-// gateway order payload. No live gateway call is made here.
-async function initiatePayment(data, user) {
-  const { dealId, milestoneId, customerId, amount, currency, gateway } = data;
-
-  await assertDealTenantAccess(dealId, user);
-
-  // TODO: replace this stub with a real gateway order-creation call, e.g.:
-  //   Razorpay: const order = await razorpayInstance.orders.create({ amount: amount * 100, currency, receipt: ... });
-  //   PayU:     const order = await payuClient.createTransaction({ amount, productinfo: ..., ... });
-  // and store order.id below instead of the mocked value.
-  const gatewayOrderId = `stub_order_${crypto.randomBytes(10).toString('hex')}`;
-
-  const result = await pool.query(
-    `INSERT INTO payments (
-       tenant_id, deal_id, milestone_id, customer_id, amount, currency,
-       gateway, gateway_order_id, status, initiated_by
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'initiated', $9)
-     RETURNING *`,
-    [
-      user.tenant_id || null,
-      dealId,
-      milestoneId || null,
-      customerId,
-      amount,
-      currency || 'INR',
-      gateway || 'manual',
-      gatewayOrderId,
-      user.id,
-    ]
-  );
-  const payment = result.rows[0];
-
-  // Stubbed gateway order details - shape mirrors what a real Razorpay/PayU
-  // order-creation response would give the frontend to open its checkout.
-  return {
-    payment,
-    gatewayOrder: {
-      gateway: payment.gateway,
-      orderId: payment.gateway_order_id,
-      amount: payment.amount,
-      currency: payment.currency,
-      keyId: 'stub_key_id', // TODO: real publishable/merchant key from env config
-    },
-  };
-}
-
-// POST /api/payments/webhook (public)
-// Updates payments.status and cascades to payment_milestones.status inside
-// a single transaction, so the two can never drift out of sync.
-async function handleWebhook(payload) {
-  const { gatewayOrderId, gatewayPaymentId, gatewaySignature, status } = payload;
-
-  // TODO: replace this stub with real signature verification, e.g.:
-  //   Razorpay: crypto.createHmac('sha256', RAZORPAY_WEBHOOK_SECRET).update(orderId + '|' + paymentId).digest('hex') === gatewaySignature
-  //   PayU:     verify the posted hash against the PayU merchant salt
-  // For now we just require a signature to be present at all.
-  if (!gatewaySignature) {
-    const err = new Error('Missing gateway signature');
-    err.statusCode = 400;
-    throw err;
-  }
-
-  if (!['success', 'failed', 'refunded'].includes(status)) {
-    throw badRequest('status must be one of: success, failed, refunded');
-  }
-
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    const current = await client.query(
-      'SELECT * FROM payments WHERE gateway_order_id = $1 FOR UPDATE',
-      [gatewayOrderId]
-    );
-    if (current.rows.length === 0) throw notFound('Payment not found for this gateway order id');
-    const payment = current.rows[0];
-
-    const updated = await client.query(
-      `UPDATE payments
-       SET status = $1, gateway_payment_id = $2, gateway_signature = $3
-       WHERE id = $4 RETURNING *`,
-      [status, gatewayPaymentId || null, gatewaySignature, payment.id]
-    );
-
-    if (status === 'success' && payment.milestone_id) {
-      await client.query(
-        `UPDATE payment_milestones SET status = 'paid' WHERE id = $1`,
-        [payment.milestone_id]
-      );
-    }
-
-    await client.query('COMMIT');
-    if (status === 'success') require('./orchestration.service').safeEvaluate(payment.deal_id);
-    return updated.rows[0];
-  } catch (err) {
-    await client.query('ROLLBACK');
-    throw err;
-  } finally {
-    client.release();
-  }
-}
+// No gateway here, by contract: A R Buildwel never holds customer funds and
+// buyer-to-seller payments stay off-platform. Deal milestones are recorded by
+// hand (updateMilestone); this table keeps any earlier rows as read-only history.
 
 async function getPaymentById(id, user) {
   const result = await pool.query('SELECT * FROM payments WHERE id = $1', [id]);
@@ -324,8 +223,6 @@ async function getPaymentStats(user, { from, to } = {}) {
 module.exports = {
   listPayments,
   getPaymentStats,
-  initiatePayment,
-  handleWebhook,
   getPaymentById,
   getPaymentsByDeal,
   getMilestonesByDeal,

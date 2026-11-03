@@ -123,7 +123,7 @@ router.get('/overview', portal.overview);
  *             properties:
  *               purpose: { type: string, enum: [buy, rent] }
  *               propertyType: { type: string, enum: [apartment, villa, independent_house, plot, commercial, farmhouse, other] }
- *               city: { type: string, example: Gurugram }
+ *               city: { type: string, example: City name }
  *               localities: { type: array, items: { type: string }, example: [Sector 56, Golf Course Road] }
  *               budgetMin: { type: number, example: 8000000 }
  *               budgetMax: { type: number, example: 12000000 }
@@ -298,7 +298,7 @@ router.get('/favourites', portal.listFavourites);
  *             type: object
  *             required: [name]
  *             properties:
- *               name: { type: string, example: 3 BHK in Gurugram under 2 Cr }
+ *               name: { type: string, example: 3 BHK under 2 Cr }
  *               filters:
  *                 type: object
  *                 properties:
@@ -456,7 +456,7 @@ const listingValidators = (creating) => [
  *               propertyType: { type: string, enum: [apartment, villa, independent_house, plot, commercial, farmhouse, other] }
  *               transactionType: { type: string, enum: [sell, rent] }
  *               price: { type: string, example: 1.45 Cr }
- *               city: { type: string, example: Gurugram }
+ *               city: { type: string, example: City name }
  *               locality: { type: string, example: Sector 56 }
  *               latitude: { type: number }
  *               longitude: { type: number }
@@ -571,7 +571,7 @@ router.post(
  *             required: [tenantName, monthlyRent, startDate]
  *             properties:
  *               propertyId: { type: string, format: uuid, description: One of the owner's own listings (optional) }
- *               propertyLabel: { type: string, example: "Flat 402, Palm Heights, Sector 56, Gurugram" }
+ *               propertyLabel: { type: string, example: "Flat number, building, locality, city" }
  *               tenantName: { type: string }
  *               tenantMobile: { type: string }
  *               tenantEmail: { type: string }

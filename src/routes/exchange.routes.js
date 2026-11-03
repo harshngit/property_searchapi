@@ -74,6 +74,12 @@ const idp = [param('id').isUUID()];
  *     tags: [Exchange]
  *     security: [{ bearerAuth: [] }]
  *     responses: { 200: { description: Valuation saved } }
+ * /exchange/requests/{id}/ai-estimate:
+ *   post:
+ *     summary: Optional AI condition check on the indicative estimate (#14) - paid from the asker's AI credits; the estimate itself is unchanged
+ *     tags: [Exchange]
+ *     security: [{ bearerAuth: [] }]
+ *     responses: { 200: { description: AI-assisted indicative estimate with its disclaimer }, 402: { description: Not enough AI credits } }
  * /exchange/interests/{id}/confirm:
  *   post:
  *     summary: Staff confirm the chosen option - opens the linked deals
@@ -101,6 +107,7 @@ router.post(
 );
 router.get('/requests/:id', idp, validate, h(async (req, res) => ok(res, 'Exchange request', await exchange.detail(req.user, req.params.id))));
 router.post('/requests/:id/interest', [...idp, body('optionKind').isIn(Object.keys(exchange.OPTION_LABEL)), body('propertyId').optional({ checkFalsy: true }).isUUID()], validate, h(async (req, res) => ok(res, 'Interest recorded', await exchange.expressInterest(req.user, req.params.id, req.body, meta(req)), 201)));
+router.post('/requests/:id/ai-estimate', idp, validate, h(async (req, res) => ok(res, 'AI-assisted indicative estimate', await exchange.aiEstimate(req.user, req.params.id, meta(req)))));
 router.post('/requests/:id/cancel', idp, validate, h(async (req, res) => ok(res, 'Exchange request cancelled', await exchange.cancel(req.user, req.params.id, req.body, meta(req)))));
 router.put('/requests/:id/valuation', authorize(...STAFF), [...idp, body('value').isFloat({ gt: 0 }), body('note').isString().isLength({ min: 5, max: 500 })], validate, h(async (req, res) => ok(res, 'Valuation saved', await exchange.setValuation(req.user, req.params.id, req.body, meta(req)))));
 router.post('/requests/:id/close', authorize(...STAFF), idp, validate, h(async (req, res) => ok(res, 'Exchange closed', await exchange.closeLinked(req.user, req.params.id, meta(req)))));

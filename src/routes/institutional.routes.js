@@ -203,6 +203,8 @@ router.post(
  * /institutional/manage/listings/{id}/due-diligence:
  *   get: { summary: "Due-diligence report with staff notes", tags: [Institutional], security: [{ bearerAuth: [] }], responses: { 200: { description: Report } } }
  *   put: { summary: "Record a review item (ownershipChain, encumbrance, enrollmentAudit, municipalCompliance)", tags: [Institutional], security: [{ bearerAuth: [] }], responses: { 200: { description: Report } } }
+ * /institutional/manage/listings/{id}/ai-approvals-review:
+ *   post: { summary: "Optional AI review of the approvals and approval documents (#15, Claude) - paid from the asker's AI credits; CA + legal counsel must verify", tags: [Institutional], security: [{ bearerAuth: [] }], responses: { 200: { description: AI review }, 402: { description: Not enough AI credits } } }
  * /institutional/manage/comparables:
  *   get: { summary: "Comparable transactions", tags: [Institutional], security: [{ bearerAuth: [] }], responses: { 200: { description: Comparables } } }
  *   post: { summary: "Add a comparable transaction (re-benchmarks that asset class)", tags: [Institutional], security: [{ bearerAuth: [] }], responses: { 201: { description: Comparable } } }
@@ -234,6 +236,7 @@ manage.get('/buyers/:id/capacity-document', idp, validate, h(async (req, res) =>
 manage.post('/listings/:id/valuation', idp, validate, h(async (req, res) => ok(res, 'Valuation recomputed', await valuation.refresh(req.params.id))));
 manage.get('/listings/:id/due-diligence', idp, validate, h(async (req, res) => ok(res, 'Institutional due diligence', await institutional.dueDiligence(req.params.id, { internal: true }))));
 manage.put('/listings/:id/due-diligence', idp, [body('key').isString(), body('status').isIn(['ok', 'issue', 'pending']), body('note').optional({ checkFalsy: true }).isString().isLength({ max: 2000 })], validate, h(async (req, res) => ok(res, 'Review recorded', await institutional.reviewDueDiligence(req.user, req.params.id, req.body, meta(req)))));
+manage.post('/listings/:id/ai-approvals-review', idp, validate, h(async (req, res) => ok(res, 'AI approvals review', await institutional.aiApprovalsReview(req.user, req.params.id, meta(req)))));
 manage.get('/comparables', h(async (req, res) => ok(res, 'Comparables', await institutional.listComparables(req.query))));
 manage.post('/comparables', [body('assetClass').isIn(Object.keys(institutional.ASSET_CLASSES)), body('dealValueCr').isFloat({ gt: 0 })], validate, h(async (req, res) => ok(res, 'Comparable added', await institutional.addComparable(req.user, req.body, meta(req)), 201)));
 manage.delete('/comparables/:id', idp, validate, h(async (req, res) => ok(res, 'Comparable removed', await institutional.removeComparable(req.user, req.params.id, meta(req)))));

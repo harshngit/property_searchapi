@@ -19,8 +19,10 @@
 //   document_analysis   #9 document classification, risk flags, anomalies (Claude)
 //   field_fraud_review  #10 second opinion on a field-partner submission (signals + photos)
 //   agreement_review    AI review of a generated agreement (Claude)
+//   exchange_estimate_adjust        #14 condition check beside the Exchange indicative estimate
+//   institutional_approvals_review  #15 review of an institutional listing's approvals (Claude)
 //   translation         drafting interface translations
-// Safety checks (#8 image contact blocking, #11 crawler OCR, #16 duplicates)
+// Safety checks (#8 image contact / QR blocking, #11 crawler OCR, #16 duplicates)
 // and the rule-based scores never call Serchi - they run on rules and
 // self-hosted tools at no AI cost.
 

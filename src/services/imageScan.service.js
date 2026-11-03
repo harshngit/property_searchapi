@@ -90,6 +90,20 @@ async function ocrContactScan(image) {
   }
 }
 
+// QR code scan (self-hosted jsQR, no AI) - a QR on a listing photo is a way
+// around contact masking (a phone, WhatsApp link, UPI id or website).
+function qrScan(image) {
+  try {
+    const small = Math.max(image.bitmap.width, image.bitmap.height) > 1200 ? image.clone().scaleToFit({ w: 1200, h: 1200 }) : image;
+    const { data, width, height } = small.bitmap;
+    const code = require('jsqr')(new Uint8ClampedArray(data.buffer, data.byteOffset, data.length), width, height, { inversionAttempts: 'attemptBoth' });
+    return code ? { found: true, payloadLength: code.data.length } : { found: false };
+  } catch (err) {
+    console.error('[imageScan] QR scan failed:', err.message);
+    return null;
+  }
+}
+
 // Analyse an uploaded image buffer. Returns metadata + a scan verdict:
 // 'blocked' (reject the upload), 'flagged' (keep, send to review) or 'clean'.
 async function analyse(buffer, { scan = true } = {}) {
@@ -105,9 +119,15 @@ async function analyse(buffer, { scan = true } = {}) {
   const reasons = [];
   let status = 'clean';
   let ocr = null;
+  let qr = null;
   if (scan && (await configService.getConfig('fraud.image_scan_enabled', true))) {
+    qr = (await configService.getConfig('fraud.image_qr_scan', true)) ? qrScan(image) : null;
     ocr = await ocrContactScan(image);
-    if (ocr?.kinds.length) {
+    if (qr?.found) {
+      // A decodable QR is never a property detail - reject it outright.
+      status = 'blocked';
+      reasons.push('QR code visible in image');
+    } else if (ocr?.kinds.length) {
       // Clear read = reject; a shaky read goes to human review instead.
       status = ocr.confidence >= 60 ? 'blocked' : 'flagged';
       reasons.push(`Contact details visible in image: ${ocr.kinds.join(', ')}`);
@@ -119,7 +139,7 @@ async function analyse(buffer, { scan = true } = {}) {
       reasons.push('Text-heavy image');
     }
   }
-  return { decodable: true, width, height, phash, exif, scan: { status, reasons, ai: false, ocr: !!ocr } };
+  return { decodable: true, width, height, phash, exif, scan: { status, reasons, ai: false, ocr: !!ocr, qr: !!qr?.found } };
 }
 
-module.exports = { analyse, fingerprint, hamming, looksLikeVisitingCard, OCR_PATTERNS };
+module.exports = { analyse, fingerprint, hamming, looksLikeVisitingCard, qrScan, OCR_PATTERNS };
