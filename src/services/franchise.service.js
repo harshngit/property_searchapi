@@ -1245,7 +1245,7 @@ module.exports = {
   list, get, create, update,
   listTerritories, saveTerritory, grantReserved, withdrawTerritory, listConflicts, resolveConflict,
   calculateForDeal, safeCalculate, listCommissions, releaseCommission, deleteCommission, refreshCollected,
-  raiseInvoice, listInvoices, recordPayment, writeOff, paymentStatus, claimPayment, createRazorpayOrder, verifyRazorpayPayment, recomputeFranchisee, sweep, computeReach,
+  raiseInvoice, listInvoices, recordPayment, writeOff, paymentStatus, claimPayment, settle, createRazorpayOrder, verifyRazorpayPayment, recomputeFranchisee, sweep, computeReach,
   myBranding, saveBrandingDraft, publishBranding, setDomain, brandingForHost,
   dashboard, myBrokers, addBroker, setBrokerStatus, kycQueue, decideKyc,
   listTickets, getTicket, openTicket, replyTicket,

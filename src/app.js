@@ -7,6 +7,7 @@ const swaggerUi = require('swagger-ui-express');
 
 const swaggerSpec = require('./config/swagger');
 const authRoutes = require('./routes/auth.routes');
+const razorpayWebhookRoutes = require('./routes/razorpayWebhook.routes');
 const userRoutes = require('./routes/user.routes');
 const tenantRoutes = require('./routes/tenant.routes');
 const propertyRoutes = require('./routes/property.routes');
@@ -126,6 +127,8 @@ app.use('/api/notifications', notificationRoutes);
 app.use('/api/broker', brokerRoutes);
 app.use('/api/deals', dealRoutes);
 app.use('/api/documents', documentRoutes);
+// Razorpay's server-to-server webhook - signed, no login.
+app.use('/api/webhooks/razorpay', razorpayWebhookRoutes);
 app.use('/api/payments', paymentRoutes);
 app.use('/api/reports', reportRoutes);
 app.use('/api/whatsapp', whatsappRoutes);

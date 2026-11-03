@@ -7408,3 +7408,89 @@ test('acceptance gates: images showing contact details or a QR code are blocked 
   const lint = spawnSync(process.execPath, ['scripts/checkHardcodedGeo.js'], { cwd: require('path').join(__dirname, '..'), encoding: 'utf8' });
   assert.equal(lint.status, 0, lint.stderr);
 });
+
+test('payments: Razorpay webhook settles an AI credit purchase once (signed, amount checked, retries ignored); bank / UPI top-up with a payment screenshot; bank / UPI details and credit rules set by the Super Admin only; balance for the top bar', async () => {
+  const engine = require('../src/services/ai/orchestrator.service');
+  const S = ctx.superAdmin.token;
+  const A = ctx.admin.token;
+  const buyer = await createUser('broker', 'rzp-buyer');
+
+  // ---- balance chip
+  const b0 = await api('GET', '/ai-credits/balance', { token: buyer.token });
+  assert.equal(b0.status, 200, JSON.stringify(b0.body));
+  assert.deepEqual([b0.data.balance, b0.data.low], [0, true]);
+
+  // ---- rules: admins read, only the Super Admin changes; bad IFSC / UPI refused
+  const before = await api('GET', '/ai-credits/admin/rules', { token: A });
+  assert.equal(before.status, 200, JSON.stringify(before.body));
+  assert.equal(before.data.canEdit, false);
+  assert.equal(typeof before.data.paymentDetails.bank, 'object', 'structured bank details (migration 089)');
+  assert.equal((await api('GET', '/ai-credits/admin/rules', { token: buyer.token })).status, 403);
+  const bank = { accountName: 'A R Buildwel Pvt Ltd', accountNumber: '50200012345678', ifsc: 'HDFC0001234', bankName: 'HDFC Bank', branch: 'Connaught Place' };
+  assert.equal((await api('PUT', '/ai-credits/admin/rules', { token: A, body: { paymentDetails: { bank, upi: { id: 'arbuildwel@hdfcbank' } } } })).status, 403);
+  assert.equal((await api('PUT', '/ai-credits/admin/rules', { token: S, body: { paymentDetails: { bank: { ...bank, ifsc: 'HDFC1234' }, upi: {} } } })).status, 400, 'bad IFSC');
+  assert.equal((await api('PUT', '/ai-credits/admin/rules', { token: S, body: { paymentDetails: { bank, upi: { id: 'not-a-upi' } } } })).status, 400, 'bad UPI id');
+  assert.equal((await api('PUT', '/ai-credits/admin/rules', { token: S, body: { creditValidityDays: { purchase: null, grant: 0, referral: 180 } } })).status, 400, 'validity 0 days');
+  const saved = await api('PUT', '/ai-credits/admin/rules', {
+    token: S,
+    body: { paymentDetails: { bank, upi: { id: 'arbuildwel@hdfcbank', name: 'A R Buildwel' } }, referralRewards: { join: 30, usagePercent: 5, dealClosed: 250 }, creditValidityDays: { purchase: null, grant: 60, referral: 180 }, purchaseRefundDays: 10 },
+  });
+  assert.equal(saved.status, 200, JSON.stringify(saved.body));
+  assert.deepEqual([saved.data.paymentDetails.bank.ifsc, saved.data.paymentReady.bank, saved.data.paymentReady.upi, saved.data.referralRewards.join, saved.data.creditValidityDays.grant, saved.data.purchaseRefundDays], ['HDFC0001234', true, true, 30, 60, 10]);
+  const w = await api('GET', '/ai-credits/wallet', { token: buyer.token });
+  assert.deepEqual([w.data.paymentDetails.upi.id, w.data.paymentDetails.bank.accountNumber, w.data.refundDays, w.data.referrals.rewards.join], ['arbuildwel@hdfcbank', '50200012345678', 10, 30], 'users see the details');
+  assert.ok((await pool.query(`SELECT 1 FROM audit_logs WHERE action = 'config_updated' AND entity_id = 'ai.payment_details' AND created_at > now() - interval '1 minute'`)).rows.length, 'audited');
+
+  // ---- bank / UPI top-up with a screenshot (multipart)
+  const pack = w.data.packs[0];
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64');
+  const form = new FormData();
+  form.append('packId', pack.id);
+  form.append('method', 'upi');
+  form.append('reference', `SHOT${RUN}01`);
+  form.append('screenshot', new Blob([png], { type: 'image/png' }), 'payment.png');
+  const shot = await (await fetch(`${BASE}/ai-credits/topups`, { method: 'POST', headers: { Authorization: `Bearer ${buyer.token}` }, body: form })).json();
+  assert.equal(shot.success, true, JSON.stringify(shot));
+  assert.deepEqual([shot.data.hasScreenshot, shot.data.screenshotName], [true, 'payment.png']);
+  const bad = new FormData();
+  bad.append('packId', pack.id);
+  bad.append('method', 'upi');
+  bad.append('reference', `SHOT${RUN}02`);
+  bad.append('screenshot', new Blob(['hello'], { type: 'text/plain' }), 'note.txt');
+  assert.equal((await fetch(`${BASE}/ai-credits/topups`, { method: 'POST', headers: { Authorization: `Bearer ${buyer.token}` }, body: bad })).status, 400, 'only images / PDF');
+  const queue = await api('GET', '/ai-credits/admin/topups', { token: A });
+  assert.equal(queue.data.find((t) => t.id === shot.data.id)?.hasScreenshot, true, 'admin sees there is a screenshot');
+  const other = await createUser('broker', 'rzp-other');
+  assert.equal((await api('GET', `/ai-credits/topups/${shot.data.id}/screenshot`, { token: other.token })).status, 403, 'not someone else\'s');
+
+  // ---- Razorpay webhook: an order made for this purchase, paid while the browser was closed
+  const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
+  if (!secret) return; // the server and this run need RAZORPAY_WEBHOOK_SECRET for the rest
+  const packRow = (await pool.query('SELECT * FROM ai_credit_packs WHERE id = $1', [pack.id])).rows[0];
+  const p = await engine.newPurchase(pool, { id: buyer.id }, packRow, 'razorpay');
+  const orderId = `order_e2e${RUN}`;
+  await pool.query('UPDATE ai_credit_purchases SET gateway_order_id = $2 WHERE id = $1', [p.id, orderId]);
+  const send = (event, amount, eventId, sig) => {
+    const raw = JSON.stringify({ event, payload: { payment: { entity: { id: `pay_e2e${RUN}`, order_id: orderId, amount, status: 'captured' } } } });
+    return fetch(`${BASE}/webhooks/razorpay`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-razorpay-event-id': eventId, 'x-razorpay-signature': sig ?? crypto.createHmac('sha256', secret).update(raw).digest('hex') },
+      body: raw,
+    }).then(async (r) => ({ status: r.status, body: await r.json() }));
+  };
+  const total = Math.round(Number(p.total_inr) * 100);
+  assert.equal((await send('payment.captured', total, `evt_bad${RUN}`, 'deadbeef')).status, 400, 'bad signature');
+  assert.equal((await send('payment.captured', total - 100, `evt_low${RUN}`)).body.outcome, 'amount_mismatch', 'short payment not credited');
+  assert.equal((await api('GET', '/ai-credits/balance', { token: buyer.token })).data.balance, 0);
+  const paid = await send('payment.captured', total, `evt_ok${RUN}`);
+  assert.deepEqual([paid.status, paid.body.outcome], [200, 'settled']);
+  assert.equal((await api('GET', '/ai-credits/balance', { token: buyer.token })).data.balance, p.credits, 'credits added by the webhook');
+  assert.equal((await send('payment.captured', total, `evt_ok${RUN}`)).body.outcome, 'duplicate', 'a retried event is not applied again');
+  assert.equal((await send('order.paid', total, `evt_order${RUN}`)).body.outcome, 'already_paid', 'the second event for the same order adds nothing');
+  const row = (await pool.query('SELECT status, invoice_number, gateway_payment_id FROM ai_credit_purchases WHERE id = $1', [p.id])).rows[0];
+  assert.deepEqual([row.status, !!row.invoice_number, row.gateway_payment_id], ['paid', true, `pay_e2e${RUN}`], 'GST invoice issued');
+  assert.equal((await api('GET', '/ai-credits/balance', { token: buyer.token })).data.balance, p.credits);
+
+  // restore the rules other tests rely on
+  await api('PUT', '/ai-credits/admin/rules', { token: S, body: { paymentDetails: before.data.paymentDetails, referralRewards: before.data.referralRewards, creditValidityDays: before.data.creditValidityDays, purchaseRefundDays: before.data.purchaseRefundDays } });
+});

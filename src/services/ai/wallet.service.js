@@ -4,6 +4,7 @@ const auditService = require('../audit.service');
 const notificationService = require('../notification.service');
 const engine = require('./orchestrator.service');
 const { badRequest, forbidden, notFound } = require('../../utils/httpError');
+const { uploadBuffer, getReadUrl } = require('../../utils/storage');
 
 // AI credit wallet - everything around the spend itself (client, 25 Oct 2026):
 //
@@ -17,6 +18,8 @@ const { badRequest, forbidden, notFound } = require('../../utils/httpError');
 //   Validity    credits expire per kind as the Terms & Conditions say
 //               (ai.credit_validity_days); unused purchased credits can be
 //               refunded within ai.purchase_refund_days.
+//   Rules       the Super Admin sets the bank / UPI details, referral
+//               rewards, validity and refund window (walletRules).
 
 const ADMIN = ['admin', 'super_admin'];
 const assertAdmin = (u) => {
@@ -61,7 +64,7 @@ async function view(user) {
       monthlyCap: s.monthly_cap ?? null,
     },
     expiring: lots.rows.map((l) => ({ credits: l.credits, expiresAt: l.expires_at })),
-    paymentDetails: details || {},
+    paymentDetails: paymentDetailsView(details),
     topups: topups.rows.map(topupView),
     invoices: invoices.rows.map((i) => ({ id: i.id, receiptNumber: i.receipt_number, invoiceNumber: i.invoice_number, packName: i.pack_name, credits: i.credits, totalInr: Number(i.total_inr), gateway: i.gateway, status: i.status, paidAt: i.paid_at, refundedCredits: i.refunded_credits })),
     referrals: {
@@ -71,6 +74,14 @@ async function view(user) {
     },
     refundDays: refundDays === null ? null : Number(refundDays),
   };
+}
+
+// The small balance chip in the CRM top bar / website dashboard.
+async function balance(user) {
+  await engine.ensureWallet(user.id);
+  const w = (await pool.query('SELECT balance, low_balance_alert FROM ai_wallets WHERE user_id = $1', [user.id])).rows[0];
+  const alertAt = w.low_balance_alert ?? Number(await configService.getConfig('ai.low_balance_alert', 25));
+  return { balance: w.balance, low: w.balance <= alertAt };
 }
 
 // ------------------------------------------------------------ settings
@@ -109,14 +120,18 @@ function topupView(t) {
   return {
     id: t.id, userId: t.user_id, userName: t.user_name, packId: t.pack_id, packName: t.pack_name, method: t.method, reference: t.reference,
     amountInr: Number(t.amount_inr), paidOn: t.paid_on, note: t.note, status: t.status, decisionNote: t.decision_note, decidedAt: t.decided_at, purchaseId: t.purchase_id, createdAt: t.created_at,
+    hasScreenshot: !!t.screenshot_path, screenshotName: t.screenshot_name || null,
   };
 }
 
 // The user reports a transfer they made; nothing is credited until an admin checks it.
-async function requestTopup(user, { packId, method, reference, paidOn, note } = {}, meta = {}) {
+const SCREENSHOT_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'];
+async function requestTopup(user, { packId, method, reference, paidOn, note } = {}, meta = {}, file = null) {
   if (!['bank', 'upi'].includes(method)) throw badRequest('Choose bank transfer or UPI');
   const ref = String(reference || '').trim();
   if (ref.length < 6) throw badRequest('Give the UTR / transaction reference of your payment');
+  if (file && !SCREENSHOT_TYPES.includes(file.mimetype)) throw badRequest('The screenshot must be a JPG, PNG, WEBP or PDF');
+  if (file && file.size > 5 * 1024 * 1024) throw badRequest('The screenshot is larger than 5 MB');
   const pack = (await pool.query('SELECT * FROM ai_credit_packs WHERE id = $1 AND is_active', [packId])).rows[0];
   if (!pack) throw notFound('Credit pack not found');
   const gst = Number(await configService.getConfig('ai.credit_gst_percent', 18));
@@ -127,6 +142,13 @@ async function requestTopup(user, { packId, method, reference, paidOn, note } = 
       `INSERT INTO ai_topup_requests (user_id, pack_id, method, reference, amount_inr, paid_on, note) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
       [user.id, pack.id, method, ref.slice(0, 60), v.totalInr, paidOn || null, note ? String(note).slice(0, 300) : null]
     )).rows[0];
+    if (file) {
+      // Without a bucket (local development) the file is noted but not kept.
+      const path = !process.env.GCS_BUCKET_NAME && process.env.NODE_ENV !== 'production'
+        ? `not-stored/ai-topups/${t.id}/${file.originalname}`
+        : await uploadBuffer(file.buffer, `ai-topups/${t.id}`, file.originalname, file.mimetype);
+      t = (await pool.query('UPDATE ai_topup_requests SET screenshot_path = $2, screenshot_name = $3, screenshot_type = $4 WHERE id = $1 RETURNING *', [t.id, path, String(file.originalname).slice(0, 200), file.mimetype])).rows[0];
+    }
   } catch (err) {
     if (err.code === '23505') throw badRequest('This payment reference has already been reported');
     throw err;
@@ -169,6 +191,93 @@ async function decideTopup(admin, id, { action, note } = {}, meta = {}) {
   } else throw badRequest('action must be approve or reject');
   await auditService.log({ actor: admin, action: `ai.topup_${action === 'approve' ? 'approved' : 'rejected'}`, entityType: 'ai_topup_request', entityId: id, after: { note: note || null }, ...meta });
   return topupView({ ...(await pool.query('SELECT t.*, k.name AS pack_name FROM ai_topup_requests t JOIN ai_credit_packs k ON k.id = t.pack_id WHERE t.id = $1', [id])).rows[0] });
+}
+
+// The payment screenshot a user attached - the user themself or an admin.
+async function topupScreenshot(actor, id) {
+  const t = (await pool.query('SELECT user_id, screenshot_path, screenshot_name FROM ai_topup_requests WHERE id = $1', [id])).rows[0];
+  if (!t) throw notFound('Top-up request not found');
+  if (t.user_id !== actor.id) assertAdmin(actor);
+  if (!t.screenshot_path) throw notFound('No screenshot was attached');
+  if (t.screenshot_path.startsWith('not-stored/')) throw badRequest('File storage is not set up here, so the screenshot was not kept');
+  const url = await getReadUrl(t.screenshot_path);
+  if (!url) throw badRequest('The screenshot could not be opened');
+  return { url, name: t.screenshot_name };
+}
+
+// ------------------------------------------------------------ wallet rules (Super Admin)
+
+const RULE_KEYS = ['ai.payment_details', 'ai.referral_rewards', 'ai.credit_validity_days', 'ai.purchase_refund_days', 'ai.low_balance_alert', 'ai.credit_gst_percent'];
+
+function paymentDetailsView(d) {
+  const bank = d && typeof d.bank === 'object' && d.bank ? d.bank : {};
+  const upi = d && typeof d.upi === 'object' && d.upi ? d.upi : {};
+  const str = (v, n) => String(v ?? '').trim().slice(0, n);
+  return {
+    bank: { accountName: str(bank.accountName, 120), accountNumber: str(bank.accountNumber, 30), ifsc: str(bank.ifsc, 11).toUpperCase(), bankName: str(bank.bankName, 80), branch: str(bank.branch, 80) },
+    upi: { id: str(upi.id, 80), name: str(upi.name, 120) },
+    note: str(d?.note, 300),
+  };
+}
+const bankReady = (b) => !!(b.accountName && b.accountNumber && b.ifsc);
+
+async function walletRules(admin) {
+  assertAdmin(admin);
+  const [details, referral, validity, refundDays, lowAlert, gst] = await Promise.all(RULE_KEYS.map((k) => configService.getConfig(k, null)));
+  const pd = paymentDetailsView(details);
+  return {
+    paymentDetails: pd,
+    paymentReady: { bank: bankReady(pd.bank), upi: !!pd.upi.id, online: !!(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET), webhook: !!process.env.RAZORPAY_WEBHOOK_SECRET },
+    referralRewards: { join: Number(referral?.join) || 0, usagePercent: Number(referral?.usagePercent) || 0, dealClosed: Number(referral?.dealClosed) || 0 },
+    creditValidityDays: { purchase: validity?.purchase ?? null, grant: validity?.grant ?? null, referral: validity?.referral ?? null },
+    purchaseRefundDays: refundDays === null || refundDays === undefined ? null : Number(refundDays),
+    lowBalanceAlert: Number(lowAlert ?? 25),
+    gstPercent: Number(gst ?? 18),
+    canEdit: admin.role === 'super_admin',
+  };
+}
+
+const IFSC_RE = /^[A-Z]{4}0[A-Z0-9]{6}$/;
+const UPI_RE = /^[a-z0-9._-]{2,}@[a-z][a-z0-9.-]{1,}$/i;
+function days(v, label) {
+  if (v === null || v === '' || v === undefined) return null;
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 1 || n > 3650) throw badRequest(`${label} must be between 1 and 3650 days, or empty for never`);
+  return n;
+}
+function wholeNumber(v, label, max) {
+  const n = Number(v ?? 0);
+  if (!Number.isInteger(n) || n < 0 || n > max) throw badRequest(`${label} must be a whole number from 0 to ${max}`);
+  return n;
+}
+
+async function saveWalletRules(admin, data = {}, meta = {}) {
+  if (admin.role !== 'super_admin') throw forbidden('Only the Super Admin changes payment details and credit rules');
+  const updates = [];
+  if (data.paymentDetails !== undefined) {
+    const pd = paymentDetailsView(data.paymentDetails);
+    if (pd.bank.ifsc && !IFSC_RE.test(pd.bank.ifsc)) throw badRequest('The IFSC code looks wrong (11 characters, e.g. HDFC0001234)');
+    if (pd.bank.accountNumber && !/^\d{6,18}$/.test(pd.bank.accountNumber)) throw badRequest('The account number should be 6 to 18 digits');
+    if ((pd.bank.accountName || pd.bank.accountNumber || pd.bank.ifsc) && !bankReady(pd.bank)) throw badRequest('Give the account name, account number and IFSC together');
+    if (pd.upi.id && !UPI_RE.test(pd.upi.id)) throw badRequest('The UPI id looks wrong (e.g. arbuildwel@hdfcbank)');
+    updates.push(['ai.payment_details', pd]);
+  }
+  if (data.referralRewards !== undefined) {
+    const r = data.referralRewards || {};
+    updates.push(['ai.referral_rewards', { join: wholeNumber(r.join, 'The joining reward', 10000), usagePercent: wholeNumber(r.usagePercent, 'The usage share', 50), dealClosed: wholeNumber(r.dealClosed, 'The deal reward', 100000) }]);
+  }
+  if (data.creditValidityDays !== undefined) {
+    const v = data.creditValidityDays || {};
+    updates.push(['ai.credit_validity_days', { purchase: days(v.purchase, 'Bought credits'), grant: days(v.grant, 'Added credits'), referral: days(v.referral, 'Referral credits') }]);
+  }
+  if (data.purchaseRefundDays !== undefined) {
+    const v = data.purchaseRefundDays;
+    if (v !== null && v !== '' && (!Number.isInteger(Number(v)) || Number(v) < 0 || Number(v) > 365)) throw badRequest('The refund window must be 0 to 365 days, or empty for no refunds');
+    updates.push(['ai.purchase_refund_days', v === null || v === '' ? null : Number(v)]);
+  }
+  if (data.lowBalanceAlert !== undefined) updates.push(['ai.low_balance_alert', wholeNumber(data.lowBalanceAlert, 'The default low-balance alert', 100000)]);
+  for (const [key, value] of updates) await configService.updateConfig(key, value, { reason: data.reason || 'AI credit rules' }, admin, meta);
+  return walletRules(admin);
 }
 
 // ------------------------------------------------------------ referral credits
@@ -388,7 +497,7 @@ function startScheduler() {
 }
 
 module.exports = {
-  view, saveSettings, requestTopup, listTopups, decideTopup,
+  view, balance, saveSettings, requestTopup, listTopups, decideTopup, topupScreenshot, walletRules, saveWalletRules, paymentDetailsView,
   referralRewards, onJoined, onSpend, onDealClosed, safeOnJoined: safe(onJoined, 'join reward'), safeOnDealClosed: safe(onDealClosed, 'deal reward'),
   invoicePdf, expireCredits, refundPurchase, startScheduler,
 };

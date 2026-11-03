@@ -1,4 +1,5 @@
 const express = require('express');
+const multer = require('multer');
 const { body, param, query } = require('express-validator');
 const router = express.Router();
 
@@ -15,6 +16,7 @@ const meta = (req) => auditService.requestMeta(req);
 const h = asyncHandler;
 const ok = (res, msg, data, code = 200) => success(res, code, msg, data);
 const ADMIN = ['admin', 'super_admin'];
+const screenshotUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 
 router.use(authenticate);
 
@@ -35,7 +37,7 @@ router.use(authenticate);
  *     security: [{ bearerAuth: [] }]
  * /ai-credits/topups:
  *   post:
- *     summary: Report a bank transfer / UPI payment for a pack (with its reference) - credited once an admin approves it
+ *     summary: Report a bank transfer / UPI payment for a pack (with its reference and an optional screenshot - multipart field `screenshot`) - credited once an admin approves it
  *     tags: [AI credits]
  *     security: [{ bearerAuth: [] }]
  * /ai-credits/purchases/{id}/invoice:
@@ -97,6 +99,25 @@ router.use(authenticate);
  *     summary: Edit or switch off a credit pack (Super Admin)
  *     tags: [AI credits]
  *     security: [{ bearerAuth: [] }]
+ * /ai-credits/balance:
+ *   get:
+ *     summary: My balance only, and whether it is below my low-balance alert (for the top bar)
+ *     tags: [AI credits]
+ *     security: [{ bearerAuth: [] }]
+ * /ai-credits/topups/{id}/screenshot:
+ *   get:
+ *     summary: A short-lived link to the payment screenshot of a reported top-up (its user or an admin)
+ *     tags: [AI credits]
+ *     security: [{ bearerAuth: [] }]
+ * /ai-credits/admin/rules:
+ *   get:
+ *     summary: Bank / UPI details, referral rewards, credit validity, refund window and default low-balance alert (admin)
+ *     tags: [AI credits]
+ *     security: [{ bearerAuth: [] }]
+ *   put:
+ *     summary: Change them (Super Admin) - each change is kept in the audit log
+ *     tags: [AI credits]
+ *     security: [{ bearerAuth: [] }]
  * /ai-credits/admin/credit:
  *   post:
  *     summary: Add credits to a user - a bank-transfer purchase (packId + reference) or a grant / correction (credits + note) (admin)
@@ -104,14 +125,17 @@ router.use(authenticate);
  *     security: [{ bearerAuth: [] }]
  */
 router.get('/wallet', h(async (req, res) => ok(res, 'AI credits', await walletService.view(req.user))));
+router.get('/balance', h(async (req, res) => ok(res, 'AI credit balance', await walletService.balance(req.user))));
 const limitRules = ['lowBalanceAlert', 'dailyCap', 'monthlyCap'].map((k) => body(k).optional({ nullable: true }).custom((v) => v === '' || (Number.isInteger(Number(v)) && Number(v) >= 0)));
 router.put('/settings', limitRules, validate, h(async (req, res) => ok(res, 'Settings saved', await walletService.saveSettings(req.user, req.user.id, req.body, meta(req)))));
 router.post(
   '/topups',
+  screenshotUpload.single('screenshot'),
   [body('packId').isUUID(), body('method').isIn(['bank', 'upi']), body('reference').isString().isLength({ min: 6, max: 60 }), body('paidOn').optional({ checkFalsy: true }).isISO8601(), body('note').optional({ nullable: true }).isString().isLength({ max: 300 })],
   validate,
-  h(async (req, res) => ok(res, 'Payment reported - credits are added once it is checked', await walletService.requestTopup(req.user, req.body, meta(req)), 201))
+  h(async (req, res) => ok(res, 'Payment reported - credits are added once it is checked', await walletService.requestTopup(req.user, req.body, meta(req), req.file), 201))
 );
+router.get('/topups/:id/screenshot', [param('id').isUUID()], validate, h(async (req, res) => ok(res, 'Screenshot', await walletService.topupScreenshot(req.user, req.params.id))));
 router.get(
   '/purchases/:id/invoice',
   [param('id').isUUID()],
@@ -137,6 +161,14 @@ router.post(
   [param('id').isUUID(), body('action').isIn(['approve', 'reject']), body('note').optional({ nullable: true }).isString().isLength({ max: 300 })],
   validate,
   h(async (req, res) => ok(res, 'Payment decided', await walletService.decideTopup(req.user, req.params.id, req.body, meta(req))))
+);
+router.get('/admin/rules', authorize(...ADMIN), h(async (req, res) => ok(res, 'AI credit rules', await walletService.walletRules(req.user))));
+router.put(
+  '/admin/rules',
+  authorize('super_admin'),
+  [body('paymentDetails').optional().isObject(), body('referralRewards').optional().isObject(), body('creditValidityDays').optional().isObject(), body('reason').optional().isString().isLength({ max: 300 })],
+  validate,
+  h(async (req, res) => ok(res, 'Saved', await walletService.saveWalletRules(req.user, req.body, meta(req))))
 );
 router.put('/admin/users/:id/settings', authorize(...ADMIN), [param('id').isUUID(), ...limitRules], validate, h(async (req, res) => ok(res, 'Settings saved', await walletService.saveSettings(req.user, req.params.id, req.body, meta(req)))));
 router.post(
