@@ -7,6 +7,9 @@ const validate = require('../middlewares/validate');
 const { authenticate, authorize } = require('../middlewares/auth');
 const { uploadCsv } = require('../middlewares/upload');
 const { ENTITIES } = require('../services/masterData.service');
+const geocode = require('../services/geocode.service');
+const { success } = require('../utils/response');
+const handler = require('../utils/asyncHandler');
 
 const ADMIN_ROLES = ['admin', 'super_admin'];
 const ENTITY_NAMES = Object.keys(ENTITIES);
@@ -244,5 +247,21 @@ router.get(
   validate,
   adminController.listAuditLogs
 );
+
+/**
+ * @swagger
+ * /admin/geocoding:
+ *   get:
+ *     summary: Delayed geocoding (sec. 25.5.2) - listings waiting for a location from their pincode, placed approximately, or to pin by hand; which geocoders are set up
+ *     tags: [Admin]
+ *     security: [{ bearerAuth: [] }]
+ * /admin/geocoding/run:
+ *   post:
+ *     summary: Place pincode-only listings now (also runs every 15 minutes)
+ *     tags: [Admin]
+ *     security: [{ bearerAuth: [] }]
+ */
+router.get('/geocoding', handler(async (req, res) => success(res, 200, 'Geocoding', await geocode.summary())));
+router.post('/geocoding/run', handler(async (req, res) => success(res, 200, 'Geocoding run', await geocode.run())));
 
 module.exports = router;

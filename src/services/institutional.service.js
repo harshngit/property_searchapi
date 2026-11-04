@@ -85,7 +85,7 @@ const priceBand = (c) => {
 const acresBand = (a) => band(a, [1, 2, 5, 10, 25, 50], ' acres');
 
 const SELECT = `
-  SELECT il.*, p.id, p.title, p.city, p.locality, p.address, p.latitude, p.longitude, p.status, p.created_by, p.broker_id, p.created_at AS listed_at,
+  SELECT il.*, p.id, p.title, p.city, p.locality, p.address, p.latitude, p.longitude, p.pincode, p.geo_status, p.status, p.created_by, p.broker_id, p.created_at AS listed_at,
          p.verification_level, p.description
   FROM institutional_listings il JOIN properties p ON p.id = il.property_id`;
 
@@ -129,6 +129,8 @@ function fullView(r) {
     yearEstablished: r.year_established,
     address: r.address,
     latitude: r.latitude === null ? null : Number(r.latitude),
+    pincode: r.pincode || null,
+    geoStatus: r.geo_status || null,
     longitude: r.longitude === null ? null : Number(r.longitude),
     campusAreaSqft: num(r.campus_area_sqft),
     campusAreaAcres: num(r.campus_area_acres),
@@ -237,10 +239,14 @@ async function createListing(user, input, meta = {}) {
   const data = cleanInput(input);
   if (!ASSET_CLASSES[data.assetClass]) throw badRequest('Choose the type of institution');
   if (!data.institutionName || !data.city) throw badRequest('Institution name and city are required');
-  // Geolocation is mandatory on institutional listings (geo-validation, trust scoring).
+  // Geolocation is mandatory on institutional listings (geo-validation, trust
+  // scoring). If the map cannot be used, a 6-digit pincode is accepted and the
+  // campus is placed later by the geocoder (sec. 25.5.2 - never block listing).
   const lat = num(data.latitude);
   const lng = num(data.longitude);
-  if (lat === null || lng === null || Math.abs(lat) > 90 || Math.abs(lng) > 180) throw badRequest('Pin the campus on the map - latitude and longitude are required');
+  const pincode = /^\d{6}$/.test(String(data.pincode || '')) ? String(data.pincode) : null;
+  const pinned = lat !== null && lng !== null && Math.abs(lat) <= 90 && Math.abs(lng) <= 180;
+  if (!pinned && !pincode) throw badRequest('Pin the campus on the map, or give its 6-digit pincode if the map is not available');
   if (!(num(data.askingPriceCr) > 0)) throw badRequest('Asking price (in crores) is required');
   await assertCleanContent({ infrastructure: data.infrastructure, subType: data.subType }, { blockContact: true });
 
@@ -252,15 +258,15 @@ async function createListing(user, input, meta = {}) {
     const p = (
       await client.query(
         `INSERT INTO properties (tenant_id, created_by, broker_id, title, description, property_type, transaction_type, price, price_value, city, locality, address,
-           latitude, longitude, area_sqft, listing_category, is_institutional_asset, status, approved_by, approved_at)
-         VALUES ($1, $2, $3, $4, $5, 'commercial', $6, $7, $8, $9, $10, $11, $12, $13, $14, 'institutional', true, $15, $16, $17)
+           latitude, longitude, area_sqft, listing_category, is_institutional_asset, status, approved_by, approved_at, pincode)
+         VALUES ($1, $2, $3, $4, $5, 'commercial', $6, $7, $8, $9, $10, $11, $12, $13, $14, 'institutional', true, $15, $16, $17, $18)
          RETURNING id`,
         [
           user.tenant_id || null, user.id, ['broker', 'agency_admin'].includes(user.role) ? user.id : null,
           maskedTitle(data.assetClass, data.locality, data.city),
           `${ASSET_CLASSES[data.assetClass]} - ${DEAL_TYPES[data.dealType || 'full_sale']}. Details are confidential and shared with verified buyers under NDA.`,
           data.dealType === 'lease' ? 'rent' : 'sell', `${price} Cr`, Math.round(price * 1e7), data.city, data.locality || null, data.address || null,
-          lat, lng, num(data.campusAreaSqft), staff ? 'approved' : 'pending_approval', staff ? user.id : null, staff ? new Date() : null,
+          pinned ? lat : null, pinned ? lng : null, num(data.campusAreaSqft), staff ? 'approved' : 'pending_approval', staff ? user.id : null, staff ? new Date() : null, pincode,
         ]
       )
     ).rows[0];
@@ -310,6 +316,7 @@ async function updateListing(user, propertyId, input, meta = {}) {
     sets.push(`${col} = $${params.length}`);
   };
   for (const [key, col] of [['city', 'city'], ['locality', 'locality'], ['address', 'address']]) if (data[key] !== undefined) set(col, data[key] || null);
+  if (data.pincode !== undefined) set('pincode', /^\d{6}$/.test(String(data.pincode || '')) ? String(data.pincode) : null);
   if (data.latitude !== undefined && data.longitude !== undefined) {
     if (num(data.latitude) === null || num(data.longitude) === null) throw badRequest('Latitude and longitude are required');
     set('latitude', num(data.latitude));

@@ -7119,6 +7119,36 @@ test('chat intake (Engine 1): WhatsApp / Telegram free text read for intent (buy
   const routes = new Set(lg.data.items.map((i) => i.routedTo));
   for (const r of ['listing', 'requirement', 'photo']) assert.ok(routes.has(r), `log has ${r}`);
   assert.ok(lg.data.items.every((i) => !/\d{10}/.test(i.contact || '')), 'phone numbers masked in the log');
+
+  // ---- replies after review: an approved WhatsApp template when one is registered (Meta's 24-hour window), else text; the Telegram smart link
+  const chat = require('../src/services/messaging/chatIntake.service');
+  const meta = require('../src/services/metaWhatsapp.service');
+  const telegram = require('../src/services/telegram.service');
+  const configService = require('../src/services/config.service');
+  const real = { sendTemplate: meta.sendTemplate, sendText: meta.sendText, bot: process.env.TELEGRAM_BOT_USERNAME };
+  const out = [];
+  const registry = await configService.getConfig('notifications.whatsapp_templates', {});
+  try {
+    meta.sendTemplate = async (m) => { out.push(['template', m.templateName, m.variables]); };
+    meta.sendText = async (m) => { out.push(['text', m.body]); };
+    const waSub = { id: 'x', channel: 'whatsapp', contact_phone: '9811100001', reference: 'CL-T1' };
+    await chat.replyOutsideWindow(waSub, 'listing_rejected', ['CL-T1', 'No price'], 'Your property CL-T1 could not be listed: No price');
+    assert.deepEqual(out.pop(), ['text', 'Your property CL-T1 could not be listed: No price'], 'no template registered yet: plain text');
+    await pool.query(`UPDATE app_config SET value = value || '{"listing_rejected": "ar_listing_not_listed"}'::jsonb WHERE config_key = 'notifications.whatsapp_templates'`);
+    configService.invalidate();
+    await chat.replyOutsideWindow(waSub, 'listing_rejected', ['CL-T1', 'No price'], 'Your property CL-T1 could not be listed: No price');
+    assert.deepEqual(out.pop(), ['template', 'ar_listing_not_listed', ['CL-T1', 'No price']], 'registered template used');
+    meta.sendTemplate = async () => { throw new Error('template not approved'); };
+    await chat.replyOutsideWindow(waSub, 'listing_rejected', ['CL-T1', 'No price'], 'Your property CL-T1 could not be listed: No price');
+    assert.equal(out.pop()[0], 'text', 'a failed template falls back to text');
+    process.env.TELEGRAM_BOT_USERNAME = 'PropertySerchBot';
+    assert.equal(telegram.listingLink('abc'), 'https://t.me/PropertySerchBot?start=p_abc');
+  } finally {
+    Object.assign(meta, { sendTemplate: real.sendTemplate, sendText: real.sendText });
+    if (real.bot === undefined) delete process.env.TELEGRAM_BOT_USERNAME; else process.env.TELEGRAM_BOT_USERNAME = real.bot;
+    await pool.query(`UPDATE app_config SET value = $1::jsonb WHERE config_key = 'notifications.whatsapp_templates'`, [JSON.stringify(registry)]);
+    configService.invalidate();
+  }
 });
 
 test('paid AI buttons (Serchi): review second opinion (#7), read an inbound lead with AI (#3), document analysis (#9) and field-task second opinion (#10) are asked for and paid by the user; the rule-based checks run free; compliance wording', async () => {
@@ -7409,7 +7439,7 @@ test('acceptance gates: images showing contact details or a QR code are blocked 
   assert.equal(lint.status, 0, lint.stderr);
 });
 
-test('payments: Razorpay webhook settles an AI credit purchase once (signed, amount checked, retries ignored); bank / UPI top-up with a payment screenshot; bank / UPI details and credit rules set by the Super Admin only; balance for the top bar', async () => {
+test('payments: Razorpay webhook settles an AI credit purchase once (signed, amount checked, retries ignored), AI credit refunds paid back through Razorpay or recorded as sent by bank / UPI; bank / UPI top-up with a payment screenshot; bank / UPI details and credit rules set by the Super Admin only; balance for the top bar', async (t) => {
   const engine = require('../src/services/ai/orchestrator.service');
   const S = ctx.superAdmin.token;
   const A = ctx.admin.token;
@@ -7423,6 +7453,8 @@ test('payments: Razorpay webhook settles an AI credit purchase once (signed, amo
   // ---- rules: admins read, only the Super Admin changes; bad IFSC / UPI refused
   const before = await api('GET', '/ai-credits/admin/rules', { token: A });
   assert.equal(before.status, 200, JSON.stringify(before.body));
+  // restore the rules other tests rely on, even when an assertion below fails
+  t.after(() => api('PUT', '/ai-credits/admin/rules', { token: S, body: { paymentDetails: before.data.paymentDetails, referralRewards: before.data.referralRewards, creditValidityDays: before.data.creditValidityDays, purchaseRefundDays: before.data.purchaseRefundDays } }));
   assert.equal(before.data.canEdit, false);
   assert.equal(typeof before.data.paymentDetails.bank, 'object', 'structured bank details (migration 089)');
   assert.equal((await api('GET', '/ai-credits/admin/rules', { token: buyer.token })).status, 403);
@@ -7438,6 +7470,10 @@ test('payments: Razorpay webhook settles an AI credit purchase once (signed, amo
   assert.equal(saved.status, 200, JSON.stringify(saved.body));
   assert.deepEqual([saved.data.paymentDetails.bank.ifsc, saved.data.paymentReady.bank, saved.data.paymentReady.upi, saved.data.referralRewards.join, saved.data.creditValidityDays.grant, saved.data.purchaseRefundDays], ['HDFC0001234', true, true, 30, 60, 10]);
   const w = await api('GET', '/ai-credits/wallet', { token: buyer.token });
+  const site = await api('GET', '/ai-credits/wallet?audience=customer', { token: buyer.token });
+  assert.ok(w.data.prices.some((x) => x.key === 'email_lead_parse'), 'the CRM page lists every action');
+  assert.ok(!site.data.prices.some((x) => x.audience === 'staff' || x.key === 'email_lead_parse'), 'the website price list leaves out staff tools (migration 091)');
+  assert.ok(site.data.prices.some((x) => x.key === 'agreement_review'));
   assert.deepEqual([w.data.paymentDetails.upi.id, w.data.paymentDetails.bank.accountNumber, w.data.refundDays, w.data.referrals.rewards.join], ['arbuildwel@hdfcbank', '50200012345678', 10, 30], 'users see the details');
   assert.ok((await pool.query(`SELECT 1 FROM audit_logs WHERE action = 'config_updated' AND entity_id = 'ai.payment_details' AND created_at > now() - interval '1 minute'`)).rows.length, 'audited');
 
@@ -7491,6 +7527,252 @@ test('payments: Razorpay webhook settles an AI credit purchase once (signed, amo
   assert.deepEqual([row.status, !!row.invoice_number, row.gateway_payment_id], ['paid', true, `pay_e2e${RUN}`], 'GST invoice issued');
   assert.equal((await api('GET', '/ai-credits/balance', { token: buyer.token })).data.balance, p.credits);
 
-  // restore the rules other tests rely on
-  await api('PUT', '/ai-credits/admin/rules', { token: S, body: { paymentDetails: before.data.paymentDetails, referralRewards: before.data.referralRewards, creditValidityDays: before.data.creditValidityDays, purchaseRefundDays: before.data.purchaseRefundDays } });
+  // ---- refund of an online purchase: the money goes back through Razorpay (stubbed here), the webhook confirms it
+  const wallet = require('../src/services/ai/wallet.service');
+  const adminUser = { id: ctx.admin.id, role: 'admin' };
+  const keys = [process.env.RAZORPAY_KEY_ID, process.env.RAZORPAY_KEY_SECRET];
+  const realFetch = global.fetch;
+  const sent = [];
+  try {
+    delete process.env.RAZORPAY_KEY_ID;
+    await assert.rejects(wallet.refundPurchase(adminUser, p.id, { note: 'asked within 10 days' }), /keys are not set/, 'no keys, no online refund');
+    process.env.RAZORPAY_KEY_ID = 'rzp_test_e2e';
+    process.env.RAZORPAY_KEY_SECRET = 'e2e-secret';
+    global.fetch = async (url, opts) => {
+      if (!String(url).startsWith('https://api.razorpay.com/')) return realFetch(url, opts);
+      sent.push({ url: String(url), body: JSON.parse(opts.body) });
+      if (sent.length === 1) return new Response(JSON.stringify({ error: { description: 'The amount is invalid' } }), { status: 400 });
+      return new Response(JSON.stringify({ id: `rfnd_e2e${RUN}`, status: 'pending' }), { status: 200 });
+    };
+    await assert.rejects(wallet.refundPurchase(adminUser, p.id, { note: 'asked within 10 days' }), /The amount is invalid/, 'Razorpay refused');
+    assert.equal((await api('GET', '/ai-credits/balance', { token: buyer.token })).data.balance, p.credits, 'a refused refund changes nothing');
+    const rf = await wallet.refundPurchase(adminUser, p.id, { note: 'asked within 10 days' });
+    assert.deepEqual([rf.refundedCredits, rf.refundStatus, rf.refundGatewayId, rf.balance], [p.credits, 'processing', `rfnd_e2e${RUN}`, 0]);
+    assert.equal(sent[1].url, `https://api.razorpay.com/v1/payments/pay_e2e${RUN}/refund`);
+    assert.equal(sent[1].body.amount, total, 'the full amount for an unused purchase, in paise');
+  } finally {
+    global.fetch = realFetch;
+    if (keys[0] === undefined) delete process.env.RAZORPAY_KEY_ID; else process.env.RAZORPAY_KEY_ID = keys[0];
+    if (keys[1] === undefined) delete process.env.RAZORPAY_KEY_SECRET; else process.env.RAZORPAY_KEY_SECRET = keys[1];
+  }
+  const sendRefund = (event, eventId) => {
+    const raw = JSON.stringify({ event, payload: { refund: { entity: { id: `rfnd_e2e${RUN}`, payment_id: `pay_e2e${RUN}`, amount: total, status: event === 'refund.processed' ? 'processed' : 'failed' } } } });
+    return fetch(`${BASE}/webhooks/razorpay`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-razorpay-event-id': eventId, 'x-razorpay-signature': crypto.createHmac('sha256', secret).update(raw).digest('hex') },
+      body: raw,
+    }).then(async (r) => ({ status: r.status, body: await r.json() }));
+  };
+  assert.equal((await sendRefund('refund.processed', `evt_rf${RUN}`)).body.outcome, 'refund_processed');
+  assert.equal((await sendRefund('refund.failed', `evt_rf2${RUN}`)).body.outcome, 'ignored', 'a processed refund stays processed');
+  const mine = await api('GET', '/ai-credits/wallet', { token: buyer.token });
+  assert.equal(mine.data.invoices.find((i) => i.id === p.id)?.refundStatus, 'processed', 'the buyer sees the refund was sent');
+
+  // ---- refund of a bank / UPI purchase: waits for finance, who record the transfer reference
+  await api('POST', '/ai-credits/admin/credit', { token: A, body: { userId: other.id, packId: pack.id, reference: `NEFT${RUN}68` } });
+  const mp = (await pool.query(`SELECT id FROM ai_credit_purchases WHERE user_id = $1`, [other.id])).rows[0];
+  const mr = await api('POST', `/ai-credits/admin/purchases/${mp.id}/refund`, { token: A, body: { note: 'changed their mind' } });
+  assert.equal(mr.status, 200, JSON.stringify(mr.body));
+  assert.equal(mr.data.refundStatus, 'manual_pending');
+  assert.equal((await api('POST', `/ai-credits/admin/purchases/${mp.id}/refund-paid`, { token: other.token, body: { reference: `UTR${RUN}` } })).status, 403);
+  const sentBack = await api('POST', `/ai-credits/admin/purchases/${mp.id}/refund-paid`, { token: A, body: { reference: `UTR${RUN}` } });
+  assert.equal(sentBack.status, 200, JSON.stringify(sentBack.body));
+  assert.equal((await api('POST', `/ai-credits/admin/purchases/${mp.id}/refund-paid`, { token: A, body: { reference: `UTR${RUN}` } })).status, 400, 'recorded once');
+  const listed = (await api('GET', '/ai-credits/admin', { token: A })).data.purchases.find((x) => x.id === mp.id);
+  assert.deepEqual([listed?.refundStatus, listed?.refundReference], ['processed', `UTR${RUN}`]);
+
+});
+
+test('resilience (sec. 25.5): pincode-only listings placed later by the geocoder, crawler manual-entry queue for blocked sources, public status page with incidents, backup records; employee incentives: EM codes, scoring from the cascade / visits / deals, related-party exclusion, approval and payroll export, exit', async (t) => {
+  const A = ctx.admin.token;
+  const SA = ctx.superAdmin.token;
+  const configService = require('../src/services/config.service');
+  const geocode = require('../src/services/geocode.service');
+  const incentives = require('../src/services/incentive.service');
+  const keep = {};
+  for (const k of ['geo.geocoder_order', 'geo.max_geocode_attempts']) keep[k] = await configService.getConfig(k, null);
+  t.after(async () => {
+    for (const [k, v] of Object.entries(keep)) await pool.query('UPDATE app_config SET value = $2::jsonb WHERE config_key = $1', [k, JSON.stringify(v)]);
+    configService.invalidate();
+  });
+  const setConfig = async (k, v) => {
+    await pool.query('UPDATE app_config SET value = $2::jsonb WHERE config_key = $1', [k, JSON.stringify(v)]);
+    configService.invalidate();
+  };
+
+  // ---- map / geo failover: a pincode stands in for the pin, the geocoder places it later
+  const GEO_CITY = `Geo City ${RUN}`;
+  const state = (await pool.query(`SELECT id FROM states ORDER BY state_name LIMIT 1`)).rows[0].id;
+  await pool.query(`INSERT INTO cities (state_id, city_name, slug, status, lat_centroid, lng_centroid) VALUES ($1, $2, $3, 'active', 26.85, 80.95)`, [state, GEO_CITY, `geo-city-${RUN}`]);
+  await setConfig('geo.geocoder_order', ['master_data']);
+  const pin6 = String(parseInt(RUN, 16) % 800000 + 110000);
+  const listing = await api('POST', '/properties', { token: A, body: { title: `Pincode only flat ${RUN}`, propertyType: 'apartment', transactionType: 'sell', price: '80 Lakh', city: GEO_CITY, pincode: pin6 } });
+  assert.equal(listing.status, 201, JSON.stringify(listing.body));
+  const pid = listing.data.id || listing.data.property?.id;
+  let row = (await pool.query('SELECT geo_status, latitude FROM properties WHERE id = $1', [pid])).rows[0];
+  assert.deepEqual([row.geo_status, row.latitude], ['pending', null], 'saved without a map pin');
+  await geocode.run();
+  row = (await pool.query('SELECT geo_status, geo_source, latitude::float AS lat FROM properties WHERE id = $1', [pid])).rows[0];
+  assert.deepEqual([row.geo_status, row.geo_source, row.lat], ['approximate', 'master_data', 26.85], 'placed at the city centre');
+  await pool.query('UPDATE properties SET latitude = 26.8512, longitude = 80.9533 WHERE id = $1', [pid]);
+  assert.equal((await pool.query('SELECT geo_status FROM properties WHERE id = $1', [pid])).rows[0].geo_status, 'pinned', 'a person moving the pin makes it exact');
+  // Nothing to place it from: given up after the set attempts, for staff to pin by hand.
+  await setConfig('geo.max_geocode_attempts', 1);
+  const lost = await api('POST', '/properties', { token: A, body: { title: `Nowhere flat ${RUN}`, propertyType: 'apartment', transactionType: 'sell', price: '50 Lakh', city: `No Such City ${RUN}`, pincode: pin6 } });
+  const lostId = lost.data.id || lost.data.property?.id;
+  await geocode.run();
+  assert.equal((await pool.query('SELECT geo_status FROM properties WHERE id = $1', [lostId])).rows[0].geo_status, 'failed');
+  const geoAdmin = await api('GET', '/admin/geocoding', { token: A });
+  assert.ok(geoAdmin.data.failed >= 1 && geoAdmin.data.providers.masterData === true);
+  // Institutional listings: the pin was mandatory - now a pincode is enough.
+  const inst = { institutionName: `Pincode School ${RUN}`, assetClass: 'k12_school', city: GEO_CITY, askingPriceCr: 12 };
+  assert.equal((await api('POST', '/institutional/listings', { token: ctx.sales.token, body: inst })).status, 400, 'neither pin nor pincode');
+  const instOk = await api('POST', '/institutional/listings', { token: ctx.sales.token, body: { ...inst, pincode: pin6 } });
+  assert.equal(instOk.status, 201, JSON.stringify(instOk.body));
+
+  // ---- crawler manual-entry queue
+  const src = (await pool.query(
+    `INSERT INTO crawler_sources (source_key, name, module, category, list_url, is_enabled, legal_approved, legal_approved_at, status, consecutive_failures, last_error)
+     VALUES ($1, $2, 'bank_auction', 'bank_auction', 'https://bank.example/auctions', true, true, now(), 'dead_letter', 5, 'HTTP 403') RETURNING id`,
+    [`e2e_manual_${RUN}`, `Blocked Bank ${RUN}`]
+  )).rows[0].id;
+  t.after(() => pool.query('DELETE FROM crawler_sources WHERE id = $1', [src]));
+  assert.equal((await api('POST', '/crawlers/manual-tasks/sweep', { token: ctx.sales.token })).status, 403, 'admins only');
+  const swept = await api('POST', '/crawlers/manual-tasks/sweep', { token: A });
+  assert.ok(swept.data.opened >= 1, JSON.stringify(swept.body));
+  const task = (await api('GET', '/crawlers/manual-tasks', { token: A })).data.find((x) => x.sourceId === src);
+  assert.equal(task?.reason, 'dead_letter');
+  assert.ok((await pool.query(`SELECT 1 FROM notifications WHERE user_id = $1 AND type = 'crawler_manual_entry' AND related_entity_id = $2`, [ctx.admin.id, task.id])).rows.length, 'admins told');
+  const item = await api('POST', `/crawlers/manual-tasks/${task.id}/items`, { token: A, body: { title: `Hand-entered flat auction ${RUN}`, city: GEO_CITY, reserve_price: '4500000', auction_date: '2027-01-15', auction_reference_id: `MAN-${RUN}` } });
+  assert.equal(item.status, 201, JSON.stringify(item.body));
+  assert.equal(item.data.task.itemsEntered, 1);
+  assert.ok(['needs_review', 'duplicate'].includes(item.data.summary.items[0].status), 'same review pipeline as crawled items');
+  assert.equal((await api('POST', `/crawlers/manual-tasks/${task.id}/checks`, { token: A, body: { note: '' } })).status, 422);
+  const checked = await api('POST', `/crawlers/manual-tasks/${task.id}/checks`, { token: A, body: { note: 'No new notices today', itemsEntered: 0 } });
+  assert.ok(new Date(checked.data.dueAt) > new Date(Date.now() + 23 * 3600000), 'next check due in a day');
+  await pool.query(`UPDATE crawler_manual_tasks SET due_at = now() - interval '1 hour' WHERE id = $1`, [task.id]);
+  assert.ok((await api('POST', '/crawlers/manual-tasks/sweep', { token: A })).data.alerted >= 1, 'overdue check alerted');
+  await pool.query(`UPDATE crawler_sources SET status = 'healthy', last_success_at = now() WHERE id = $1`, [src]);
+  await api('POST', '/crawlers/manual-tasks/sweep', { token: A });
+  assert.equal((await pool.query('SELECT status FROM crawler_manual_tasks WHERE id = $1', [task.id])).rows[0].status, 'closed', 'closes once the source crawls again');
+
+  // ---- status page
+  const pub0 = await fetch(`${BASE}/status`).then((r) => r.json());
+  assert.ok(pub0.data.components.some((c) => c.key === 'whatsapp'), 'public, no sign-in');
+  const broker = await createUser('broker', 'status-broker');
+  const inc = { title: `WhatsApp delayed ${RUN}`, impact: 'major', components: ['whatsapp'], message: 'WhatsApp messages are arriving late.', etaAt: new Date(Date.now() + 2 * 3600000).toISOString() };
+  assert.equal((await api('POST', '/status/incidents', { token: broker.token, body: inc })).status, 403);
+  assert.equal((await api('POST', '/status/incidents', { token: A, body: { ...inc, components: ['nope'] } })).status, 400);
+  assert.equal((await api('POST', '/status/incidents', { token: A, body: { ...inc, impact: 'maintenance', etaAt: null } })).status, 400, 'maintenance needs an end time');
+  const posted = await api('POST', '/status/incidents', { token: A, body: inc });
+  assert.equal(posted.status, 201, JSON.stringify(posted.body));
+  t.after(() => pool.query(`UPDATE platform_incidents SET status = 'resolved', resolved_at = now() WHERE id = $1 AND status <> 'resolved'`, [posted.data.id]));
+  assert.ok(posted.data.notified >= 1 && /^INC-\d{4}-\d{4}$/.test(posted.data.reference));
+  assert.ok((await pool.query(`SELECT 1 FROM notifications WHERE user_id = $1 AND type = 'platform_incident' AND related_entity_id = $2`, [broker.id, posted.data.id])).rows.length, 'brokers told');
+  const pub1 = await fetch(`${BASE}/status`).then((r) => r.json());
+  assert.equal(pub1.data.components.find((c) => c.key === 'whatsapp').state, 'partial_outage');
+  assert.ok(pub1.data.active.some((i) => i.id === posted.data.id && i.updates.length === 1));
+  assert.ok((await api('GET', '/status/banner', { token: broker.token })).data.active.some((i) => i.id === posted.data.id), 'CRM banner');
+  const fixed = await api('POST', `/status/incidents/${posted.data.id}/updates`, { token: A, body: { status: 'resolved', message: 'Messages are on time again.' } });
+  assert.equal(fixed.status, 200, JSON.stringify(fixed.body));
+  assert.ok(fixed.data.notified >= 1, 'everyone told is told it is over');
+  const pub2 = await fetch(`${BASE}/status`).then((r) => r.json());
+  assert.ok(!pub2.data.active.some((i) => i.id === posted.data.id) && pub2.data.recent.some((i) => i.id === posted.data.id));
+  assert.equal((await api('POST', `/status/incidents/${posted.data.id}/updates`, { token: A, body: { message: 'again please' } })).status, 400, 'already resolved');
+  // Backups: the status admin reads backup_runs.
+  await pool.query(`INSERT INTO backup_runs (kind, status, target, size_bytes, finished_at, retain_until) VALUES ('backup', 'success', 'gs://e2e/x.dump', 2048, now(), now() + interval '35 days')`);
+  const adm = await api('GET', '/status/admin', { token: A });
+  assert.equal(adm.status, 200);
+  assert.equal(adm.data.checks.find((c) => c.key === 'backup').level, 'ok');
+  assert.equal(adm.data.checks.find((c) => c.key === 'database').level, 'ok');
+  assert.equal((await api('GET', '/status/admin', { token: broker.token })).status, 403);
+
+  // ---- employee incentives: EM codes
+  const rep = await createUser('internal_sales', 'inc-rep');
+  const lead2 = await createUser('internal_sales', 'inc-tl');
+  const other = await createUser('internal_sales', 'inc-other');
+  await pool.query(`INSERT INTO arb_representatives (user_id, designation, accepts_assignments) VALUES ($1, 'tl', false), ($2, 'rm', false), ($3, 'rm', false) ON CONFLICT (user_id) DO NOTHING`, [lead2.id, rep.id, other.id]);
+  await pool.query(`UPDATE arb_representatives SET team_leader_id = $1 WHERE user_id = $2`, [lead2.id, rep.id]);
+  const code0 = (await pool.query('SELECT em_code, serial FROM employee_codes WHERE user_id = $1', [rep.id])).rows[0];
+  assert.match(code0.em_code, /^EM-RM-\d{3,}$/);
+  await pool.query(`UPDATE arb_representatives SET designation = 'tc' WHERE user_id = $1`, [rep.id]);
+  await pool.query(`UPDATE arb_representatives SET designation = 'rm' WHERE user_id = $1`, [rep.id]);
+  const code1 = (await pool.query('SELECT em_code, serial, history FROM employee_codes WHERE user_id = $1', [rep.id])).rows[0];
+  assert.deepEqual([code1.serial, code1.em_code, code1.history.length], [code0.serial, code0.em_code, 3], 'same serial through designation changes');
+  await assert.rejects(pool.query('DELETE FROM employee_codes WHERE user_id = $1', [rep.id]), /never deleted/);
+
+  // ---- scoring: attended, missed, a deal closed won, and a related-party deal
+  const custId = (await pool.query(`INSERT INTO customers (full_name, mobile) VALUES ($1, $2) RETURNING id`, [`Inc Buyer ${RUN}`, `8${String(Math.floor(Math.random() * 1e9)).padStart(9, '0')}`])).rows[0].id;
+  const lead = (await pool.query(`INSERT INTO leads (source, customer_id, status, arb_rep_id) VALUES ('website', $1, 'new', $2) RETURNING id`, [custId, rep.id])).rows[0].id;
+  await pool.query(`INSERT INTO lead_assignment_events (lead_id, hop, kind, from_user_id) VALUES ($1, 1, 'contacted', $2), ($1, 1, 'missed', $2)`, [lead, rep.id]);
+  await pool.query(`INSERT INTO deals (customer_id, broker_id, stage, deal_value, closed_at, assigned_rep_id) VALUES ($1, $3, 'closed_won', 5000000, now(), $2)`, [custId, rep.id, broker.id]);
+  // Sec. 33.12: the database never lets an employee hold a deal their disclosed family is party to ...
+  const spouseMobile = `7${String(Math.floor(Math.random() * 1e9)).padStart(9, '0')}`;
+  await pool.query(`INSERT INTO employee_disclosures (employee_id, relation, full_name, mobile10) VALUES ($1, 'spouse', 'Rep Spouse', $2)`, [rep.id, spouseMobile]);
+  const spouseCust = (await pool.query(`INSERT INTO customers (full_name, mobile) VALUES ($1, $2) RETURNING id`, [`Rep Spouse ${RUN}`, spouseMobile])).rows[0].id;
+  await assert.rejects(pool.query(`INSERT INTO deals (customer_id, broker_id, stage, deal_value, closed_at, assigned_rep_id) VALUES ($1, $3, 'closed_won', 9000000, now(), $2)`, [spouseCust, rep.id, broker.id]), /related_party_self_assignment/);
+  // ... and a lead the rep already worked that turns out to be related (late disclosure, re-routed) scores nothing for them.
+  const rpLead = (await pool.query(`INSERT INTO leads (source, customer_id, status, arb_rep_id) VALUES ('website', $1, 'new', $2) RETURNING id`, [custId, rep.id])).rows[0].id;
+  await pool.query(`INSERT INTO lead_assignment_events (lead_id, hop, kind, from_user_id) VALUES ($1, 1, 'contacted', $2)`, [rpLead, rep.id]);
+  await pool.query(`UPDATE leads SET arb_rep_id = $3, related_party_transaction = true, related_party_employee_ids = ARRAY[$2]::uuid[] WHERE id = $1`, [rpLead, rep.id, other.id]);
+  assert.equal((await api('POST', '/incentives/sync', { token: rep.token })).status, 403);
+  assert.equal((await api('POST', '/incentives/sync', { token: A })).status, 200);
+  const month = incentives.monthOf(new Date()).slice(0, 7);
+  const mine = await api('GET', `/incentives/employees/${rep.id}?period=${month}`, { token: rep.token });
+  assert.equal(mine.status, 200, JSON.stringify(mine.body));
+  assert.equal(mine.data.emCode, code0.em_code);
+  assert.equal(mine.data.points, 5 - 10 + 50 + 50, 'attended +5, missed -10, deal 50 + 1 per lakh of Rs 50 lakh');
+  const rp = mine.data.events.find((e) => e.excluded);
+  assert.ok(rp && rp.leadId === rpLead && rp.points === 0 && /Related-party/.test(rp.excludeReason), 'related-party lead recorded, not counted');
+  assert.equal((await api('GET', `/incentives/employees/${rep.id}?period=${month}`, { token: other.token })).status, 403, 'not their team');
+  assert.equal((await api('GET', `/incentives/employees/${rep.id}?period=${month}`, { token: lead2.token })).status, 200, 'the team leader sees the team');
+  const ownBoard = await api('GET', `/incentives?period=${month}`, { token: other.token });
+  assert.ok(ownBoard.data.rows.every((r) => r.userId === other.id), 'an RM sees only their own row');
+  assert.equal((await api('GET', '/incentives', { token: broker.token })).status, 403, 'staff only');
+
+  // ---- rules, adjustments, approving a month, payroll export, late facts
+  const rulesBefore = await incentives.rules();
+  t.after(() => pool.query(`UPDATE app_config SET value = $1::jsonb WHERE config_key = 'incentive.rules'`, [JSON.stringify(rulesBefore)]).then(() => configService.invalidate()));
+  assert.equal((await api('PUT', '/incentives/rules', { token: A, body: { rupeesPerPoint: 10 } })).status, 403, 'Super Admin only');
+  assert.equal((await api('PUT', '/incentives/rules', { token: SA, body: { rupeesPerPoint: 10, points: { cascade_attended: 'x' } } })).status, 400);
+  assert.equal((await api('PUT', '/incentives/rules', { token: SA, body: { rupeesPerPoint: 10 } })).status, 200);
+  // A finished month: a fact from a past month (one per run, so re-runs do not collide).
+  const past = new Date(Date.UTC(2015 + (parseInt(RUN, 16) % 10), parseInt(RUN.slice(0, 2), 16) % 12, 10, 6));
+  const pastMonth = incentives.monthOf(past).slice(0, 7);
+  const lead3 = (await pool.query(`INSERT INTO leads (source, customer_id, status, arb_rep_id) VALUES ('website', $1, 'new', $2) RETURNING id`, [custId, rep.id])).rows[0].id;
+  await pool.query(`INSERT INTO lead_assignment_events (lead_id, hop, kind, from_user_id, created_at) VALUES ($1, 1, 'contacted', $2, $3)`, [lead3, rep.id, past]);
+  await incentives.sync({ days: 5000 });
+  assert.equal((await api('POST', '/incentives/adjustments', { token: SA, body: { userId: rep.id, period: pastMonth, points: 5, note: 'x' } })).status, 422, 'a reason is needed');
+  assert.equal((await api('POST', '/incentives/adjustments', { token: SA, body: { userId: rep.id, period: pastMonth, points: 5, note: 'Helped close a co-broked deal' } })).status, 201);
+  assert.equal((await api('POST', `/incentives/periods/${month}/approve`, { token: SA })).status, 400, 'only a finished month');
+  assert.equal((await api('POST', `/incentives/periods/${pastMonth}/approve`, { token: A })).status, 403);
+  const approved = await api('POST', `/incentives/periods/${pastMonth}/approve`, { token: SA });
+  assert.equal(approved.status, 200, JSON.stringify(approved.body));
+  const pastBoard = await api('GET', `/incentives?period=${pastMonth}`, { token: rep.token });
+  assert.deepEqual([pastBoard.data.status, pastBoard.data.rows[0]?.points, pastBoard.data.rows[0]?.amountInr], ['approved', 10, 100], '5 attended + 5 adjustment, Rs 10 a point');
+  assert.equal((await api('POST', '/incentives/adjustments', { token: SA, body: { userId: rep.id, period: pastMonth, points: 5, note: 'Too late now' } })).status, 400, 'approved months are frozen');
+  const csv = await fetch(`${BASE}/incentives/periods/${pastMonth}/export`, { headers: { authorization: `Bearer ${SA}` } });
+  assert.equal(csv.status, 200);
+  const text = await csv.text();
+  assert.ok(text.startsWith('month,em_code,name') && text.includes(`${code0.em_code},`) && text.includes(',100'), text.slice(0, 300));
+  assert.equal((await pool.query(`SELECT status FROM incentive_periods WHERE period = $1`, [`${pastMonth}-01`])).rows[0].status, 'exported');
+  // A fact from the approved month that arrives late lands in the current month.
+  const lead4 = (await pool.query(`INSERT INTO leads (source, customer_id, status, arb_rep_id) VALUES ('website', $1, 'new', $2) RETURNING id`, [custId, rep.id])).rows[0].id;
+  await pool.query(`INSERT INTO lead_assignment_events (lead_id, hop, kind, from_user_id, created_at) VALUES ($1, 1, 'contacted', $2, $3)`, [lead4, rep.id, past]);
+  await incentives.sync({ days: 5000 });
+  const late = (await pool.query(`SELECT to_char(period, 'YYYY-MM') AS p, late FROM incentive_events WHERE lead_id = $1`, [lead4])).rows[0];
+  assert.deepEqual([late.p, late.late], [month, true]);
+  await assert.rejects(pool.query(`UPDATE incentive_events SET points = 99 WHERE lead_id = $1`, [lead4]), /append-only/);
+
+  // ---- exit: the code is retired for good, the account switched off
+  assert.equal((await api('POST', `/incentives/employees/${other.id}/exit`, { token: A, body: { reason: 'Resigned on 1 Nov' } })).status, 403);
+  const exited = await api('POST', `/incentives/employees/${other.id}/exit`, { token: SA, body: { reason: 'Resigned on 1 Nov' } });
+  assert.equal(exited.status, 200, JSON.stringify(exited.body));
+  assert.equal((await pool.query('SELECT status FROM users WHERE id = $1', [other.id])).rows[0].status, 'inactive');
+  await pool.query(`UPDATE arb_representatives SET designation = 'tl' WHERE user_id = $1`, [other.id]);
+  const retired = (await pool.query('SELECT status, em_code FROM employee_codes WHERE user_id = $1', [other.id])).rows[0];
+  assert.deepEqual([retired.status, retired.em_code.startsWith('EM-RM-')], ['terminated', true], 'a retired code never changes');
+  const codes = await api('GET', '/incentives/codes', { token: SA });
+  assert.ok(codes.data.some((c) => c.userId === other.id && c.status === 'terminated'));
+  assert.equal((await api('GET', '/incentives/codes', { token: A })).status, 403, 'retired codes: Super Admin only');
 });

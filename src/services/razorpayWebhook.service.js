@@ -6,7 +6,7 @@ const advertising = require('./advertising.service');
 const franchise = require('./franchise.service');
 
 // Razorpay webhook (Dashboard -> Settings -> Webhooks, events payment.captured,
-// order.paid and payment.failed). Checkout's handler confirms a payment from
+// order.paid, payment.failed, refund.processed and refund.failed). Checkout's handler confirms a payment from
 // the browser; this is the server-to-server backup for when the browser closed
 // first. Signed with RAZORPAY_WEBHOOK_SECRET over the raw body. It settles the
 // three things paid through Razorpay - AI credit packs, ad invoices and
@@ -49,6 +49,18 @@ async function settleOrder(orderId, paymentId, amount) {
   return ['unknown_order', null];
 }
 
+// An AI credit refund sent through Razorpay when the admin refunded it.
+async function settleRefund(refund, processed) {
+  const reason = processed ? null : String(refund.error_description || refund.status || 'failed').slice(0, 300);
+  const r = (await pool.query(
+    `UPDATE ai_credit_purchases SET refund_status = $2::varchar, refund_paid_at = CASE WHEN $2::varchar = 'processed' THEN now() ELSE refund_paid_at END, refund_error = $3
+     WHERE refund_gateway_id = $1 AND refund_status IN ('processing', 'failed') RETURNING receipt_number`,
+    [refund.id, processed ? 'processed' : 'failed', reason]
+  )).rows[0];
+  if (!r) return ['ignored', `refund ${refund.id}`];
+  return [processed ? 'refund_processed' : 'refund_failed', `AI credits ${r.receipt_number}`];
+}
+
 async function handle(rawBody, signature, eventIdHeader) {
   if (!process.env.RAZORPAY_WEBHOOK_SECRET) return { status: 503, outcome: 'not_configured' };
   if (!signatureOk(rawBody, signature)) return { status: 400, outcome: 'bad_signature' };
@@ -61,8 +73,9 @@ async function handle(rawBody, signature, eventIdHeader) {
   const event = String(body.event || '');
   const payment = body.payload?.payment?.entity || {};
   const order = body.payload?.order?.entity || {};
+  const refund = body.payload?.refund?.entity || {};
   const orderId = payment.order_id || order.id || null;
-  const paymentId = payment.id || null;
+  const paymentId = payment.id || refund.payment_id || null;
   const amount = payment.amount != null ? Number(payment.amount) : order.amount_paid != null ? Number(order.amount_paid) : null;
   const eventId = String(eventIdHeader || `${event}:${paymentId || orderId || crypto.randomUUID()}`).slice(0, 80);
 
@@ -78,6 +91,8 @@ async function handle(rawBody, signature, eventIdHeader) {
   try {
     if ((event === 'payment.captured' || event === 'order.paid') && orderId) {
       [outcome, detail] = await settleOrder(orderId, paymentId, amount);
+    } else if ((event === 'refund.processed' || event === 'refund.failed') && refund.id) {
+      [outcome, detail] = await settleRefund(refund, event === 'refund.processed');
     } else if (event === 'payment.failed' && orderId) {
       const r = await pool.query(`UPDATE ai_credit_purchases SET status = 'failed' WHERE gateway_order_id = $1 AND status = 'created' RETURNING receipt_number`, [orderId]);
       outcome = r.rows[0] ? 'marked_failed' : 'ignored';
@@ -97,4 +112,4 @@ async function handle(rawBody, signature, eventIdHeader) {
   return { status: 200, outcome };
 }
 
-module.exports = { handle, signatureOk, settleOrder };
+module.exports = { handle, signatureOk, settleOrder, settleRefund };

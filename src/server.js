@@ -86,4 +86,9 @@ server.listen(PORT, () => {
     require('./services/relatedParty.service').startScheduler();
     require('./services/privacy.service').startScheduler();
   }
+  // Sec. 25.5: delayed geocoding of pincode-only listings, crawler manual-entry queue.
+  if (process.env.GEOCODE_JOBS_DISABLED !== 'true') require('./services/geocode.service').startScheduler();
+  if (process.env.CRAWLER_MANUAL_JOBS_DISABLED !== 'true') require('./services/crawler/manualQueue.service').startScheduler();
+  // Employee incentives: score new facts every hour.
+  if (process.env.INCENTIVE_JOBS_DISABLED !== 'true') require('./services/incentive.service').startScheduler();
 });

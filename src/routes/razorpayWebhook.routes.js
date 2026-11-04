@@ -7,7 +7,7 @@ const webhook = require('../services/razorpayWebhook.service');
  * @swagger
  * /webhooks/razorpay:
  *   post:
- *     summary: Razorpay webhook (payment.captured, order.paid, payment.failed) - settles AI credit packs, ad invoices and franchise invoices once each
+ *     summary: Razorpay webhook (payment.captured, order.paid, payment.failed, refund.processed, refund.failed) - settles AI credit packs, ad invoices and franchise invoices once each, and confirms AI credit refunds
  *     description: No login. Signed by Razorpay - the X-Razorpay-Signature header is an HMAC-SHA256 of the raw body with RAZORPAY_WEBHOOK_SECRET. A repeated event (X-Razorpay-Event-Id) is answered 200 and not applied again.
  *     tags: [Payments]
  *     responses:

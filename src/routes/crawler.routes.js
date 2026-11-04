@@ -2,6 +2,7 @@ const express = require('express');
 const { body, param, query } = require('express-validator');
 
 const crawler = require('../services/crawler/crawler.service');
+const manualQueue = require('../services/crawler/manualQueue.service');
 const auditService = require('../services/audit.service');
 const validate = require('../middlewares/validate');
 const { authenticate, authorize } = require('../middlewares/auth');
@@ -185,6 +186,55 @@ router.post(
   [body('listingCategory').optional().isIn(['auction', 'special_situation'])],
   validate,
   handler(async (req, res) => success(res, 200, 'Notice parsed and queued', await crawler.parseUploadedNotice(req.file, req.body, req.user)))
+);
+
+// ------------------------------------------------------------ manual-entry queue (sec. 25.5.2)
+
+/**
+ * @swagger
+ * /crawlers/manual-tasks:
+ *   get:
+ *     summary: Sources that cannot be crawled (dead-letter, refused by robots.txt, or stale) and must be checked by hand until they recover
+ *     tags: [Crawlers]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters:
+ *       - { in: query, name: status, schema: { type: string, enum: [open, closed, all] } }
+ *     responses: { 200: { description: Tasks } }
+ * /crawlers/manual-tasks/sweep:
+ *   post:
+ *     summary: Open / close manual-entry tasks now (also runs every 30 minutes)
+ *     tags: [Crawlers]
+ *     security: [{ bearerAuth: [] }]
+ * /crawlers/manual-tasks/{id}/items:
+ *   post:
+ *     summary: Enter one item from the blocked source's own website - same normalise / dedupe / review pipeline as crawled items
+ *     tags: [Crawlers]
+ *     security: [{ bearerAuth: [] }]
+ * /crawlers/manual-tasks/{id}/checks:
+ *   post:
+ *     summary: Record a manual check of the portal (how many items were entered, or none new) - moves the next check due date
+ *     tags: [Crawlers]
+ *     security: [{ bearerAuth: [] }]
+ */
+router.get('/manual-tasks', [query('status').optional().isIn(['open', 'closed', 'all'])], validate, handler(async (req, res) => success(res, 200, 'Manual-entry tasks', await manualQueue.list({ status: req.query.status || 'open' }))));
+router.post('/manual-tasks/sweep', handler(async (req, res) => success(res, 200, 'Manual-entry queue checked', await manualQueue.sweep())));
+router.post(
+  '/manual-tasks/:id/items',
+  [
+    param('id').isUUID(),
+    body('title').isString().trim().isLength({ min: 3, max: 300 }),
+    body('city').isString().trim().isLength({ min: 2, max: 120 }),
+    ...['locality', 'pincode', 'property_type', 'description', 'reserve_price', 'emd_amount', 'auction_date', 'emd_deadline', 'source_bank', 'auction_reference_id', 'auction_portal_url', 'area_sqft']
+      .map((f) => body(f).optional({ nullable: true, checkFalsy: true }).isString().isLength({ max: 2000 })),
+  ],
+  validate,
+  handler(async (req, res) => success(res, 201, 'Item entered', await manualQueue.addItem(req.user, req.params.id, req.body, meta(req))))
+);
+router.post(
+  '/manual-tasks/:id/checks',
+  [param('id').isUUID(), body('note').isString().trim().isLength({ min: 3, max: 300 }), body('itemsEntered').optional().isInt({ min: 0, max: 1000 })],
+  validate,
+  handler(async (req, res) => success(res, 200, 'Check recorded', await manualQueue.recordCheck(req.user, req.params.id, req.body, meta(req))))
 );
 
 module.exports = router;

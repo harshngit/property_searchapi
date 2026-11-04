@@ -30,6 +30,8 @@ router.use(authenticate);
  *     summary: My balance, history, packs on sale and the credit price of each AI action
  *     tags: [AI credits]
  *     security: [{ bearerAuth: [] }]
+ *     parameters:
+ *       - { in: query, name: audience, schema: { type: string, enum: [customer] }, description: "customer - leave out the staff (CRM) tools from the price list (the website)" }
  * /ai-credits/settings:
  *   put:
  *     summary: My low-balance alert and optional daily / monthly AI spend limits (credits; empty = none)
@@ -62,7 +64,12 @@ router.use(authenticate);
  *     security: [{ bearerAuth: [] }]
  * /ai-credits/admin/purchases/{id}/refund:
  *   post:
- *     summary: Refund the unused credits of a purchase within the Terms & Conditions window (admin)
+ *     summary: Refund the unused credits of a purchase within the Terms & Conditions window (admin). Paid online - the money goes back through Razorpay at once; paid by bank / UPI - it waits for finance (refund-paid).
+ *     tags: [AI credits]
+ *     security: [{ bearerAuth: [] }]
+ * /ai-credits/admin/purchases/{id}/refund-paid:
+ *   post:
+ *     summary: Record the bank / UPI reference of a refund finance sent back by hand (admin)
  *     tags: [AI credits]
  *     security: [{ bearerAuth: [] }]
  * /ai-credits/purchases:
@@ -124,7 +131,7 @@ router.use(authenticate);
  *     tags: [AI credits]
  *     security: [{ bearerAuth: [] }]
  */
-router.get('/wallet', h(async (req, res) => ok(res, 'AI credits', await walletService.view(req.user))));
+router.get('/wallet', h(async (req, res) => ok(res, 'AI credits', await walletService.view(req.user, { audience: req.query.audience === 'customer' ? 'customer' : undefined }))));
 router.get('/balance', h(async (req, res) => ok(res, 'AI credit balance', await walletService.balance(req.user))));
 const limitRules = ['lowBalanceAlert', 'dailyCap', 'monthlyCap'].map((k) => body(k).optional({ nullable: true }).custom((v) => v === '' || (Number.isInteger(Number(v)) && Number(v) >= 0)));
 router.put('/settings', limitRules, validate, h(async (req, res) => ok(res, 'Settings saved', await walletService.saveSettings(req.user, req.user.id, req.body, meta(req)))));
@@ -178,6 +185,13 @@ router.post(
   validate,
   h(async (req, res) => ok(res, 'Unused credits refunded', await walletService.refundPurchase(req.user, req.params.id, req.body, meta(req))))
 );
+router.post(
+  '/admin/purchases/:id/refund-paid',
+  authorize(...ADMIN),
+  [param('id').isUUID(), body('reference').isString().isLength({ min: 4, max: 120 })],
+  validate,
+  h(async (req, res) => ok(res, 'Refund recorded as sent', await walletService.recordRefundPaid(req.user, req.params.id, req.body, meta(req))))
+);
 router.put(
   '/admin/activities/:key',
   authorize('super_admin'),
@@ -191,6 +205,7 @@ router.put(
     body('maxOutputTokens').optional().isInt({ min: 50, max: 64000 }),
     body('credits').optional().isInt({ min: 0, max: 100000 }),
     body('active').optional().isBoolean(),
+    body('audience').optional().isIn(['customer', 'staff']),
   ],
   validate,
   h(async (req, res) => ok(res, 'Activity saved', await ai.updateActivity(req.user, req.params.key, req.body, meta(req))))

@@ -745,15 +745,43 @@ async function approve(user, id, data = {}, meta = {}) {
   await auditService.log({ actor: user, action: 'chat_listing.approved', entityType: 'chat_listing', entityId: id, after: { propertyId }, ...meta });
   const status = (await pool.query('SELECT status FROM properties WHERE id = $1', [propertyId])).rows[0]?.status;
   const contact = { channel: s.channel, phone: s.contact_phone, waUserId: s.wa_user_id, chatId: s.telegram_chat_id };
+  // The live message carries both links: the website page and the Telegram smart
+  // link (t.me/<bot>?start=p_<id>) that takes a buyer straight into an inquiry.
+  const liveText = async () => {
+    const tg = require('../telegram.service').listingLink(propertyId);
+    return `Your property ${s.reference} is now live: ${await siteUrl()}/properties/${propertyId}${tg ? `\nTelegram link for buyers: ${tg}` : ''}\nShare these links with buyers.`;
+  };
   if (s.intent === 'institutional_sale') await send(contact, `Your institutional listing ${s.reference} is now with the A R Buildwel institutional desk. A representative will call you to complete the details.`);
   else if (status === 'approved' && s.channel === 'whatsapp' && (s.contact_phone || s.wa_user_id)) {
     // ar_listing_live (approved wording): listing.short_title, mandate.type_label.
     const typeLabel = s.mandate_type_requested === 'exclusive' ? 'Exclusive Mandate' : 'Standard listing';
     await metaWhatsapp().sendTemplate({ ...waContactFor(s), templateName: 'ar_listing_live', variables: [s.parsed?.title || s.reference, typeLabel], buttonUrlSuffix: propertyId })
-      .catch(async (err) => { console.error(`[chat-intake] ar_listing_live send failed for ${s.id}:`, err.message); await send(contact, `Your property ${s.reference} is now live: ${await siteUrl()}/properties/${propertyId}\nShare this link with buyers.`); });
-  } else if (status === 'approved') await send(contact, `Your property ${s.reference} is now live: ${await siteUrl()}/properties/${propertyId}\nShare this link with buyers.`);
-  else await send(contact, `Your property ${s.reference} has been accepted and is in a final check. We will message you when it is live.`);
+      .catch(async (err) => { console.error(`[chat-intake] ar_listing_live send failed for ${s.id}:`, err.message); await send(contact, await liveText()); });
+  } else if (status === 'approved') await send(contact, await liveText());
+  else await replyOutsideWindow(s, 'listing_in_review', [s.reference], `Your property ${s.reference} has been accepted and is in a final check. We will message you when it is live.`);
   return { ...(await getSubmission(user, id)), propertyStatus: status };
+}
+
+// A review can come back after Meta's 24-hour window, when WhatsApp only
+// delivers an approved template. If the template for this reply is in the
+// registry (notifications.whatsapp_templates - listing_rejected /
+// listing_in_review, once Meta approves them) it is used; otherwise, or if it
+// fails, the plain text goes out (it reaches the poster inside the window).
+// Telegram has no window, so it always gets the text.
+async function replyOutsideWindow(s, type, variables, text) {
+  const contact = { channel: s.channel, phone: s.contact_phone, waUserId: s.wa_user_id, chatId: s.telegram_chat_id };
+  if (s.channel === 'whatsapp' && (s.contact_phone || s.wa_user_id)) {
+    const registry = (await configService.getConfig('notifications.whatsapp_templates', {})) || {};
+    if (registry[type]) {
+      try {
+        await metaWhatsapp().sendTemplate({ ...waContactFor(s), templateName: registry[type], variables });
+        return;
+      } catch (err) {
+        console.error(`[chat-intake] ${registry[type]} send failed for ${s.id}:`, err.message);
+      }
+    }
+  }
+  await send(contact, text);
 }
 
 async function reject(user, id, { reason, notify = true } = {}, meta = {}) {
@@ -763,7 +791,7 @@ async function reject(user, id, { reason, notify = true } = {}, meta = {}) {
   if (!reason) throw badRequest('Give a reason');
   await pool.query(`UPDATE chat_listing_submissions SET status = 'rejected', review_note = $2, reviewed_by = $3, reviewed_at = now(), updated_at = now() WHERE id = $1`, [id, String(reason).slice(0, 500), user.id]);
   await auditService.log({ actor: user, action: 'chat_listing.rejected', entityType: 'chat_listing', entityId: id, after: { reason }, ...meta });
-  if (notify) await send({ channel: s.channel, phone: s.contact_phone, waUserId: s.wa_user_id, chatId: s.telegram_chat_id }, `Your property ${s.reference} could not be listed: ${reason}`);
+  if (notify) await replyOutsideWindow(s, 'listing_rejected', [s.reference, String(reason).slice(0, 300)], `Your property ${s.reference} could not be listed: ${reason}`);
   return getSubmission(user, id);
 }
 
@@ -785,6 +813,7 @@ async function intakeLog(user, { days = 7 } = {}) {
 }
 
 module.exports = {
+  replyOutsideWindow,
   detectIntent,
   parseFields,
   read,

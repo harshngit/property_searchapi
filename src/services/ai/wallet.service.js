@@ -28,8 +28,8 @@ const assertAdmin = (u) => {
 
 // ------------------------------------------------------------ the wallet page
 
-async function view(user) {
-  const base = await engine.wallet(user);
+async function view(user, { audience } = {}) {
+  const base = await engine.wallet(user, { audience });
   const [w, lots, topups, invoices, referrals, details, refundDays] = await Promise.all([
     pool.query('SELECT low_balance_alert, daily_cap, monthly_cap FROM ai_wallets WHERE user_id = $1', [user.id]),
     pool.query(
@@ -42,7 +42,7 @@ async function view(user) {
       [user.id]
     ),
     pool.query(
-      `SELECT id, receipt_number, invoice_number, pack_name, credits, total_inr, gateway, status, paid_at, refunded_credits FROM ai_credit_purchases
+      `SELECT id, receipt_number, invoice_number, pack_name, credits, total_inr, gateway, status, paid_at, refunded_credits, refund_inr, refund_status FROM ai_credit_purchases
        WHERE user_id = $1 AND invoice_number IS NOT NULL ORDER BY paid_at DESC LIMIT 50`,
       [user.id]
     ),
@@ -66,7 +66,7 @@ async function view(user) {
     expiring: lots.rows.map((l) => ({ credits: l.credits, expiresAt: l.expires_at })),
     paymentDetails: paymentDetailsView(details),
     topups: topups.rows.map(topupView),
-    invoices: invoices.rows.map((i) => ({ id: i.id, receiptNumber: i.receipt_number, invoiceNumber: i.invoice_number, packName: i.pack_name, credits: i.credits, totalInr: Number(i.total_inr), gateway: i.gateway, status: i.status, paidAt: i.paid_at, refundedCredits: i.refunded_credits })),
+    invoices: invoices.rows.map((i) => ({ id: i.id, receiptNumber: i.receipt_number, invoiceNumber: i.invoice_number, packName: i.pack_name, credits: i.credits, totalInr: Number(i.total_inr), gateway: i.gateway, status: i.status, paidAt: i.paid_at, refundedCredits: i.refunded_credits, refundInr: i.refund_inr == null ? null : Number(i.refund_inr), refundStatus: i.refund_status })),
     referrals: {
       code: (await pool.query('SELECT referral_code FROM users WHERE id = $1', [user.id])).rows[0]?.referral_code || null,
       rewards,
@@ -452,8 +452,10 @@ async function expireCredits() {
 }
 
 // Refund the unused credits of one purchase within the T&C window (admin).
-// The money goes back through the gateway / bank by finance; this takes the
-// credits out and records the amount.
+// The credits come out of the wallet and the money goes back: a purchase paid
+// online is refunded through Razorpay at once (the webhook confirms it); one
+// paid by bank / UPI waits for finance to send it back and record the
+// transfer reference (recordRefundPaid).
 async function refundPurchase(admin, purchaseId, { note } = {}, meta = {}) {
   assertAdmin(admin);
   const p = (await pool.query('SELECT * FROM ai_credit_purchases WHERE id = $1', [purchaseId])).rows[0];
@@ -463,6 +465,8 @@ async function refundPurchase(admin, purchaseId, { note } = {}, meta = {}) {
   if (days === null || days === undefined) throw badRequest('Refunds of AI credits are not offered under the current Terms & Conditions');
   if (Date.now() - new Date(p.paid_at).getTime() > Number(days) * 86400000) throw badRequest(`Refunds are possible within ${days} days of purchase`);
   if (!note || String(note).trim().length < 5) throw badRequest('Say why it is refunded');
+  const online = p.gateway === 'razorpay' && p.gateway_payment_id;
+  if (online && !engine.razorpay()) throw badRequest('Razorpay keys are not set, so this online payment cannot be refunded yet');
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -473,20 +477,49 @@ async function refundPurchase(admin, purchaseId, { note } = {}, meta = {}) {
     if (!w) throw badRequest('The wallet no longer holds these credits');
     await client.query('UPDATE ai_credit_lots SET remaining = 0 WHERE id = $1', [lot.id]);
     const refund = Math.round((Number(p.total_inr) * unused) / p.credits * 100) / 100;
+    // The gateway refund goes out before the commit: if Razorpay refuses, nothing changes.
+    let payout = { status: 'manual_pending', gatewayId: null };
+    if (online) {
+      const r = await engine.razorpayRequest(`/v1/payments/${encodeURIComponent(p.gateway_payment_id)}/refund`, {
+        amount: Math.round(refund * 100),
+        speed: 'normal',
+        receipt: p.receipt_number,
+        notes: { purchaseId: p.id, credits: String(unused) },
+      });
+      if (!r.ok || !r.body?.id) throw badRequest(`Razorpay did not accept the refund${r.body?.error?.description ? `: ${r.body.error.description}` : ''}`);
+      payout = { status: r.body.status === 'processed' ? 'processed' : 'processing', gatewayId: r.body.id };
+    }
     await client.query(
-      `UPDATE ai_credit_purchases SET status = 'refunded', refunded_credits = $2, refund_inr = $3, refunded_at = now(), refund_note = $4 WHERE id = $1`,
-      [p.id, unused, refund, String(note).slice(0, 300)]
+      `UPDATE ai_credit_purchases SET status = 'refunded', refunded_credits = $2, refund_inr = $3, refunded_at = now(), refund_note = $4,
+              refund_status = $5::varchar, refund_gateway_id = $6, refund_paid_at = CASE WHEN $5::varchar = 'processed' THEN now() END WHERE id = $1`,
+      [p.id, unused, refund, String(note).slice(0, 300), payout.status, payout.gatewayId]
     );
     await engine.ledger(client, { userId: p.user_id, kind: 'refund_out', credits: -unused, balanceAfter: w.balance, purchaseId: p.id, note: `Unused credits of ${p.receipt_number} refunded (Rs ${refund})`, actorId: admin.id });
     await client.query('COMMIT');
-    await auditService.log({ actor: admin, action: 'ai.purchase_refunded', entityType: 'ai_credit_purchase', entityId: p.id, after: { credits: unused, refundInr: refund, note }, ...meta });
-    return { purchaseId: p.id, refundedCredits: unused, refundInr: refund, balance: w.balance };
+    await auditService.log({ actor: admin, action: 'ai.purchase_refunded', entityType: 'ai_credit_purchase', entityId: p.id, after: { credits: unused, refundInr: refund, note, refundStatus: payout.status, refundGatewayId: payout.gatewayId }, ...meta });
+    return { purchaseId: p.id, refundedCredits: unused, refundInr: refund, balance: w.balance, refundStatus: payout.status, refundGatewayId: payout.gatewayId };
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     throw err;
   } finally {
     client.release();
   }
+}
+
+// Finance sent a bank / UPI refund back (or a failed online refund by hand):
+// record the transfer reference.
+async function recordRefundPaid(admin, purchaseId, { reference } = {}, meta = {}) {
+  assertAdmin(admin);
+  const ref = String(reference || '').trim();
+  if (ref.length < 4) throw badRequest('Give the bank / UPI reference of the refund');
+  const p = (await pool.query(
+    `UPDATE ai_credit_purchases SET refund_status = 'processed', refund_reference = $2, refund_paid_at = now()
+     WHERE id = $1 AND status = 'refunded' AND refund_status IN ('manual_pending', 'failed') RETURNING id, refund_inr`,
+    [purchaseId, ref.slice(0, 120)]
+  )).rows[0];
+  if (!p) throw badRequest('This refund is not waiting to be sent by hand');
+  await auditService.log({ actor: admin, action: 'ai.refund_paid', entityType: 'ai_credit_purchase', entityId: p.id, after: { reference: ref, refundInr: Number(p.refund_inr) }, ...meta });
+  return { purchaseId: p.id, refundStatus: 'processed', refundReference: ref };
 }
 
 let timer = null;
@@ -499,5 +532,5 @@ function startScheduler() {
 module.exports = {
   view, balance, saveSettings, requestTopup, listTopups, decideTopup, topupScreenshot, walletRules, saveWalletRules, paymentDetailsView,
   referralRewards, onJoined, onSpend, onDealClosed, safeOnJoined: safe(onJoined, 'join reward'), safeOnDealClosed: safe(onDealClosed, 'deal reward'),
-  invoicePdf, expireCredits, refundPurchase, startScheduler,
+  invoicePdf, expireCredits, refundPurchase, recordRefundPaid, startScheduler,
 };

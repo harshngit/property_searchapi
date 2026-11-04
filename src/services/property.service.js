@@ -231,6 +231,7 @@ async function createProperty(data, user, { autoVerify = true } = {}) {
     price,
     city,
     locality,
+    pincode,
     address,
     latitude,
     longitude,
@@ -279,11 +280,11 @@ async function createProperty(data, user, { autoVerify = true } = {}) {
        locality_rating, auction_date, source_bank, occupancy_percent, yield_percent, yield_qualifier,
        about_extended, carpet_area_sqft, facing, tags, badge, is_verified, rera_number,
        possession_status, floor_number, total_floors, furnishing, parking_spots, parking_type,
-       age_of_property, gated_community, faqs
+       age_of_property, gated_community, faqs, pincode
      ) VALUES (
        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, 'pending_approval',
        $19, $20, $21, $22, $23, $24, $25, $26, $27, $28,
-       $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44
+       $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45
      ) RETURNING *`,
     [
       user.tenant_id || null,
@@ -330,6 +331,7 @@ async function createProperty(data, user, { autoVerify = true } = {}) {
       ageOfProperty || null,
       gatedCommunity ?? false,
       JSON.stringify(faqs || []),
+      pincode || null,
     ]
   );
   const propertyId = result.rows[0].id;

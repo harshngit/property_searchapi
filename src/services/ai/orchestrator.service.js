@@ -279,15 +279,26 @@ const packView = (p, gst) => {
   return { id: p.id, name: p.name, priceInr: price, gstInr: tax, totalInr: Math.round((price + tax) * 100) / 100, credits: p.credits, bonusCredits: p.bonus_credits, totalCredits: p.credits + p.bonus_credits };
 };
 const razorpay = () => (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET ? { keyId: process.env.RAZORPAY_KEY_ID, secret: process.env.RAZORPAY_KEY_SECRET } : null);
+async function razorpayRequest(path, body) {
+  const rz = razorpay();
+  if (!rz) return { ok: false, status: 0, body: null };
+  const res = await fetch(`https://api.razorpay.com${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Basic ${Buffer.from(`${rz.keyId}:${rz.secret}`).toString('base64')}` },
+    body: JSON.stringify(body),
+  });
+  return { ok: res.ok, status: res.status, body: await res.json().catch(() => null) };
+}
 
-async function wallet(user) {
+// audience 'customer': the website's price list leaves out the staff (CRM) tools.
+async function wallet(user, { audience } = {}) {
   await ensureWallet(user.id);
   const gst = Number(await configService.getConfig('ai.credit_gst_percent', 18));
   const [w, history, packs, priced] = await Promise.all([
     pool.query('SELECT * FROM ai_wallets WHERE user_id = $1', [user.id]),
     pool.query(`SELECT l.*, a.label FROM ai_credit_ledger l LEFT JOIN ai_activities a ON a.activity_key = l.activity_key WHERE l.user_id = $1 ORDER BY l.created_at DESC LIMIT 50`, [user.id]),
     pool.query('SELECT * FROM ai_credit_packs WHERE is_active ORDER BY sort_order, price_inr'),
-    pool.query(`SELECT activity_key, label, description, credits, tier FROM ai_activities WHERE is_active AND credits > 0 ORDER BY credits`),
+    pool.query(`SELECT activity_key, label, description, credits, tier, audience FROM ai_activities WHERE is_active AND credits > 0 AND ($1::text IS NULL OR audience = $1) ORDER BY credits`, [audience === 'customer' ? 'customer' : null]),
   ]);
   return {
     balance: w.rows[0].balance,
@@ -296,7 +307,7 @@ async function wallet(user) {
     paymentOnline: !!razorpay(),
     gstPercent: gst,
     packs: packs.rows.map((p) => packView(p, gst)),
-    prices: priced.rows.map((r) => ({ key: r.activity_key, label: r.label, description: r.description, credits: r.credits, tier: r.tier })),
+    prices: priced.rows.map((r) => ({ key: r.activity_key, label: r.label, description: r.description, credits: r.credits, tier: r.tier, audience: r.audience })),
     history: history.rows.map((l) => ({ id: l.id, kind: l.kind, credits: l.credits, balanceAfter: l.balance_after, label: l.label || l.note, note: l.note, at: l.created_at })),
   };
 }
@@ -319,12 +330,8 @@ async function startPurchase(user, packId) {
   const rz = razorpay();
   if (!rz) throw badRequest('Online payment is not set up yet - ask your A R Buildwel contact to add credits after a bank transfer');
   const p = await newPurchase(pool, user, pack, 'razorpay');
-  const res = await fetch('https://api.razorpay.com/v1/orders', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Basic ${Buffer.from(`${rz.keyId}:${rz.secret}`).toString('base64')}` },
-    body: JSON.stringify({ amount: Math.round(Number(p.total_inr) * 100), currency: 'INR', receipt: p.receipt_number, notes: { purchaseId: p.id, credits: String(p.credits) } }),
-  });
-  const order = await res.json().catch(() => null);
+  const res = await razorpayRequest('/v1/orders', { amount: Math.round(Number(p.total_inr) * 100), currency: 'INR', receipt: p.receipt_number, notes: { purchaseId: p.id, credits: String(p.credits) } });
+  const order = res.body;
   if (!res.ok || !order?.id) {
     await pool.query(`UPDATE ai_credit_purchases SET status = 'failed' WHERE id = $1`, [p.id]);
     throw badRequest(`Could not start the payment${order?.error?.description ? `: ${order.error.description}` : ''}`);
@@ -385,7 +392,7 @@ const assertSuper = (u) => { if (u.role !== 'super_admin') throw forbidden('Only
 const activityView = (a) => ({
   key: a.activity_key, label: a.label, description: a.description, tier: a.tier, provider: a.provider, model: a.model,
   fallbackProvider: a.fallback_provider, fallbackModel: a.fallback_model, effort: a.effort, maxOutputTokens: a.max_output_tokens,
-  credits: a.credits, payer: a.payer, active: a.is_active, updatedAt: a.updated_at,
+  credits: a.credits, payer: a.payer, active: a.is_active, audience: a.audience, updatedAt: a.updated_at,
 });
 
 async function adminOverview(user) {
@@ -410,7 +417,7 @@ async function adminOverview(user) {
     ),
     pool.query(
       `SELECT p.id, p.receipt_number, p.invoice_number, p.pack_name, p.credits, p.total_inr::float AS total_inr, p.gateway, p.reference, p.status, p.paid_at,
-              p.refunded_credits, p.refund_inr::float AS refund_inr, u.full_name AS user_name,
+              p.refunded_credits, p.refund_inr::float AS refund_inr, p.refund_status, p.refund_gateway_id, p.refund_reference, p.refund_error, u.full_name AS user_name,
               (SELECT l.remaining FROM ai_credit_lots l WHERE l.purchase_id = p.id AND l.kind = 'purchase' LIMIT 1) AS unused
        FROM ai_credit_purchases p JOIN users u ON u.id = p.user_id WHERE p.status IN ('paid', 'refunded') ORDER BY p.paid_at DESC NULLS LAST LIMIT 50`
     ),
@@ -425,7 +432,7 @@ async function adminOverview(user) {
     packs: packs.rows.map((p) => ({ ...packView(p, gst), active: p.is_active, sortOrder: p.sort_order })),
     usage30d: usage.rows.map((u) => ({ ...u, ...margin(u.credits, u.cost_usd), costPerRunInr: u.runs ? inr(u.cost_usd / u.runs) : 0 })),
     recentRuns: recent.rows.map((r) => ({ id: r.id, activityKey: r.activity_key, label: r.label, model: r.model, status: r.status, userName: r.user_name, inputTokens: r.input_tokens, outputTokens: r.output_tokens, creditsCharged: r.credits_charged, ...margin(r.credits_charged, r.cost_usd), at: r.created_at })),
-    purchases: purchases.rows.map((p) => ({ id: p.id, receiptNumber: p.receipt_number, invoiceNumber: p.invoice_number, packName: p.pack_name, credits: p.credits, totalInr: p.total_inr, gateway: p.gateway, reference: p.reference, status: p.status, paidAt: p.paid_at, userName: p.user_name, unusedCredits: p.unused ?? null, refundedCredits: p.refunded_credits, refundInr: p.refund_inr })),
+    purchases: purchases.rows.map((p) => ({ id: p.id, receiptNumber: p.receipt_number, invoiceNumber: p.invoice_number, packName: p.pack_name, credits: p.credits, totalInr: p.total_inr, gateway: p.gateway, reference: p.reference, status: p.status, paidAt: p.paid_at, userName: p.user_name, unusedCredits: p.unused ?? null, refundedCredits: p.refunded_credits, refundInr: p.refund_inr, refundStatus: p.refund_status, refundGatewayId: p.refund_gateway_id, refundReference: p.refund_reference, refundError: p.refund_error })),
     revenue30d: revenue.rows[0],
     modelPrices: prices,
     usdInrRate: usdInr,
@@ -440,16 +447,17 @@ async function updateActivity(user, key, data = {}, meta = {}) {
   const pick = (k, col) => (data[k] === undefined ? a[col] : data[k]);
   const next = {
     provider: pick('provider', 'provider'), model: pick('model', 'model'), fallback_provider: pick('fallbackProvider', 'fallback_provider') || null, fallback_model: pick('fallbackModel', 'fallback_model') || null,
-    effort: pick('effort', 'effort'), max_output_tokens: Number(pick('maxOutputTokens', 'max_output_tokens')), credits: Number(pick('credits', 'credits')), payer: 'user', is_active: pick('active', 'is_active'),
+    effort: pick('effort', 'effort'), max_output_tokens: Number(pick('maxOutputTokens', 'max_output_tokens')), credits: Number(pick('credits', 'credits')), payer: 'user', is_active: pick('active', 'is_active'), audience: pick('audience', 'audience'),
   };
+  if (!['customer', 'staff'].includes(next.audience)) throw badRequest('audience must be customer or staff');
   if (!['openai', 'claude'].includes(next.provider)) throw badRequest('provider must be openai or claude');
   if (!prices[next.model]) throw badRequest(`Add a price for ${next.model} in the model price list first (ai.model_prices)`);
   if ((next.provider === 'claude') !== String(next.model).startsWith('claude')) throw badRequest('That model does not belong to that provider');
   if (next.fallback_provider && (!next.fallback_model || !prices[next.fallback_model])) throw badRequest('Give a priced fallback model, or no fallback');
   if (!Number.isInteger(next.credits) || next.credits < 0 || next.credits > 100000) throw badRequest('Credits must be a whole number');
   const r = (await pool.query(
-    `UPDATE ai_activities SET provider = $2, model = $3, fallback_provider = $4, fallback_model = $5, effort = $6, max_output_tokens = $7, credits = $8, payer = $9, is_active = $10, updated_by = $11, updated_at = now() WHERE activity_key = $1 RETURNING *`,
-    [key, next.provider, next.model, next.fallback_provider, next.fallback_model, next.effort, next.max_output_tokens, next.credits, next.payer, !!next.is_active, user.id]
+    `UPDATE ai_activities SET provider = $2, model = $3, fallback_provider = $4, fallback_model = $5, effort = $6, max_output_tokens = $7, credits = $8, payer = $9, is_active = $10, updated_by = $11, audience = $12, updated_at = now() WHERE activity_key = $1 RETURNING *`,
+    [key, next.provider, next.model, next.fallback_provider, next.fallback_model, next.effort, next.max_output_tokens, next.credits, next.payer, !!next.is_active, user.id, next.audience]
   )).rows[0];
   invalidate();
   await auditService.log({ actor: user, action: 'ai.activity_updated', entityType: 'ai_activity', entityId: null, before: activityView(a), after: activityView(r), ...meta });
@@ -500,5 +508,5 @@ async function adminCredit(user, { userId, credits, packId, reference, note } = 
 module.exports = {
   run, available, activity, activities, invalidate, InsufficientCredits, wallet, startPurchase, verifyPurchase, adminOverview, updateActivity, savePack, adminCredit,
   // for wallet.service (top-ups, referrals, expiry, refunds)
-  credit, ensureWallet, newPurchase, markPaid, packView, ledger, consumeLots,
+  credit, ensureWallet, newPurchase, markPaid, packView, ledger, consumeLots, razorpay, razorpayRequest,
 };

@@ -611,7 +611,7 @@ async function listReps() {
     await pool.query(
       `SELECT u.id AS user_id, u.full_name, u.email, u.status, r.name AS role,
               ar.designation, ar.platform_number, ar.assigned_states, ar.assigned_cities, ar.coverage_localities,
-              ar.team_leader_id, tl.full_name AS team_leader_name, ar.accepts_assignments, (ar.user_id IS NOT NULL) AS is_rep,
+              ar.team_leader_id, tl.full_name AS team_leader_name, ar.accepts_assignments, (ar.user_id IS NOT NULL) AS is_rep, ec.em_code,
               (SELECT COUNT(*) FROM leads l WHERE l.arb_rep_id = u.id AND l.status NOT IN ('won', 'lost'))::int AS open_load,
               (SELECT COUNT(*) FROM lead_assignment_events e WHERE e.from_user_id = u.id AND e.kind = 'contacted')::int AS attended,
               (SELECT COUNT(*) FROM lead_assignment_events e WHERE e.from_user_id = u.id AND e.kind = 'missed')::int AS missed,
@@ -619,6 +619,7 @@ async function listReps() {
        FROM users u JOIN roles r ON r.id = u.role_id
        LEFT JOIN arb_representatives ar ON ar.user_id = u.id
        LEFT JOIN users tl ON tl.id = ar.team_leader_id
+       LEFT JOIN employee_codes ec ON ec.user_id = u.id
        WHERE r.name = ANY($1)
        ORDER BY (ar.user_id IS NULL), u.full_name`,
       [REP_ROLES]

@@ -31,7 +31,13 @@ dist/
 build/
 
 # Internal working docs (handoff notes, integration status) - not part of the
-# published API, kept local only
-docs/
+# published API, kept local only - except the handover documents below
+docs/*
+!docs/OPEN_SOURCE_LICENCES.md
+!docs/WHATSAPP_TEMPLATES_TO_REGISTER.md
+!docs/BACKUP_AND_DR_RUNBOOK.md
 *.traineddata
 .ocr-cache/
+
+# Local npm cache (npm --cache .npm-cache); never commit
+.npm-cache/

@@ -85,6 +85,7 @@ const listingRules = (create) => [
   body('address').optional({ nullable: true }).isString().isLength({ max: 400 }),
   body('latitude').optional().isFloat({ min: -90, max: 90 }),
   body('longitude').optional().isFloat({ min: -180, max: 180 }),
+  body('pincode').optional({ nullable: true, checkFalsy: true }).matches(/^\d{6}$/).withMessage('Pincode must be 6 digits'),
   body('dealType').optional().isIn(Object.keys(institutional.DEAL_TYPES)),
   body('nocStatus').optional().isIn(['valid', 'pending', 'expired', 'not_applicable']),
   body('landOwnership').optional().isIn(['owned', 'leased', 'trust_held', 'mixed']),

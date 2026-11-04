@@ -152,11 +152,15 @@ const TYPES = {
   },
   geo_point: {
     label: 'Map location',
+    // When the map is down a 6-digit pincode stands in for the pin; the
+    // geocoder places it later (sec. 25.5.2).
     clean: (raw) => {
       const lat = Number(raw?.lat ?? raw?.latitude);
       const lng = Number(raw?.lng ?? raw?.longitude);
-      if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180 || raw?.lat === '' || raw?.lng === '') fail('Pick the location on the map');
-      return { lat: Number(lat.toFixed(7)), lng: Number(lng.toFixed(7)) };
+      const typed = raw?.lat !== '' && raw?.lng !== '' && raw?.lat != null && raw?.lng != null;
+      if (typed && Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180) return { lat: Number(lat.toFixed(7)), lng: Number(lng.toFixed(7)) };
+      if (/^\d{6}$/.test(String(raw?.pincode || '').trim())) return { pincode: String(raw.pincode).trim(), pending: true };
+      return fail('Pick the location on the map, or give the 6-digit pincode');
     },
   },
   rating: {
@@ -618,7 +622,7 @@ function displayText(f, value) {
     case 'dropdown': return label(value);
     case 'multiselect': return (value || []).map(label).join(', ');
     case 'address': return [value.line1, value.line2, value.city, value.state, value.pincode].filter(Boolean).join(', ');
-    case 'geo_point': return `${value.lat}, ${value.lng}`;
+    case 'geo_point': return value.pending ? `Pincode ${value.pincode} (location to be placed)` : `${value.lat}, ${value.lng}${value.approximate ? ' (approximate)' : ''}`;
     case 'phone': return `${value.countryCode} ${value.number}`;
     case 'rating': return `${value} / ${Number(f.validation_rules?.max) || 5}`;
     case 'file': case 'image': return (Array.isArray(value) ? value : [value]).map((x) => x.name).join(', ');
