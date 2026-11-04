@@ -217,12 +217,15 @@ async function leaderboard(user, { scope = 'platform', city, period = 'month', a
 }
 
 // Cities that have a board, for the area picker.
-async function boardCities(user) {
+// The 200 busiest by default; `q` searches all of them (the picker types to find the rest).
+async function boardCities(user, { q } = {}) {
   const aud = STAFF.includes(user.role) ? null : audienceOf(user.role);
+  const term = q ? String(q).trim().slice(0, 100).replace(/[\\%_]/g, (m) => `\\${m}`) : '';
   const r = await pool.query(
     `SELECT g.city, COUNT(DISTINCT g.user_id)::int AS players FROM gamification_points g JOIN users u ON u.id = g.user_id JOIN roles r ON r.id = u.role_id
-     WHERE g.city IS NOT NULL AND ($1::text[] IS NULL OR r.name = ANY($1::text[])) GROUP BY 1 ORDER BY players DESC, g.city LIMIT 200`,
-    [aud ? (aud === 'professional' ? PROFESSIONAL : ['customer']) : null]
+     WHERE g.city IS NOT NULL AND ($1::text[] IS NULL OR r.name = ANY($1::text[])) AND ($2 = '' OR g.city ILIKE '%' || $2 || '%')
+     GROUP BY 1 ORDER BY players DESC, g.city LIMIT 200`,
+    [aud ? (aud === 'professional' ? PROFESSIONAL : ['customer']) : null, term]
   );
   return r.rows;
 }

@@ -24,7 +24,7 @@ npm-debug.log*
 Thumbs.db
 
 # Test/coverage
-coverage/
+/coverage/
 
 # Build output
 dist/
@@ -41,3 +41,6 @@ docs/*
 
 # Local npm cache (npm --cache .npm-cache); never commit
 .npm-cache/
+
+# Load-test reports
+loadtest-*.json

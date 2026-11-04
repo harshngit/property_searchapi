@@ -978,7 +978,8 @@ test('deal room: verified buyer + NDA + admin approval gate, append-only access 
 
 test('crawler: legal approval gate, robots.txt, parse -> queue -> dedupe, legal-review gate on notices', async () => {
   const http = require('http');
-  const port = 5000 + Math.floor(Math.random() * 400) + 5300;
+  // A free port picked by the OS (a fixed random one could already be taken).
+  let port;
   const row = (i) => `<tr class="item"><td class="ref">E2E-${RUN}-${i}</td><td class="t">3 BHK flat ${RUN} ${i}</td><td class="city">${CITY}</td><td class="price">Rs. ${90 + i} Lakh</td><td class="date">2${i}-12-2027</td></tr>`;
   const server = http
     .createServer((req, res) => {
@@ -988,7 +989,9 @@ test('crawler: legal approval gate, robots.txt, parse -> queue -> dedupe, legal-
       res.statusCode = 404;
       return res.end();
     })
-    .listen(port);
+    .listen(0);
+  await new Promise((r) => (server.listening ? r() : server.once('listening', r)));
+  port = server.address().port;
   try {
     const A = ctx.admin.token;
     const sources = await api('GET', '/crawlers/sources', { token: A });
@@ -2527,7 +2530,8 @@ test('guest interest (OTP, no account), web push, reference-data crawlers (RERA 
   const INDEX_CITY_2 = `Other${word}`;
   const indexPdf = await scannedPdf(['RBI House Price Index Q1 2025-26', `${INDEX_CITY} 312.4 4.2 1.1`, `${INDEX_CITY_2} 287.0 3.5 0.8`]);
   const RERA_NO = `P-${RUN}-00123`;
-  const port = 5000 + Math.floor(Math.random() * 400) + 5800;
+  // A free port picked by the OS (a fixed random one could already be taken).
+  let port;
   const server = http
     .createServer((req, res) => {
       if (req.url === '/robots.txt') return res.end('User-agent: *\nAllow: /\n');
@@ -2562,7 +2566,9 @@ test('guest interest (OTP, no account), web push, reference-data crawlers (RERA 
       res.statusCode = 404;
       return res.end();
     })
-    .listen(port);
+    .listen(0);
+  await new Promise((r) => (server.listening ? r() : server.once('listening', r)));
+  port = server.address().port;
   const base = `http://localhost:${port}`;
   const sources = (await api('GET', '/crawlers/sources', { token: A })).data;
   const src = (key) => sources.find((s) => s.source_key === key);
@@ -3270,7 +3276,8 @@ test('gamification: points from platform activity, idempotent sync, tiers, strea
   const cboard = await api('GET', '/gamification/leaderboard?period=month', { token: cust.token });
   assert.equal(cboard.data.audience, 'customer');
   assert.ok(cboard.data.items.every((i) => i.userId === undefined && !/gamecust \w{6}$/.test(i.name)));
-  assert.ok((await api('GET', '/gamification/cities', { token: b1.token })).data.some((c) => c.city === GCITY));
+  assert.ok((await api('GET', `/gamification/cities?q=${encodeURIComponent(GCITY)}`, { token: b1.token })).data.some((c) => c.city === GCITY));
+  assert.ok((await api('GET', '/gamification/cities', { token: b1.token })).data.length <= 200);
 
   // Admin: bonus with a reason moves the tier and notifies; deduction is another ledger row.
   assert.equal((await api('POST', '/gamification/manage/adjust', { token: ctx.sales.token, body: { userId: b1.id, points: 100, reason: 'Top performer' } })).status, 403);
@@ -6274,7 +6281,15 @@ test('franchise extras: statutory TDS versions, unified per-PAN ledger, GST invo
   assert.equal((await api('POST', '/tax/statutory', { token: A, body: { key: 'tds_commission_percent', value: 2, effectiveFrom: tomorrow, legalBasis: 'Finance Act test amendment' } })).status, 403);
   assert.equal((await api('POST', '/tax/statutory', { token: S, body: { key: 'tds_commission_percent', value: 2, effectiveFrom: '2020-01-01', legalBasis: 'Finance Act test amendment' } })).status, 400, 'never backdated');
   assert.equal((await api('POST', '/tax/statutory', { token: S, body: { key: 'tds_commission_percent', value: 2, effectiveFrom: tomorrow, legalBasis: 'x' } })).status, 400, 'legal basis required');
-  const far = `2099-0${1 + Math.floor(Math.random() * 8)}-${String(10 + Math.floor(Math.random() * 18))}`;
+  // A future date no earlier run has used (versions are never edited or deleted, so a reused date would clash).
+  const usedFar = new Set((await pool.query(`SELECT to_char(effective_from, 'YYYY-MM-DD') AS d FROM statutory_parameters WHERE param_key = 'tds_commission_percent' AND effective_from > now()`)).rows.map((r) => r.d));
+  let far;
+  for (let y = 2099; !far; y -= 1) {
+    for (let i = 0; i < 365 && !far; i += 1) {
+      const d = new Date(Date.UTC(y, 0, 1 + Math.floor(Math.random() * 365))).toISOString().slice(0, 10);
+      if (!usedFar.has(d)) far = d;
+    }
+  }
   const added = await api('POST', '/tax/statutory', { token: S, body: { key: 'tds_commission_percent', value: 2, effectiveFrom: far, legalBasis: 'Test: Finance Act amendment to s. 194H, CBDT notification' } });
   assert.equal(added.status, 201, JSON.stringify(added.body));
   const today = await tax.params();
@@ -7775,4 +7790,123 @@ test('resilience (sec. 25.5): pincode-only listings placed later by the geocoder
   const codes = await api('GET', '/incentives/codes', { token: SA });
   assert.ok(codes.data.some((c) => c.userId === other.id && c.status === 'terminated'));
   assert.equal((await api('GET', '/incentives/codes', { token: A })).status, 403, 'retired codes: Super Admin only');
+});
+
+test('Smart Audience Engine (Module 49): the eight contract segments from events, lead scores, requirements and NRI signals, admin-edited rules, masked members, consent-only hashed sync with joiners and leavers; co-broking on a buyer requirement from the marketplace', async (t) => {
+  const A = ctx.admin.token;
+  const configService = require('../src/services/config.service');
+  const audiences = require('../src/services/audience.service');
+  const keepSettings = await configService.getConfig('audiences.settings', null);
+  t.after(async () => {
+    await pool.query('UPDATE app_config SET value = $2::jsonb WHERE config_key = $1', ['audiences.settings', JSON.stringify(keepSettings)]);
+    configService.invalidate();
+    delete process.env.AUDIENCE_SYNC_MOCK;
+  });
+
+  // ---- a buyer with a Rs 2.5 Cr requirement, commercial searches, registration from abroad
+  const buyer = await createUser('customer', 'audbuyer');
+  const rq = await api('POST', '/me/requirements', {
+    token: buyer.token,
+    body: { purpose: 'buy', propertyType: 'apartment', city: CITY, budgetMin: 20000000, budgetMax: 25000000, consentToken: await consent(buyer.token, 'requirement') },
+  });
+  assert.equal(rq.status, 201, JSON.stringify(rq.body));
+  const customerId = (await pool.query('SELECT id FROM customers WHERE user_id = $1', [buyer.id])).rows[0].id;
+  const search = { type: 'search_performed', properties: { filters: { propertyType: 'commercial' } } };
+  const tracked = await api('POST', '/events/track', {
+    token: buyer.token,
+    headers: { 'cf-ipcountry': 'AE' },
+    body: { anonymousId: `aud-${RUN}`, events: [search, search, search, { type: 'registration_completed', properties: {} }, { type: 'whatsapp_click', properties: {} }] },
+  });
+  assert.equal(tracked.data.accepted, 5);
+  const reg = (await pool.query(`SELECT device_json->>'country' AS c FROM events WHERE user_id = $1 AND event_type = 'registration_completed'`, [buyer.id])).rows[0];
+  assert.equal(reg.c, 'AE', 'only the country is kept from the proxy header');
+  await new Promise((r) => setTimeout(r, 2200)); // let the debounced lead-score refresh run first
+  await pool.query(`INSERT INTO lead_scores (customer_id, score, category) VALUES ($1, 75, 'hot') ON CONFLICT (customer_id) DO UPDATE SET score = 75, category = 'hot'`, [customerId]);
+
+  // ---- the eight built-in segments
+  assert.equal((await api('GET', '/audiences', { token: ctx.broker.token })).status, 403, 'admins only');
+  const list = await api('GET', '/audiences', { token: A });
+  assert.equal(list.status, 200);
+  const byKey = Object.fromEntries(list.data.items.map((s) => [s.key, s]));
+  for (const k of ['commercial_buyers', 'luxury_buyers', 'nri_buyers', 'active_investors', 'high_intent', 'site_visit_requested', 'whatsapp_enquiry', 'deal_ready']) assert.ok(byKey[k]?.builtIn, k);
+  const memberOf = async (key) => {
+    const r = await api('POST', `/audiences/${byKey[key].id}/refresh`, { token: A });
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    return (await pool.query('SELECT 1 FROM audience_members WHERE segment_id = $1 AND customer_id = $2', [byKey[key].id, customerId])).rows.length === 1;
+  };
+  assert.ok(await memberOf('commercial_buyers'), '3 commercial searches in 14 days');
+  assert.ok(await memberOf('luxury_buyers'), 'budget above Rs 2 Cr');
+  assert.ok(await memberOf('nri_buyers'), 'registered from outside India');
+  assert.ok(await memberOf('high_intent'), 'lead score 70+');
+  assert.ok(await memberOf('whatsapp_enquiry'), 'WhatsApp click in 30 days');
+  assert.equal(await memberOf('deal_ready'), false, 'no offer, no completed visit');
+  assert.equal(await memberOf('active_investors'), false);
+
+  // Admin tunes a rule - no code change: three searches no longer enough.
+  const tuned = await api('PUT', `/admin/audiences/${byKey.commercial_buyers.id}`, { token: A, body: { rule: { match: 'any', conditions: [{ type: 'search_count', propertyTypes: ['commercial'], minCount: 4, days: 14 }] } } });
+  assert.equal(tuned.status, 200, JSON.stringify(tuned.body));
+  assert.equal((await pool.query('SELECT 1 FROM audience_members WHERE segment_id = $1 AND customer_id = $2', [byKey.commercial_buyers.id, customerId])).rows.length, 0, 'recomputed on save');
+  await api('PUT', `/admin/audiences/${byKey.commercial_buyers.id}`, { token: A, body: { rule: byKey.commercial_buyers.rule } });
+  assert.equal((await api('PUT', `/admin/audiences/${byKey.high_intent.id}`, { token: A, body: { rule: { conditions: [{ type: 'bogus' }] } } })).status, 400);
+  assert.equal((await api('PUT', `/admin/audiences/${byKey.high_intent.id}`, { token: A, body: { rule: { conditions: [{ type: 'lead_score', min: 101 }] } } })).status, 400);
+
+  // ---- a custom segment: high score AND (NRI OR luxury budget)
+  const rule = { match: 'all', conditions: [{ type: 'lead_score', min: 74 }, { type: 'combo', match: 'any', conditions: [{ type: 'nri' }, { type: 'budget_above', minRupees: 20000000 }] }] };
+  const pv = await api('POST', '/audiences/preview', { token: A, body: { rule } });
+  assert.ok(pv.data.members >= 1);
+  const created = await api('POST', '/admin/audiences', { token: A, body: { key: `e2e_${RUN}`, name: `E2E NRI high intent ${RUN}`, rule, syncMeta: true, metaAudienceId: '1234567890123' } });
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  assert.equal((await api('POST', '/admin/audiences', { token: A, body: { key: `e2e_${RUN}`, name: 'Duplicate', rule } })).status, 400);
+  const SEG = created.data.id;
+  const mem = await api('GET', `/audiences/${SEG}/members?limit=200`, { token: A });
+  const me = mem.data.items.find((m) => m.customerId === customerId);
+  assert.ok(me, 'member');
+  assert.ok(/X/.test(me.mobile) && /\*@/.test(me.email), 'contact masked');
+  assert.equal(me.marketingConsent, false);
+
+  // ---- sync: without the Meta token it is recorded as skipped
+  const skipped = await api('POST', `/audiences/${SEG}/sync`, { token: A });
+  assert.equal(skipped.status, 200);
+  assert.equal(skipped.data[0].status, 'skipped');
+  assert.match(skipped.data[0].detail, /Meta is not connected/);
+
+  // Consent gate and hashes (mock transport, in this process).
+  process.env.AUDIENCE_SYNC_MOCK = 'true';
+  await pool.query('UPDATE app_config SET value = $2::jsonb WHERE config_key = $1', ['audiences.settings', JSON.stringify({ ...(keepSettings || {}), minSyncSize: 1 })]);
+  configService.invalidate();
+  const synced = async () => (await pool.query(`SELECT email_sha256 FROM audience_synced_members WHERE segment_id = $1 AND platform = 'meta' AND customer_id = $2`, [SEG, customerId])).rows[0];
+  await audiences.sync(SEG);
+  assert.equal(await synced(), undefined, 'no marketing consent - never sent');
+  await pool.query(`INSERT INTO consent_logs (user_id, category, consent_version, granted, source) VALUES ($1, 'marketing', 'e2e', true, 'e2e')`, [buyer.id]);
+  const [run1] = await audiences.sync(SEG);
+  assert.equal(run1.status, 'success');
+  assert.ok(run1.sent >= 1);
+  const email = (await pool.query('SELECT email FROM customers WHERE id = $1', [customerId])).rows[0].email;
+  if (email) assert.equal((await synced()).email_sha256, crypto.createHash('sha256').update(email.trim().toLowerCase()).digest('hex'), 'SHA-256 of the normalised email only');
+  else assert.ok(await synced());
+  assert.equal(audiences._test.hashesFor('meta', { mobile: '98765 43210' }).phone, crypto.createHash('sha256').update('919876543210').digest('hex'));
+  assert.equal(audiences._test.hashesFor('google', { mobile: '9876543210' }).phone, crypto.createHash('sha256').update('+919876543210').digest('hex'));
+  // The buyer leaves the segment -> removed on the next sync.
+  await pool.query('UPDATE lead_scores SET score = 10 WHERE customer_id = $1', [customerId]);
+  await audiences.refresh(SEG);
+  const [run2] = await audiences.sync(SEG);
+  assert.ok(run2.removed >= 1);
+  assert.equal(await synced(), undefined);
+  const detail = await api('GET', `/audiences/${SEG}`, { token: A });
+  assert.ok(detail.data.syncHistory.length >= 3);
+
+  // ---- co-broking on a buyer requirement, started from the marketplace
+  const holder = await createUser('broker', 'cbholder');
+  const lister = await createUser('broker', 'cblister');
+  const share = await api('POST', `/matching/requirements/${rq.data.id}/share`, { token: holder.token, body: { brokerId: lister.id } });
+  assert.equal(share.status, 200, JSON.stringify(share.body));
+  await api('PUT', `/matching/shares/${share.data.id}`, { token: lister.token, body: { action: 'accept' } });
+  const row = async () => (await api('GET', '/matching/marketplace?sharedOnly=true', { token: lister.token })).data.find((r) => r.id === rq.data.id);
+  assert.deepEqual((await row()).cobroke, { canPropose: true, status: null });
+  const cb = await api('POST', '/cobroke', { token: lister.token, body: { requirementId: rq.data.id, note: 'I have a listing in budget for your buyer.' } });
+  assert.equal(cb.status, 201, JSON.stringify(cb.body));
+  assert.equal(cb.data.partner.id, holder.id, 'the broker who holds the buyer is the partner');
+  assert.deepEqual((await row()).cobroke, { canPropose: false, status: 'proposed' });
+  const adminRow = (await api('GET', `/matching/marketplace?city=${encodeURIComponent(CITY)}`, { token: A })).data.find((r) => r.id === rq.data.id);
+  assert.equal(adminRow?.cobroke, undefined, 'brokers only');
 });

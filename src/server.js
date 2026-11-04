@@ -91,4 +91,20 @@ server.listen(PORT, () => {
   if (process.env.CRAWLER_MANUAL_JOBS_DISABLED !== 'true') require('./services/crawler/manualQueue.service').startScheduler();
   // Employee incentives: score new facts every hour.
   if (process.env.INCENTIVE_JOBS_DISABLED !== 'true') require('./services/incentive.service').startScheduler();
+  // Module 49 Smart Audience Engine: recompute segments and sync to Meta / Google Ads (every 6 hours).
+  if (process.env.AUDIENCE_JOBS_DISABLED !== 'true') require('./services/audience.service').startScheduler();
 });
+
+// Graceful stop: Cloud Run sends SIGTERM (10 s grace), pm2 sends SIGINT. Stop
+// taking new requests, let the ones in flight finish, then exit - an exit
+// through process.exit also lets the coverage run (npm run coverage) write its data.
+let stopping = false;
+for (const sig of ['SIGTERM', 'SIGINT']) {
+  process.on(sig, () => {
+    if (stopping) return;
+    stopping = true;
+    console.log(`[server] ${sig} received - closing`);
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 8000).unref();
+  });
+}

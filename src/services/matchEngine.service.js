@@ -644,8 +644,17 @@ async function marketplace(user, { city, purpose, hotOnly, priorityOnly, sharedO
   params.push(Math.min(Number(limit) || 100, 300));
   const rows = await pool.query(
     `SELECT r.*,
-            (SELECT sh.status FROM requirement_shares sh WHERE sh.requirement_id = r.id AND sh.shared_with = $${meParam} LIMIT 1) AS share_status
-     FROM requirements r WHERE ${where.join(' AND ')}
+            (SELECT sh.status FROM requirement_shares sh WHERE sh.requirement_id = r.id AND sh.shared_with = $${meParam} LIMIT 1) AS share_status,
+            -- Co-broking (Engine 4): who holds the buyer - same rule as cobroke.propose - and any live agreement with them on it.
+            (hu.id IS NOT NULL AND hu.id <> $${meParam} AND hu.status = 'active' AND hr.name IN ('broker', 'agency_admin')) AS holder_is_partner,
+            (SELECT ca.status FROM cobroke_agreements ca WHERE ca.requirement_id = r.id AND ca.status IN ('proposed', 'countered', 'accepted', 'deal_open')
+               AND $${meParam} IN (ca.proposer_id, ca.partner_id) ORDER BY ca.created_at DESC LIMIT 1) AS cobroke_status
+     FROM requirements r
+     LEFT JOIN leads l ON l.id = r.lead_id
+     LEFT JOIN LATERAL (SELECT shx.shared_by FROM requirement_shares shx WHERE shx.requirement_id = r.id AND shx.shared_with = $${meParam} ORDER BY shx.created_at DESC LIMIT 1) sh ON true
+     LEFT JOIN users hu ON hu.id = COALESCE(sh.shared_by, l.created_by, r.created_by)
+     LEFT JOIN roles hr ON hr.id = hu.role_id
+     WHERE ${where.join(' AND ')}
      ORDER BY (r.mandate_type = 'exclusive') DESC, (r.temperature = 'hot') DESC, r.created_at DESC
      LIMIT $${params.length}`,
     params
@@ -659,7 +668,13 @@ async function marketplace(user, { city, purpose, hotOnly, priorityOnly, sharedO
       const m = scoreOne(listing, r, s);
       if (!best || m.score > best.score) best = { score: m.score, tier: m.tier, propertyId: listing.id, title: listing.title, breakdown: m.breakdown };
     }
-    return { ...maskRequirement(r), sharedWithMe: r.share_status || null, bestMatchWithMyListings: best };
+    return {
+      ...maskRequirement(r),
+      sharedWithMe: r.share_status || null,
+      bestMatchWithMyListings: best,
+      // Brokers only: can a co-broking proposal be sent on this buyer (the holder stays masked until then)?
+      cobroke: ['broker', 'agency_admin'].includes(user.role) ? { canPropose: !!r.holder_is_partner && !r.cobroke_status, status: r.cobroke_status || null } : undefined,
+    };
   });
 }
 

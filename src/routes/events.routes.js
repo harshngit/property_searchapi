@@ -28,7 +28,7 @@ const opt = optionalAuthenticate || ((req, res, next) => next());
  *     security: [{ bearerAuth: [] }]
  *     responses: { 200: { description: Linked } }
  */
-router.post('/events/track', limiter, opt, asyncHandler(async (req, res) => success(res, 200, 'Tracked', await events.track(req.body || {}, { user: req.user || null, userAgent: req.headers['user-agent'] }))));
+router.post('/events/track', limiter, opt, asyncHandler(async (req, res) => success(res, 200, 'Tracked', await events.track(req.body || {}, { user: req.user || null, userAgent: req.headers['user-agent'], country: events.requestCountry(req) }))));
 router.post('/events/identify', authenticate, asyncHandler(async (req, res) => success(res, 200, 'Identified', await events.identify({ anonymousId: req.body?.anonymousId, userId: req.user.id }))));
 
 /**

@@ -65,7 +65,19 @@ async function insert(e) {
 }
 
 // Browser batch: POST /events/track. Unknown types are dropped (not errors).
-async function track(batch, { user = null, ip = null, userAgent = null } = {}) {
+// Country of the request, from the proxy / CDN in front of the API (never the
+// IP itself - DPDP): GEO_COUNTRY_HEADER if set, else Cloudflare, App Engine or
+// a Google load balancer custom header. Used for the NRI audience (Module 49).
+function requestCountry(req) {
+  const names = [process.env.GEO_COUNTRY_HEADER, 'cf-ipcountry', 'x-appengine-country', 'x-client-geo-country'].filter(Boolean).map((h) => h.toLowerCase());
+  for (const h of names) {
+    const v = String(req.headers?.[h] || '').trim().toUpperCase();
+    if (/^[A-Z]{2}$/.test(v) && v !== 'XX' && v !== 'ZZ') return v;
+  }
+  return null;
+}
+
+async function track(batch, { user = null, ip = null, userAgent = null, country = null } = {}) {
   const allowed = await browserTypes();
   const list = (Array.isArray(batch?.events) ? batch.events : [batch]).slice(0, 50);
   let accepted = 0;
@@ -78,6 +90,8 @@ async function track(batch, { user = null, ip = null, userAgent = null } = {}) {
     const props = typeof raw.properties === 'object' && raw.properties ? raw.properties : {};
     // Never store full IP (DPDP) - only the coarse region the client sent, plus the UA family.
     const device = { ...(typeof raw.device === 'object' ? raw.device : {}), ua: String(userAgent || '').slice(0, 160) };
+    delete device.country;
+    if (country) device.country = country;
     await insert({
       type: raw.type, track: 'browser', userId: user?.id || null, anonymousId, customerId,
       sessionId: raw.sessionId || batch.sessionId, properties: props, attribution: raw.attribution || batch.attribution || {},
@@ -511,6 +525,7 @@ async function scoreForLead(user, leadId) {
 module.exports = {
   SERVER_TYPES,
   track,
+  requestCountry,
   emit,
   identify,
   ensurePartitions,

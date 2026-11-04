@@ -47,8 +47,9 @@ const ok = (res, msg, data) => success(res, 200, msg, data);
  *     responses: { 200: { description: Ranked list with the caller's own rank } }
  * /gamification/cities:
  *   get:
- *     summary: Cities that have an area leaderboard
+ *     summary: Cities that have an area leaderboard (the 200 busiest; q searches all)
  *     tags: [Gamification]
+ *     parameters: [{ in: query, name: q, schema: { type: string } }]
  *     security: [{ bearerAuth: [] }]
  *     responses: { 200: { description: Cities } }
  * /gamification/manage/settings:
@@ -86,7 +87,7 @@ router.get(
   validate,
   h(async (req, res) => ok(res, 'Leaderboard', await game.leaderboard(req.user, { scope: req.query.scope, city: req.query.city, period: req.query.period, audience: req.query.audience })))
 );
-router.get('/cities', authorize(...PLAYERS, ...STAFF), h(async (req, res) => ok(res, 'Leaderboard cities', await game.boardCities(req.user))));
+router.get('/cities', authorize(...PLAYERS, ...STAFF), h(async (req, res) => ok(res, 'Leaderboard cities', await game.boardCities(req.user, { q: typeof req.query.q === 'string' ? req.query.q : '' }))));
 
 router.get('/manage/settings', authorize(...STAFF), h(async (req, res) => ok(res, 'Gamification settings', await game.settings())));
 router.put(

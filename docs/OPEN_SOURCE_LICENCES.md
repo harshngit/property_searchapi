@@ -49,6 +49,8 @@ To refresh it after a dependency change, run `npm ls --omit=dev --all --json --l
 | `swagger-ui-express` | 5.0.1 | shipped | MIT | https://github.com/scottie1984/swagger-ui-express |
 | `tesseract.js` | 5.1.1 | shipped | Apache-2.0 | https://github.com/naptha/tesseract.js |
 | `uuid` | 9.0.1 | shipped | MIT | https://github.com/uuidjs/uuid |
+| `autocannon` | 7.15.0 | build / development only (load test) | MIT | https://github.com/mcollina/autocannon |
+| `c8` | 10.1.3 | build / development only (test coverage) | ISC | https://github.com/bcoe/c8 |
 | `nodemon` | 3.1.14 | build / development only | MIT | https://nodemon.io |
 | `qrcode` | 1.5.4 | build / development only | MIT | http://github.com/soldair/node-qrcode |
 
