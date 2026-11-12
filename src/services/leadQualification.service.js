@@ -261,4 +261,4 @@ function startScheduler() {
   timer.unref?.();
 }
 
-module.exports = { sendQualification, handleReply, sweep, startScheduler };
+module.exports = { sendQualification, handleReply, sweep, startScheduler, isBusinessHours };
