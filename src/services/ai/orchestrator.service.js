@@ -167,6 +167,7 @@ async function credit(userId, credits, kind, { activityKey = null, runId = null,
  */
 async function run(key, o = {}) {
   if ((await configService.getConfig('ai.enabled', true)) === false) throw unavailable('AI features are switched off');
+  await assertPlatformWithinCap();
   const a = await activity(key);
   if (!a.is_active) throw unavailable(`${a.label} is switched off`);
   // No anonymous / platform-paid AI: someone asks, and their wallet pays.
@@ -262,6 +263,22 @@ async function assertWithinCap(userId, a) {
   };
   over(w.daily_cap, spent.today, 'daily');
   over(w.monthly_cap, spent.month, 'monthly');
+}
+
+// Platform-wide safety ceiling (USD, all providers, all activities - set by
+// an admin in Admin Panel -> Settings; NULL means no cap). Separate from the
+// per-user credit caps above: this one also catches platform-paid activities
+// (credits = 0) which never touch a user's wallet but still cost real USD.
+async function assertPlatformWithinCap() {
+  const cap = await configService.getConfig('ai.platform_monthly_cap_usd', null);
+  if (cap == null) return;
+  const spent = (await pool.query(
+    `SELECT COALESCE(SUM(cost_usd), 0)::numeric AS month FROM ai_runs
+     WHERE status = 'ok' AND created_at >= date_trunc('month', now() AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata'`
+  )).rows[0];
+  if (Number(spent.month) >= Number(cap)) {
+    throw unavailable(`AI features are paused for the rest of this month - the platform's AI budget ($${cap}) has been reached. An admin can raise or clear ai.platform_monthly_cap_usd in Settings.`);
+  }
 }
 
 // Is this activity usable right now (switched on, a provider configured)?
